@@ -74,6 +74,7 @@ EXTENSIONS = {
     },
     "missions": {},
     "motion_capture": {"enabled": "avoid", "frame_rate": 10},
+    "path_planner": {},
     "rc": {"enabled": "avoid"},
     "rc_udp": {"enabled": False},
     "rtk": {
