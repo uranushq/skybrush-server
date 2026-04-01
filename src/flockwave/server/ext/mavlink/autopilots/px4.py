@@ -75,7 +75,9 @@ class PX4(Autopilot):
     }
 
     @classmethod
-    def describe_custom_mode(cls, base_mode: int, custom_mode: int) -> str:
+    def describe_custom_mode(
+        cls, base_mode: int, custom_mode: int, vehicle_type: int | None = None
+    ) -> str:
         main_mode = (custom_mode & 0x00FF0000) >> 16
         submode = (custom_mode & 0xFF000000) >> 24
         main_mode_name = cls._main_modes.get(main_mode)

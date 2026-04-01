@@ -1,1 +1,1 @@
-python -m uv run skybrushd
+python -m uv run skybrushd -p 5001 -c etc/conf/skybrush-outdoor.jsonc
