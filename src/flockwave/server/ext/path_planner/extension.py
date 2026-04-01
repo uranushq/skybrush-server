@@ -38,8 +38,10 @@ Response body (JSON)::
 
 from __future__ import annotations
 
+import os
 from contextlib import ExitStack
 from logging import Logger
+from pathlib import Path
 from quart import Blueprint, jsonify, request
 from trio import sleep_forever
 from typing import Optional
@@ -48,6 +50,7 @@ from flockwave.server.ext.base import Extension
 
 from .solver import PathSolver
 from .output import build_output
+from .converter import save_skyb_files
 
 blueprint = Blueprint("path_planner", __name__)
 
@@ -113,6 +116,13 @@ async def plan():
     if duration_ms <= 0:
         return jsonify({"error": "'duration_ms' must be > 0"}), 400
 
+    # --- optional: output directory & takeoff_time ---
+    takeoff_time: float = float(body.get("takeoff_time", 0.0))
+
+    # Default output dir: parent of skybrush-server (i.e. the DCS/ workspace)
+    default_output = str(Path(__file__).resolve().parents[6])  # …/DCS/
+    output_dir: str = body.get("output_dir", default_output)
+
     # --- run solver ---
     initials = [tuple(p) for p in initial]
     targets = [tuple(p) for p in target]
@@ -129,6 +139,18 @@ async def plan():
     output = build_output(result, duration_ms)
     output["success"] = result.success
     output["total_steps"] = result.total_steps
+
+    # --- generate & save Skybrush .skyb files ---
+    try:
+        saved = await save_skyb_files(
+            result,
+            output_dir=output_dir,
+            duration_ms=duration_ms,
+            takeoff_time=takeoff_time,
+        )
+        output["skybrush_files"] = saved
+    except Exception as exc:
+        output["skybrush_files_error"] = str(exc)
 
     return jsonify(output)
 
