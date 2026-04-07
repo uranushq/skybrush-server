@@ -95,6 +95,7 @@ def build_show_dicts(
     result: SolverResult,
     duration_ms: int = 300,
     takeoff_time: float = 0.0,
+    coordinate_system: Optional[dict] = None,
 ) -> List[dict]:
     """Build a list of full *show specification* dicts (one per drone).
 
@@ -105,9 +106,19 @@ def build_show_dicts(
             "trajectory": { ... },
             "lights": { "version": 1, "data": "AA==" },
             "home": [x, y, z],
+            "coordinateSystem": { ... },
         }
+
+    Parameters:
+        coordinate_system: optional dict like
+            ``{"type": "nwu", "origin": [lon, lat], "orientation": 0}``.
+            Defaults to a WGS-84 origin at ``[0, 0]`` with 0° orientation
+            when *None*.
     """
     import base64
+
+    if coordinate_system is None:
+        coordinate_system = {"type": "nwu", "origin": [0, 0], "orientation": 0}
 
     traj_dicts = solver_result_to_trajectory_dicts(result, duration_ms, takeoff_time)
     shows: List[dict] = []
@@ -123,6 +134,7 @@ def build_show_dicts(
                 "trajectory": traj,
                 "lights": {"version": 1, "data": minimal_light},
                 "home": home,
+                "coordinateSystem": coordinate_system,
             }
         )
 
