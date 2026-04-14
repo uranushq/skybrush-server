@@ -456,12 +456,14 @@ class MAVFTP:
     def for_uav(cls, uav: MAVLinkUAV):
         """Constructs a MAVFTP connection object to the given UAV."""
         sender = partial(uav.driver.send_packet, target=uav)
-        return cls(sender)
+        return cls(sender, reset_on_open=True)
 
-    def __init__(self, sender: UAVBoundPacketSenderFn):
+    def __init__(self, sender: UAVBoundPacketSenderFn, reset_on_open: bool = False):
         """Constructor."""
         self._closed = False
         self._closing = False
+        self._reset_on_open = reset_on_open
+        self._sessions_reset = False
 
         self._retry_policy = AdaptiveExponentialBackoffPolicy(
             max_retries=600,
@@ -472,6 +474,16 @@ class MAVFTP:
         self._path = PurePosixPath("/")
         self._seq = islice(cycle(range(65536)), randint(0, 65535), None)
         self._sender = sender
+
+    async def _ensure_sessions_reset(self) -> None:
+        """Sends a RESET_SESSIONS command once per connection if needed."""
+        if self._reset_on_open and not self._sessions_reset:
+            self._sessions_reset = True
+            message = MAVFTPMessage(MAVFTPOpCode.RESET_SESSIONS)
+            try:
+                await self._send_and_wait(message)
+            except Exception:
+                pass
 
     async def aclose(self) -> None:
         """Closes the MAVFTP connection and instructs the PixHawk to close
@@ -657,6 +669,9 @@ class MAVFTP:
         total_length = len(data)
 
         remote_path = self._resolve(remote_path)
+
+        await self._ensure_sessions_reset()
+
         if parents:
             await self.mkdir(
                 str(PurePosixPath(remote_path.decode("utf-8"))),
