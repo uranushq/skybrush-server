@@ -488,6 +488,11 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         if result is None:
             raise TooSlowError(f"No response received for command {command_id} in time")
 
+        if result != MAVResult.ACCEPTED:
+            self.log.warning(
+                f"COMMAND_ACK for cmd_int {command_id}: result={result}"
+            )
+
         if result == MAVResult.UNSUPPORTED:
             raise NotSupportedError
 
@@ -602,6 +607,11 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
 
         if result is None:
             raise TooSlowError(f"No response received for command {command_id} in time")
+
+        if result != MAVResult.ACCEPTED:
+            self.log.warning(
+                f"COMMAND_ACK for cmd_long {command_id}: result={result}"
+            )
 
         if result == MAVResult.UNSUPPORTED:
             raise NotSupportedError
@@ -2080,9 +2090,15 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """Asks the UAV to reload the current drone show file."""
         # param1 = 0 if we want to reload the show file
         success = await self.driver.send_command_long(
-            self, MAVCommand.USER_1, SkybrushUserCommand.RELOAD_SHOW
+            self, MAVCommand.USER_1, SkybrushUserCommand.RELOAD_SHOW,
+            timeout=10,
         )
         if not success:
+            # Log the raw COMMAND_ACK result for debugging
+            self.driver.log.error(
+                f"reload_show COMMAND_ACK result was not ACCEPTED "
+                f"(USER_1 param1={SkybrushUserCommand.RELOAD_SHOW})"
+            )
             raise RuntimeError("Failed to reload show file")
 
     async def remove_show(self) -> None:
@@ -2366,6 +2382,12 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         trajectory = get_trajectory_from_show_specification(show)
         geofence = get_geofence_configuration_from_show_specification(show)
 
+        self.driver.log.info(
+            f"Show upload: origin=({coordinate_system.origin.lat}, {coordinate_system.origin.lon}), "
+            f"alt_ref={altitude_reference}, trajectory_duration={trajectory.duration}s, "
+            f"light_program={len(light_program)}B"
+        )
+
         pyro_program = None
         rth_plan = None
         yaw_setpoints = None
@@ -2396,9 +2418,13 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             await show_file.finalize()
             data = show_file.get_contents()
 
+        self.driver.log.info(f"Show file built: {len(data)} bytes")
+
         # Upload show file
         async with aclosing(MAVFTP.for_uav(self)) as ftp:
             await ftp.put(data, "/collmot/show.skyb")
+
+        self.driver.log.info("Show file uploaded via MAVFTP")
 
         # We give some time for the filesystem to flush caches etc before
         # asking the drone to reload the show file. There were some reports
@@ -2406,6 +2432,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         # this could have been because the filesystem was not flushed fully
         # to the SD card before we tried to reload the show. We could not debug
         # it properly as it happened very rarely.
+        await sleep(2)
 
         # Encode latitude and longitude of show origin
         # TODO(ntamas): this is not entirely accurate due to the back-and-forth
@@ -2433,8 +2460,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 encoded_lon,
                 encoded_amsl,
             )
+            self.driver.log.info(f"USER_2 origin config: success={success}")
         except NotSupportedError:
             success = False
+            self.driver.log.info("USER_2 not supported, falling back to params")
 
         if not success:
             # Configure show origin, orientation and altitude reference using
@@ -2454,10 +2483,12 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
 
         # Configure and enable geofence
         await self.configure_geofence(geofence)
+        self.driver.log.info("Geofence configured, now reloading show...")
 
         # Ask drone to reload show file now that we are done with everything
         # else
         await self.reload_show()
+        self.driver.log.info("Show reloaded successfully")
 
     async def wait_until_connected(self) -> None:
         """Waits until the UAV becomes connected (i.e. when we see the next

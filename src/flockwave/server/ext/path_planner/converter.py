@@ -32,6 +32,8 @@ def solver_result_to_trajectory_dicts(
     result: SolverResult,
     duration_ms: int = 300,
     takeoff_time: float = 0.0,
+    takeoff_speed: float = 1.5,
+    landing_speed: float = 1.0,
 ) -> List[dict]:
     """Convert a *SolverResult* into a list of Skybrush trajectory dicts.
 
@@ -48,16 +50,16 @@ def solver_result_to_trajectory_dicts(
             ]
         }
 
-    Because the algorithm already outputs discrete waypoints joined by
-    straight-line moves, every segment is **linear** (no Bézier control
-    points between keyframes — the ``[]`` placeholder is sufficient since
-    ``iter_segments`` will build a 2-point ``[start, end]`` pair which
-    the binary encoder writes as a linear segment).
+    The generated trajectory includes a takeoff segment (ground → first
+    waypoint altitude) at the beginning and a landing segment (last
+    waypoint altitude → ground) at the end.
 
     Parameters:
         result: output of ``PathSolver.solve()``
         duration_ms: milliseconds per step (from the API request)
-        takeoff_time: seconds of ground-wait before the first movement
+        takeoff_time: seconds to wait on the ground before takeoff
+        takeoff_speed: vertical speed during takeoff in m/s
+        landing_speed: vertical speed during landing in m/s
     """
     num_drones = len(result.drones)
     duration_sec = duration_ms / 1000.0
@@ -70,11 +72,57 @@ def solver_result_to_trajectory_dicts(
         did = drone.drone_id
         points: List[list] = []
 
+        # Collect raw waypoints from solver
+        raw_points: List[list] = []
         for rec in result.steps:
             t_sec = round(rec.step * duration_sec, 4)
             pos = rec.positions[did]
-            # [time, [x,y,z], [control_points]]
-            points.append([t_sec, [round(pos[0], 4), round(pos[1], 4), round(pos[2], 4)], []])
+            raw_points.append([t_sec, [round(pos[0], 4), round(pos[1], 4), round(pos[2], 4)], []])
+
+        if not raw_points:
+            trajectories.append({"version": 1, "takeoffTime": takeoff_time, "points": []})
+            continue
+
+        first_pos = raw_points[0][1]  # [x, y, z]
+        last_pos = raw_points[-1][1]
+
+        # Ground position: same x, y but z=0
+        ground_start = [first_pos[0], first_pos[1], 0]
+        ground_end = [last_pos[0], last_pos[1], 0]
+
+        # Takeoff duration based on altitude and speed
+        takeoff_alt = abs(first_pos[2])
+        takeoff_duration = round(takeoff_alt / takeoff_speed, 4) if takeoff_alt > 0 else 0
+
+        # Landing duration based on altitude and speed
+        landing_alt = abs(last_pos[2])
+        landing_duration = round(landing_alt / landing_speed, 4) if landing_alt > 0 else 0
+
+        # Build full trajectory:
+        # 1) Ground start at t=0
+        # 2) Top of takeoff at t=takeoff_duration
+        # 3) Solver waypoints shifted by takeoff_duration
+        # 4) Landing to ground
+
+        # (1) ground start
+        points.append([0, ground_start, []])
+
+        # (2) top of takeoff (= first solver position)
+        if takeoff_duration > 0:
+            points.append([round(takeoff_duration, 4), list(first_pos), []])
+
+        # (3) solver waypoints (time-shifted)
+        for raw_pt in raw_points:
+            t_shifted = round(raw_pt[0] + takeoff_duration, 4)
+            # Skip duplicate of first point (already added as takeoff end)
+            if takeoff_duration > 0 and raw_pt is raw_points[0]:
+                continue
+            points.append([t_shifted, list(raw_pt[1]), []])
+
+        # (4) landing to ground
+        last_t = points[-1][0]
+        if landing_duration > 0:
+            points.append([round(last_t + landing_duration, 4), ground_end, []])
 
         # Optimisation: collapse consecutive identical positions into a
         # single keyframe (the encoder will produce a constant segment).
