@@ -2419,6 +2419,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             data = show_file.get_contents()
 
         self.driver.log.info(f"Show file built: {len(data)} bytes")
+        self.driver.log.info(f"Show file hex: {data.hex()}")
 
         # Upload show file
         async with aclosing(MAVFTP.for_uav(self)) as ftp:
