@@ -51,6 +51,13 @@ from flockwave.server.utils import overridden
 from .solver import PathSolver
 from .output import build_output
 from .converter import build_show_dicts, save_skyb_files
+from .validators import (
+    SEVERITY_ERROR,
+    ValidationContext,
+    collect_required_params,
+    fetch_required_params,
+    run_validators,
+)
 
 if TYPE_CHECKING:
     from flockwave.server.app import SkybrushServer
@@ -149,6 +156,57 @@ async def plan():
     # Default: local NWU at lon=0, lat=0
     coordinate_system: Optional[dict] = body.get("coordinate_system", None)
 
+    # --- pre-flight validation -------------------------------------------
+    # Validators inspect the request payload together with parameters
+    # fetched from the first connected UAV. Any "error"-severity issue
+    # blocks the request with HTTP 422; warnings are returned but do not
+    # block. Set ``"skip_validation": true`` in the body to bypass.
+    skip_validation: bool = bool(body.get("skip_validation", False))
+    validation_payload: dict = {"skipped": skip_validation, "issues": []}
+    if not skip_validation:
+        uav_params: dict = {}
+        param_names = collect_required_params()
+        if param_names and app is not None:
+            try:
+                from flockwave.server.model.uav import UAV
+                uav_ids = sorted(app.object_registry.ids_by_type(UAV))
+                if uav_ids:
+                    first_uav = app.object_registry.find_by_id(uav_ids[0])
+                    uav_params = await fetch_required_params(
+                        first_uav, param_names, log=log
+                    )
+                    validation_payload["param_source_uav"] = uav_ids[0]
+            except Exception as exc:
+                if log:
+                    log.warning(f"Could not fetch UAV parameters for validation: {exc}")
+                validation_payload["param_fetch_error"] = str(exc)
+
+        ctx = ValidationContext(
+            initial=initial,
+            target=target,
+            step_size=step_size,
+            duration_ms=duration_ms,
+            takeoff_time=takeoff_time,
+            uav_params=uav_params,
+            body=body,
+        )
+        issues = run_validators(ctx)
+        validation_payload["issues"] = [i.to_dict() for i in issues]
+        validation_payload["params"] = dict(uav_params)
+
+        blocking = [i for i in issues if i.severity == SEVERITY_ERROR]
+        if blocking:
+            return (
+                jsonify(
+                    {
+                        "error": "Path validation failed",
+                        "code": "VALIDATION_FAILED",
+                        "validation": validation_payload,
+                    }
+                ),
+                422,
+            )
+
     # --- run solver ---
     initials = [tuple(p) for p in initial]
     targets = [tuple(p) for p in target]
@@ -165,6 +223,7 @@ async def plan():
     output = build_output(result, duration_ms)
     output["success"] = result.success
     output["total_steps"] = result.total_steps
+    output["validation"] = validation_payload
 
     # --- generate & save Skybrush .skyb files ---
     try:
