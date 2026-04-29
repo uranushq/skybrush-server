@@ -116,7 +116,10 @@ async def plan():
 
     # --- optional parameters ---
     step_size: float = float(body.get("step_size", 1.0))
-    duration_ms: int = int(body.get("duration_ms", 300))
+    # Time per solver step (i.e. for one `step_size` worth of horizontal
+    # motion). 5000 ms keeps horizontal speed below the ArduPilot DRONE_SHOW
+    # firmware acceptance limits and avoids reload rejection on small shows.
+    duration_ms: int = int(body.get("duration_ms", 5000))
     seed: Optional[int] = body.get("seed")
 
     if step_size <= 0:
@@ -126,6 +129,13 @@ async def plan():
 
     # --- optional: output directory & takeoff_time ---
     takeoff_time: float = float(body.get("takeoff_time", 0.0))
+
+    # Skybrush firmware tends to silently reject very short shows or shows
+    # with a zero takeoff time. Force a sensible minimum so the drone has
+    # a ground-wait segment in front of the trajectory.
+    MIN_TAKEOFF_TIME = 5.0
+    if takeoff_time < MIN_TAKEOFF_TIME:
+        takeoff_time = MIN_TAKEOFF_TIME
 
     # Default output dir: parent of the CWD where the server was launched.
     # e.g. if launched from skybrush-server/, output goes to its parent (DCS/).
@@ -205,6 +215,44 @@ async def _upload_to_connected_uavs(
     if app is None:
         return {"error": "Server app not available"}
 
+    # Gather connected UAV IDs, sorted so assignment is deterministic
+    uav_ids = sorted(app.object_registry.ids_by_type(UAV))
+
+    if not uav_ids:
+        return {"error": "No UAVs connected", "uploaded": 0, "details": {}}
+
+    # If the caller did not specify a coordinate system, derive its origin
+    # from the current GPS position of the first connected UAV. Without a
+    # real origin, the firmware will reject the show because the resulting
+    # waypoints land thousands of km away from the drone.
+    if coordinate_system is None:
+        first_uav = app.object_registry.find_by_id(uav_ids[0])
+        pos = getattr(getattr(first_uav, "status", None), "position", None)
+        lat = getattr(pos, "lat", None)
+        lon = getattr(pos, "lon", None)
+        if (
+            lat is not None
+            and lon is not None
+            and (lat != 0.0 or lon != 0.0)
+        ):
+            coordinate_system = {
+                "type": "nwu",
+                "origin": [lon, lat],
+                "orientation": 0,
+            }
+            if log:
+                log.info(
+                    f"Auto-derived show origin from {uav_ids[0]}: "
+                    f"lat={lat}, lon={lon}"
+                )
+        else:
+            if log:
+                log.warning(
+                    "No coordinate_system provided and could not derive one "
+                    f"from {uav_ids[0]} (no GPS fix yet); show upload will "
+                    "likely be rejected by the drone."
+                )
+
     # Build per-drone show dicts (same format Skybrush Live would send)
     show_dicts = build_show_dicts(
         result,
@@ -213,12 +261,6 @@ async def _upload_to_connected_uavs(
         coordinate_system=coordinate_system,
     )
     num_drones = len(show_dicts)
-
-    # Gather connected UAV IDs, sorted so assignment is deterministic
-    uav_ids = sorted(app.object_registry.ids_by_type(UAV))
-
-    if not uav_ids:
-        return {"error": "No UAVs connected", "uploaded": 0, "details": {}}
 
     if len(uav_ids) < num_drones:
         if log:

@@ -826,9 +826,6 @@ class MAVLinkNetwork:
         broadcast_address_updated: dict[str, bool] = defaultdict(bool)
 
         async for connection_id, (message, address) in channel:
-            # Uncomment this for debugging
-            # self.log.info(repr(message))
-
             # SiK radios use system ID = 51 and component ID = 68
             # (MAV_COMP_ID_TELEMETRY_RADIO)
             # mavesp8266 uses the correct system ID and component ID = 0xf0

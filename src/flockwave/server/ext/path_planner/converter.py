@@ -177,12 +177,27 @@ def build_show_dicts(
         # Minimal light program: a single END (0x00) byte
         minimal_light = base64.b64encode(b"\x00").decode("ascii")
 
+        # Permissive default geofence so the firmware does not reject the
+        # show on reload because of missing fence info. The values are wide
+        # enough not to interfere with typical small flights.
+        geofence = {
+            "version": 1,
+            "enabled": True,
+            "maxAltitude": 100.0,
+            "maxDistance": 500.0,
+            "minAltitude": -5.0,
+            "action": "land",
+            "polygons": [],
+            "rallyPoints": [],
+        }
+
         shows.append(
             {
                 "trajectory": traj,
                 "lights": {"version": 1, "data": minimal_light},
                 "home": home,
                 "coordinateSystem": coordinate_system,
+                "geofence": geofence,
             }
         )
 

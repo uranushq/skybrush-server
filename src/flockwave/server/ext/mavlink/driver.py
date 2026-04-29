@@ -2094,12 +2094,65 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             timeout=10,
         )
         if not success:
-            # Log the raw COMMAND_ACK result for debugging
+            # Log the raw COMMAND_ACK result for debugging, together with
+            # whatever drone-side state we can extract to help figure out
+            # why the firmware refused the reload.
+            mode = getattr(self._status, "mode", None)
+            errors = list(getattr(self._status, "errors", []) or [])
+            position = getattr(self._status, "position", None)
+            lat = getattr(position, "lat", None)
+            lon = getattr(position, "lon", None)
+            amsl = getattr(position, "amsl", None)
             self.driver.log.error(
                 f"reload_show COMMAND_ACK result was not ACCEPTED "
-                f"(USER_1 param1={SkybrushUserCommand.RELOAD_SHOW})"
+                f"(USER_1 param1={SkybrushUserCommand.RELOAD_SHOW}); "
+                f"drone state: mode={mode!r}, errors={errors}, "
+                f"position=(lat={lat}, lon={lon}, amsl={amsl})"
             )
+            self._dump_health_snapshot_for_reload_failure()
             raise RuntimeError("Failed to reload show file")
+
+    def _dump_health_snapshot_for_reload_failure(self) -> None:
+        """Logs a one-shot snapshot of cached health-related MAVLink messages
+        to help diagnose why the firmware refused a RELOAD_SHOW command.
+        """
+        # MAVLink message IDs: SYS_STATUS=1, AUTOPILOT_VERSION=148,
+        # EKF_STATUS_REPORT=193, HOME_POSITION=242, GPS_RAW_INT=24,
+        # FENCE_STATUS=162, POWER_STATUS=125
+        log = self.driver.log
+        diagnostics: list[tuple[int, str, tuple[str, ...]]] = [
+            (1,   "SYS_STATUS",         (
+                "onboard_control_sensors_present",
+                "onboard_control_sensors_enabled",
+                "onboard_control_sensors_health",
+                "voltage_battery", "current_battery", "battery_remaining",
+                "errors_count1", "errors_count2", "errors_count3", "errors_count4",
+            )),
+            (24,  "GPS_RAW_INT",        (
+                "fix_type", "satellites_visible", "eph", "epv", "lat", "lon", "alt",
+            )),
+            (125, "POWER_STATUS",       ("Vcc", "Vservo", "flags")),
+            (148, "AUTOPILOT_VERSION",  ("flight_sw_version", "capabilities")),
+            (162, "FENCE_STATUS",       (
+                "breach_status", "breach_count", "breach_type", "breach_time",
+            )),
+            (193, "EKF_STATUS_REPORT",  (
+                "flags", "velocity_variance", "pos_horiz_variance",
+                "pos_vert_variance", "compass_variance", "terrain_alt_variance",
+            )),
+            (242, "HOME_POSITION",      ("latitude", "longitude", "altitude")),
+        ]
+        for msg_id, name, fields in diagnostics:
+            msg = self.get_last_message(msg_id)
+            if msg is None:
+                log.warning(f"  [{name}] not seen yet")
+                continue
+            try:
+                d = msg.to_dict()
+            except Exception:
+                d = {f: getattr(msg, f, None) for f in fields}
+            picked = {f: d.get(f) for f in fields if f in d}
+            log.warning(f"  [{name}] {picked}")
 
     async def remove_show(self) -> None:
         """Asks the UAV to remove the current drone show file."""
@@ -2485,6 +2538,25 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         # Configure and enable geofence
         await self.configure_geofence(geofence)
         self.driver.log.info("Geofence configured, now reloading show...")
+
+        # The firmware refuses RELOAD_SHOW (USER_1 param1=0) unless the
+        # vehicle is in DRONE_SHOW mode (ArduPilot custom_mode = 127). Try
+        # to switch automatically; we use the numeric mode id because the
+        # "show" name is only registered for QUADROTOR vehicle types in
+        # the autopilot mapping.
+        current_mode = getattr(self._status, "mode", None)
+        if current_mode != "show":
+            try:
+                self.driver.log.info(
+                    f"Switching mode {current_mode!r} -> show (127) before reload"
+                )
+                await self.set_mode(127)
+                # Give the firmware a moment to commit the mode change
+                await sleep(0.5)
+            except Exception as ex:
+                self.driver.log.warning(
+                    f"Failed to switch to show mode before reload: {ex}"
+                )
 
         # Ask drone to reload show file now that we are done with everything
         # else
