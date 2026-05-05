@@ -2539,24 +2539,22 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         await self.configure_geofence(geofence)
         self.driver.log.info("Geofence configured, now reloading show...")
 
-        # The firmware refuses RELOAD_SHOW (USER_1 param1=0) unless the
-        # vehicle is in DRONE_SHOW mode (ArduPilot custom_mode = 127). Try
-        # to switch automatically; we use the numeric mode id because the
-        # "show" name is only registered for QUADROTOR vehicle types in
-        # the autopilot mapping.
-        current_mode = getattr(self._status, "mode", None)
-        if current_mode != "show":
+        # Force flight-mode switch positions 5 and 6 to map to DRONE_SHOW
+        # (custom_mode = 127) so the operator can flip into show mode from
+        # the RC without losing it after a reboot. Failures are logged but
+        # do not abort the upload.
+        for _param_name in ("FLTMODE5", "FLTMODE6"):
             try:
-                self.driver.log.info(
-                    f"Switching mode {current_mode!r} -> show (127) before reload"
-                )
-                await self.set_mode(127)
-                # Give the firmware a moment to commit the mode change
-                await sleep(0.5)
+                await self.set_parameter(_param_name, 127)
+                self.driver.log.info(f"{_param_name} set to 127 (drone show)")
             except Exception as ex:
-                self.driver.log.warning(
-                    f"Failed to switch to show mode before reload: {ex}"
-                )
+                self.driver.log.warning(f"Failed to set {_param_name}=127: {ex}")
+
+        # NOTE: previously we automatically switched the vehicle into
+        # DRONE_SHOW mode (custom_mode=127) here because RELOAD_SHOW used
+        # to be rejected outside that mode. The auto-switch is disabled
+        # per user request; the firmware/operator is responsible for
+        # putting the vehicle into the desired mode before/after upload.
 
         # Ask drone to reload show file now that we are done with everything
         # else

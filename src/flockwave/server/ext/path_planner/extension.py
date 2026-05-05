@@ -156,6 +156,26 @@ async def plan():
     # Default: local NWU at lon=0, lat=0
     coordinate_system: Optional[dict] = body.get("coordinate_system", None)
 
+    # Optional AMSL reference (in meters). When set, the firmware
+    # interprets the trajectory Z as offsets from this absolute altitude
+    # instead of as relative-to-home. The Skybrush Live "Outdoor
+    # Environment" editor sets the same field as ``amslReference``.
+    amsl_reference: Optional[float] = body.get("amsl_reference", None)
+
+    # Resolve the coordinate system *now* (before the solver runs) so that
+    # both the on-disk ``.skyb`` files and the per-drone MAVFTP upload use
+    # the same origin. Without this the saved files would have origin
+    # (0, 0) while the drone receives a real GPS origin — i.e. the saved
+    # file could not be replayed against the same drone afterwards.
+    if coordinate_system is None:
+        coordinate_system = _derive_coordinate_system_from_first_uav()
+
+    # Same trick for the AMSL reference: derive it from the first UAV so
+    # the show is uploaded with a real ``amslReference`` rather than the
+    # firmware sentinel ``SHOW_ORIGIN_AMSL = -32768000`` (= "no AMSL").
+    if amsl_reference is None:
+        amsl_reference = _derive_amsl_reference_from_first_uav()
+
     # --- pre-flight validation -------------------------------------------
     # Validators inspect the request payload together with parameters
     # fetched from the first connected UAV. Any "error"-severity issue
@@ -232,10 +252,21 @@ async def plan():
             output_dir=output_dir,
             duration_ms=duration_ms,
             takeoff_time=takeoff_time,
+            coordinate_system=coordinate_system,
+            amsl_reference=amsl_reference,
         )
         output["skybrush_files"] = saved
+        if log:
+            log.info(
+                f"Saved {sum(1 for k in saved if not k.startswith('_'))} "
+                f".skyb file(s) and show.json under {output_dir}"
+            )
+            for drone_id, path in saved.items():
+                log.info(f"  {drone_id}: {path}")
     except Exception as exc:
         output["skybrush_files_error"] = str(exc)
+        if log:
+            log.error(f"Failed to save .skyb files to {output_dir}: {exc}")
 
     # --- auto-upload show to connected UAVs ---
     if auto_upload and result.success:
@@ -244,6 +275,7 @@ async def plan():
             duration_ms=duration_ms,
             takeoff_time=takeoff_time,
             coordinate_system=coordinate_system,
+            amsl_reference=amsl_reference,
         )
         output["upload"] = upload_results
 
@@ -253,12 +285,103 @@ async def plan():
 # ── Upload helper ────────────────────────────────────────────────────────
 
 
+def _derive_coordinate_system_from_first_uav() -> Optional[dict]:
+    """Return a NWU coordinate system dict whose origin is the GPS position
+    of the first connected UAV, or ``None`` if no UAV with a valid fix is
+    available. Used so that both the saved ``.skyb`` files and the
+    over-the-wire upload share the same origin.
+    """
+    from flockwave.server.model.uav import UAV
+
+    global app, log
+    if app is None:
+        return None
+
+    uav_ids = sorted(app.object_registry.ids_by_type(UAV))
+    if not uav_ids:
+        return None
+
+    first_uav = app.object_registry.find_by_id(uav_ids[0])
+    pos = getattr(getattr(first_uav, "status", None), "position", None)
+    lat = getattr(pos, "lat", None)
+    lon = getattr(pos, "lon", None)
+    if lat is None or lon is None or (lat == 0.0 and lon == 0.0):
+        if log:
+            log.warning(
+                f"Could not derive show origin from {uav_ids[0]} "
+                "(no GPS fix yet); saved files and uploads will use "
+                "origin (0, 0)."
+            )
+        return None
+
+    if log:
+        log.info(
+            f"Auto-derived show origin from {uav_ids[0]}: "
+            f"lat={lat}, lon={lon}"
+        )
+    return {"type": "nwu", "origin": [lon, lat], "orientation": 0}
+
+
+def _derive_amsl_reference_from_first_uav() -> Optional[float]:
+    """Return the current AMSL altitude (in meters) of the first connected
+    UAV, or ``None`` if no UAV reports a usable AMSL value yet.
+
+    Used so that the show specification includes an ``amslReference`` field
+    (matching the "AMSL" altitude reference in the Skybrush Live UI). Without
+    this the firmware sees ``SHOW_ORIGIN_AMSL = -32768000`` (the sentinel
+    "no AMSL reference" value) and may refuse to take off.
+    """
+    from flockwave.server.model.uav import UAV
+
+    global app, log
+    if app is None:
+        return None
+
+    uav_ids = sorted(app.object_registry.ids_by_type(UAV))
+    if not uav_ids:
+        return None
+
+    first_uav = app.object_registry.find_by_id(uav_ids[0])
+    pos = getattr(getattr(first_uav, "status", None), "position", None)
+    amsl = getattr(pos, "amsl", None)
+    if amsl is None:
+        if log:
+            log.warning(
+                f"Could not derive AMSL reference from {uav_ids[0]} "
+                "(no AMSL fix yet); show will be uploaded without an AMSL "
+                "reference and the firmware will treat Z as relative to home."
+            )
+        return None
+
+    try:
+        amsl_value = float(amsl)
+    except (TypeError, ValueError):
+        return None
+
+    # Reject obviously invalid sentinels (e.g. -32768.0 if the field was
+    # never populated). Real AMSL values are typically within +/-10000 m.
+    if amsl_value < -10000.0 or amsl_value > 10000.0:
+        if log:
+            log.warning(
+                f"AMSL reference from {uav_ids[0]} is out of range "
+                f"({amsl_value}); skipping."
+            )
+        return None
+
+    if log:
+        log.info(
+            f"Auto-derived AMSL reference from {uav_ids[0]}: {amsl_value:.2f} m"
+        )
+    return amsl_value
+
+
 async def _upload_to_connected_uavs(
     result,
     *,
     duration_ms: int = 300,
     takeoff_time: float = 0.0,
     coordinate_system: Optional[dict] = None,
+    amsl_reference: Optional[float] = None,
 ) -> dict:
     """Upload per-drone show specs to connected UAVs.
 
@@ -285,32 +408,12 @@ async def _upload_to_connected_uavs(
     # real origin, the firmware will reject the show because the resulting
     # waypoints land thousands of km away from the drone.
     if coordinate_system is None:
-        first_uav = app.object_registry.find_by_id(uav_ids[0])
-        pos = getattr(getattr(first_uav, "status", None), "position", None)
-        lat = getattr(pos, "lat", None)
-        lon = getattr(pos, "lon", None)
-        if (
-            lat is not None
-            and lon is not None
-            and (lat != 0.0 or lon != 0.0)
-        ):
-            coordinate_system = {
-                "type": "nwu",
-                "origin": [lon, lat],
-                "orientation": 0,
-            }
-            if log:
-                log.info(
-                    f"Auto-derived show origin from {uav_ids[0]}: "
-                    f"lat={lat}, lon={lon}"
-                )
-        else:
-            if log:
-                log.warning(
-                    "No coordinate_system provided and could not derive one "
-                    f"from {uav_ids[0]} (no GPS fix yet); show upload will "
-                    "likely be rejected by the drone."
-                )
+        coordinate_system = _derive_coordinate_system_from_first_uav()
+
+    # Same for the AMSL reference: without it the firmware uses the
+    # sentinel "no AMSL" value and the takeoff altitude check fails.
+    if amsl_reference is None:
+        amsl_reference = _derive_amsl_reference_from_first_uav()
 
     # Build per-drone show dicts (same format Skybrush Live would send)
     show_dicts = build_show_dicts(
@@ -318,6 +421,7 @@ async def _upload_to_connected_uavs(
         duration_ms=duration_ms,
         takeoff_time=takeoff_time,
         coordinate_system=coordinate_system,
+        amsl_reference=amsl_reference,
     )
     num_drones = len(show_dicts)
 

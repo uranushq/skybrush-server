@@ -330,6 +330,26 @@ class ScheduledTakeoffManager(ABC, Generic[TUAV]):
                         config, self._start_time
                     )
 
+                    # Diagnostic: log once whenever the desired takeoff config
+                    # changes (auth scope or takeoff time) so we can see if the
+                    # manager is producing the expected config at all.
+                    last_logged = getattr(self, "_last_logged_takeoff_config", None)
+                    fingerprint = (
+                        takeoff_config.authorization_scope,
+                        takeoff_config.takeoff_time,
+                        takeoff_config.should_update_takeoff_time,
+                    )
+                    if last_logged != fingerprint:
+                        self._last_logged_takeoff_config = fingerprint
+                        if log:
+                            log.info(
+                                f"Takeoff manager: auth_scope={takeoff_config.authorization_scope!r}, "
+                                f"takeoff_time={takeoff_config.takeoff_time}, "
+                                f"should_update_time={takeoff_config.should_update_takeoff_time}, "
+                                f"start_method={config.start_method!r}, "
+                                f"config_uav_ids={list(config.uav_ids)!r}"
+                            )
+
                     # Broadcast a packet that contains the desired takeoff time
                     # and the auth scope. If it fails, well, it does not matter
                     # because we will check the UAVs one by one as well. We

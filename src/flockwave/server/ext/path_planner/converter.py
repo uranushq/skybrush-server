@@ -144,6 +144,7 @@ def build_show_dicts(
     duration_ms: int = 300,
     takeoff_time: float = 0.0,
     coordinate_system: Optional[dict] = None,
+    amsl_reference: Optional[float] = None,
 ) -> List[dict]:
     """Build a list of full *show specification* dicts (one per drone).
 
@@ -191,15 +192,20 @@ def build_show_dicts(
             "rallyPoints": [],
         }
 
-        shows.append(
-            {
-                "trajectory": traj,
-                "lights": {"version": 1, "data": minimal_light},
-                "home": home,
-                "coordinateSystem": coordinate_system,
-                "geofence": geofence,
-            }
-        )
+        show_dict = {
+            "trajectory": traj,
+            "lights": {"version": 1, "data": minimal_light},
+            "home": home,
+            "coordinateSystem": coordinate_system,
+            "geofence": geofence,
+        }
+        # Setting an AMSL reference makes the firmware interpret the
+        # trajectory Z coordinates as offsets from this absolute altitude
+        # (in meters) rather than treating them as relative to home. This
+        # corresponds to the "AMSL" altitude reference in the Live UI.
+        if amsl_reference is not None:
+            show_dict["amslReference"] = float(amsl_reference)
+        shows.append(show_dict)
 
     return shows
 
@@ -209,10 +215,16 @@ async def save_skyb_files(
     output_dir: str | Path,
     duration_ms: int = 300,
     takeoff_time: float = 0.0,
+    coordinate_system: Optional[dict] = None,
+    amsl_reference: Optional[float] = None,
 ) -> Dict[str, str]:
     """Generate ``.skyb`` files for every drone and save them to *output_dir*.
 
     Also writes a ``show.json`` containing all drone show specifications.
+
+    The ``coordinate_system`` argument is forwarded to :func:`build_show_dicts`
+    so the JSON saved on disk matches what the drone actually receives over
+    MAVFTP. Pass the same dict you use for the auto-upload step.
 
     Returns a dict mapping drone id strings to their ``.skyb`` file paths.
     """
@@ -222,7 +234,13 @@ async def save_skyb_files(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    show_dicts = build_show_dicts(result, duration_ms, takeoff_time)
+    show_dicts = build_show_dicts(
+        result,
+        duration_ms,
+        takeoff_time,
+        coordinate_system=coordinate_system,
+        amsl_reference=amsl_reference,
+    )
     traj_dicts = solver_result_to_trajectory_dicts(result, duration_ms, takeoff_time)
     skyb_paths: Dict[str, str] = {}
 

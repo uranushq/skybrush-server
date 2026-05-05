@@ -86,11 +86,42 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
     async def update_uav(self, uav: MAVLinkUAV, config: TakeoffConfiguration) -> None:
         desired_auth_scope = config.authorization_scope
         desired_takeoff_time = config.takeoff_time_in_legacy_format
+        log = self._network.log
 
         if (
             desired_takeoff_time is None or desired_takeoff_time >= 0
         ) and desired_takeoff_time != uav.scheduled_takeoff_time:
-            await uav.set_scheduled_takeoff_time(seconds=desired_takeoff_time)
+            if log:
+                log.info(
+                    f"Setting SHOW_START_TIME on {uav.id} to {desired_takeoff_time} "
+                    f"(was {uav.scheduled_takeoff_time})"
+                )
+            try:
+                await uav.set_scheduled_takeoff_time(seconds=desired_takeoff_time)
+            except Exception:
+                if log:
+                    log.exception(
+                        f"Failed to set SHOW_START_TIME on {uav.id}"
+                    )
+                raise
+            else:
+                if log:
+                    log.info(f"SHOW_START_TIME set on {uav.id}")
 
         if desired_auth_scope != uav.scheduled_takeoff_authorization_scope:
-            await uav.set_authorization_scope(desired_auth_scope)
+            if log:
+                log.info(
+                    f"Setting SHOW_START_AUTH on {uav.id} to {desired_auth_scope!r} "
+                    f"(was {uav.scheduled_takeoff_authorization_scope!r})"
+                )
+            try:
+                await uav.set_authorization_scope(desired_auth_scope)
+            except Exception:
+                if log:
+                    log.exception(
+                        f"Failed to set SHOW_START_AUTH on {uav.id}"
+                    )
+                raise
+            else:
+                if log:
+                    log.info(f"SHOW_START_AUTH set on {uav.id}")
