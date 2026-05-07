@@ -27,8 +27,9 @@
       // network may contain up to 250 drones with system IDs from 1 to 250
       "networks": {
         "mav": {
-          // Listen for heartbeats on UDP port 14550, send broadcasts to UDP port 14555
-          "connections": ["default"]
+          // Listen for heartbeats on UDP 14550 and derive broadcast from
+          // subnet 192.168.0.0/16 -> 192.168.255.255 (broadcast port 14555)
+          "connections": ["udp-listen://:14550?subnet=192.168.0.0/16&broadcast_port=14555"]
           // Delete the previous line and uncomment the following two lines to enable a
           // secondary radio channel on port COM6, 57600 baud that is used for RTK
           // corrections and as a fallback for commands. Do _not_ uncomment this

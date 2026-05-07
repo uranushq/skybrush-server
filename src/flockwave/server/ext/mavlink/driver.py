@@ -494,6 +494,11 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         if result is None:
             raise TooSlowError(f"No response received for command {command_id} in time")
 
+        if result != MAVResult.ACCEPTED:
+            self.log.warning(
+                f"COMMAND_ACK for cmd_int {command_id}: result={result}"
+            )
+
         if result == MAVResult.UNSUPPORTED:
             raise NotSupportedError
 
@@ -608,6 +613,11 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
 
         if result is None:
             raise TooSlowError(f"No response received for command {command_id} in time")
+
+        if result != MAVResult.ACCEPTED:
+            self.log.warning(
+                f"COMMAND_ACK for cmd_long {command_id}: result={result}"
+            )
 
         if result == MAVResult.UNSUPPORTED:
             raise NotSupportedError
@@ -2181,10 +2191,69 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """Asks the UAV to reload the current drone show file."""
         # param1 = 0 if we want to reload the show file
         success = await self.driver.send_command_long(
-            self, MAVCommand.USER_1, SkybrushUserCommand.RELOAD_SHOW
+            self, MAVCommand.USER_1, SkybrushUserCommand.RELOAD_SHOW,
+            timeout=10,
         )
         if not success:
+            # Log the raw COMMAND_ACK result for debugging, together with
+            # whatever drone-side state we can extract to help figure out
+            # why the firmware refused the reload.
+            mode = getattr(self._status, "mode", None)
+            errors = list(getattr(self._status, "errors", []) or [])
+            position = getattr(self._status, "position", None)
+            lat = getattr(position, "lat", None)
+            lon = getattr(position, "lon", None)
+            amsl = getattr(position, "amsl", None)
+            self.driver.log.error(
+                f"reload_show COMMAND_ACK result was not ACCEPTED "
+                f"(USER_1 param1={SkybrushUserCommand.RELOAD_SHOW}); "
+                f"drone state: mode={mode!r}, errors={errors}, "
+                f"position=(lat={lat}, lon={lon}, amsl={amsl})"
+            )
+            self._dump_health_snapshot_for_reload_failure()
             raise RuntimeError("Failed to reload show file")
+
+    def _dump_health_snapshot_for_reload_failure(self) -> None:
+        """Logs a one-shot snapshot of cached health-related MAVLink messages
+        to help diagnose why the firmware refused a RELOAD_SHOW command.
+        """
+        # MAVLink message IDs: SYS_STATUS=1, AUTOPILOT_VERSION=148,
+        # EKF_STATUS_REPORT=193, HOME_POSITION=242, GPS_RAW_INT=24,
+        # FENCE_STATUS=162, POWER_STATUS=125
+        log = self.driver.log
+        diagnostics: list[tuple[int, str, tuple[str, ...]]] = [
+            (1,   "SYS_STATUS",         (
+                "onboard_control_sensors_present",
+                "onboard_control_sensors_enabled",
+                "onboard_control_sensors_health",
+                "voltage_battery", "current_battery", "battery_remaining",
+                "errors_count1", "errors_count2", "errors_count3", "errors_count4",
+            )),
+            (24,  "GPS_RAW_INT",        (
+                "fix_type", "satellites_visible", "eph", "epv", "lat", "lon", "alt",
+            )),
+            (125, "POWER_STATUS",       ("Vcc", "Vservo", "flags")),
+            (148, "AUTOPILOT_VERSION",  ("flight_sw_version", "capabilities")),
+            (162, "FENCE_STATUS",       (
+                "breach_status", "breach_count", "breach_type", "breach_time",
+            )),
+            (193, "EKF_STATUS_REPORT",  (
+                "flags", "velocity_variance", "pos_horiz_variance",
+                "pos_vert_variance", "compass_variance", "terrain_alt_variance",
+            )),
+            (242, "HOME_POSITION",      ("latitude", "longitude", "altitude")),
+        ]
+        for msg_id, name, fields in diagnostics:
+            msg = self.get_last_message(msg_id)
+            if msg is None:
+                log.warning(f"  [{name}] not seen yet")
+                continue
+            try:
+                d = msg.to_dict()
+            except Exception:
+                d = {f: getattr(msg, f, None) for f in fields}
+            picked = {f: d.get(f) for f in fields if f in d}
+            log.warning(f"  [{name}] {picked}")
 
     async def remove_show(self) -> None:
         """Asks the UAV to remove the current drone show file."""
@@ -2606,6 +2675,12 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         trajectory = get_trajectory_from_show_specification(show)
         geofence = get_geofence_configuration_from_show_specification(show)
 
+        self.driver.log.info(
+            f"Show upload: origin=({coordinate_system.origin.lat}, {coordinate_system.origin.lon}), "
+            f"alt_ref={altitude_reference}, trajectory_duration={trajectory.duration}s, "
+            f"light_program={len(light_program)}B"
+        )
+
         pyro_program = None
         rth_plan = None
         yaw_setpoints = None
@@ -2636,9 +2711,14 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             await show_file.finalize()
             data = show_file.get_contents()
 
+        self.driver.log.info(f"Show file built: {len(data)} bytes")
+        self.driver.log.info(f"Show file hex: {data.hex()}")
+
         # Upload show file
         async with aclosing(MAVFTP.for_uav(self)) as ftp:
             await ftp.put(data, "/collmot/show.skyb")
+
+        self.driver.log.info("Show file uploaded via MAVFTP")
 
         # We give some time for the filesystem to flush caches etc before
         # asking the drone to reload the show file. There were some reports
@@ -2646,6 +2726,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         # this could have been because the filesystem was not flushed fully
         # to the SD card before we tried to reload the show. We could not debug
         # it properly as it happened very rarely.
+        await sleep(2)
 
         # Encode latitude and longitude of show origin
         # TODO(ntamas): this is not entirely accurate due to the back-and-forth
@@ -2673,8 +2754,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 encoded_lon,
                 encoded_amsl,
             )
+            self.driver.log.info(f"USER_2 origin config: success={success}")
         except NotSupportedError:
             success = False
+            self.driver.log.info("USER_2 not supported, falling back to params")
 
         if not success:
             # Configure show origin, orientation and altitude reference using
@@ -2694,10 +2777,29 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
 
         # Configure and enable geofence
         await self.configure_geofence(geofence)
+        self.driver.log.info("Geofence configured, now reloading show...")
+
+        # Force flight-mode switch positions 5 and 6 to map to DRONE_SHOW
+        # (custom_mode = 127) so the operator can flip into show mode from
+        # the RC without losing it after a reboot. Failures are logged but
+        # do not abort the upload.
+        for _param_name in ("FLTMODE5", "FLTMODE6"):
+            try:
+                await self.set_parameter(_param_name, 127)
+                self.driver.log.info(f"{_param_name} set to 127 (drone show)")
+            except Exception as ex:
+                self.driver.log.warning(f"Failed to set {_param_name}=127: {ex}")
+
+        # NOTE: previously we automatically switched the vehicle into
+        # DRONE_SHOW mode (custom_mode=127) here because RELOAD_SHOW used
+        # to be rejected outside that mode. The auto-switch is disabled
+        # per user request; the firmware/operator is responsible for
+        # putting the vehicle into the desired mode before/after upload.
 
         # Ask drone to reload show file now that we are done with everything
         # else
         await self.reload_show()
+        self.driver.log.info("Show reloaded successfully")
 
     async def wait_until_connected(self) -> None:
         """Waits until the UAV becomes connected (i.e. when we see the next

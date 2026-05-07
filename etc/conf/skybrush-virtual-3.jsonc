@@ -1,0 +1,16 @@
+// Virtual configuration with 3 drones for testing the path planner.
+{
+  "EXTENSIONS": {
+    "http_server": {
+      "host": "",
+    },
+
+    "virtual_uavs": {
+      "enabled": true,
+      "count": 3,
+      "id_format": "{0:03}",
+      "origin": [18.915125, 47.486305, 215],
+      "orientation": 59,
+    },
+  },
+}
