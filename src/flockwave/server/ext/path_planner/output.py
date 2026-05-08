@@ -24,10 +24,10 @@ from __future__ import annotations
 
 from io import BytesIO
 from json import dumps
-from typing import Any, List, Optional
+from typing import Any, List, Optional, cast
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from .converter import build_show_dicts
+from .converter import build_show_dicts, build_show_dicts_from_explicit_drone_paths
 from .solver import SolverResult
 
 DEFAULT_DURATION_MS = 300
@@ -66,6 +66,56 @@ def build_output(result: SolverResult, duration_ms: int = DEFAULT_DURATION_MS) -
             "path": path,
         }
         drones_out.append(drone_entry)
+
+    return {"drones": drones_out}
+
+
+def build_output_from_explicit_drone_paths(drones: list[dict]) -> dict:
+    """API response for ``{ "drones": [ { "id", "path": [...] } ] }`` requests."""
+    drones_out: list[dict[str, Any]] = []
+
+    for d in drones:
+        did = str(d.get("id", ""))
+        path_in = d.get("path")
+        if not isinstance(path_in, list):
+            continue
+
+        pos0 = [0.0, 0.0, 0.0]
+        if path_in and isinstance(path_in[0], dict):
+            p0 = path_in[0]
+            pos0 = [
+                round(float(p0.get("x", 0)), 4),
+                round(float(p0.get("y", 0)), 4),
+                round(float(p0.get("z", 0)), 4),
+            ]
+
+        path_out: list[dict[str, Any]] = []
+        for i, wp in enumerate(path_in):
+            if not isinstance(wp, dict):
+                continue
+            wp_m = cast(dict[str, Any], wp)
+            if i == 0:
+                continue
+            x = round(float(wp_m["x"]), 4)
+            y = round(float(wp_m["y"]), 4)
+            z = round(float(wp_m["z"]), 4)
+            dur = int(wp_m.get("durationMs", 0) or 0)
+            path_out.append({"x": x, "y": y, "z": z, "durationMs": dur})
+            hold = int(wp_m.get("holdMs") or 0)
+            if hold > 0:
+                path_out.append({"x": x, "y": y, "z": z, "durationMs": hold})
+
+        idx = len(drones_out) + 1
+        drones_out.append(
+            {
+                "id": did or f"drone-{idx}",
+                "name": f"Drone {idx}",
+                "battery": 100,
+                "status": "Flying",
+                "pos": pos0,
+                "path": path_out,
+            }
+        )
 
     return {"drones": drones_out}
 
@@ -161,6 +211,61 @@ def build_skyc_bytes(
         "meta": {
             "id": f"path-planner-{len(drones_swarm)}",
             "title": f"Path planner export ({len(drones_swarm)} drones)",
+        },
+        "media": {},
+    }
+
+    archive = BytesIO()
+    with ZipFile(archive, mode="w", compression=ZIP_DEFLATED) as zf:
+        zf.writestr("show.json", dumps(show, ensure_ascii=False, indent=2))
+        zf.writestr("cues.json", dumps(cues, ensure_ascii=False, indent=2))
+
+    return archive.getvalue()
+
+
+def build_skyc_bytes_from_explicit_drone_paths(
+    drones: list[dict],
+    *,
+    takeoff_time: float = 0.0,
+    coordinate_system: Optional[dict] = None,
+    amsl_reference: Optional[float] = None,
+) -> bytes:
+    """Build a ``.skyc`` ZIP from frontend waypoint payloads (see ``/plan``)."""
+    show_dicts = build_show_dicts_from_explicit_drone_paths(
+        drones,
+        takeoff_time=takeoff_time,
+        coordinate_system=coordinate_system,
+        amsl_reference=amsl_reference,
+    )
+    cues = {"version": 1, "items": [{"time": 0.0, "name": "start"}]}
+
+    drones_swarm: list[dict[str, Any]] = []
+    for idx, show_dict in enumerate(show_dicts):
+        src = drones[idx] if idx < len(drones) else {}
+        drone_name = str(src.get("id") or f"drone-{idx + 1}")
+        entry = {
+            "type": "generic",
+            "settings": {"name": drone_name, **show_dict},
+        }
+        drones_swarm.append(entry)
+
+    show = {
+        "version": 1,
+        "format": "show-upload-v1",
+        "settings": {
+            "cues": cues,
+            "validation": {
+                "maxAltitude": 150,
+                "maxVelocityXY": 8,
+                "maxVelocityZ": 2.5,
+                "minDistance": 3,
+            },
+        },
+        "swarm": {"drones": drones_swarm},
+        "environment": {"type": "outdoor"},
+        "meta": {
+            "id": f"path-planner-explicit-{len(drones_swarm)}",
+            "title": f"Path planner explicit ({len(drones_swarm)} drones)",
         },
         "media": {},
     }

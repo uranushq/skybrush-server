@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .drone import Drone, Vec3
@@ -56,9 +56,7 @@ class PathSolver:
         seed: Optional[int] = None,
         on_step: Optional[Callable[[StepRecord], None]] = None,
     ) -> None:
-        assert len(initials) == len(targets), (
-            "initial and target counts must match"
-        )
+        assert len(initials) == len(targets), "initial and target counts must match"
         self.step_size = step_size
         self.on_step = on_step
 
@@ -67,14 +65,10 @@ class PathSolver:
 
         self.drones: List[Drone] = []
         for i, (ini, tgt) in enumerate(zip(initials, targets)):
-            self.drones.append(
-                Drone(drone_id=i, initial=tuple(ini), target=tuple(tgt))
-            )
+            self.drones.append(Drone(drone_id=i, initial=tuple(ini), target=tuple(tgt)))
 
         self.history: List[StepRecord] = []
-        self._consecutive_holds: Dict[int, int] = {
-            i: 0 for i in range(len(initials))
-        }
+        self._consecutive_holds: Dict[int, int] = dict.fromkeys(range(len(initials)), 0)
 
     # ── collision detection ──────────────────────────────────────────────
 
@@ -100,22 +94,45 @@ class PathSolver:
 
     # ── detour candidates ────────────────────────────────────────────────
 
-    def _detour_candidates(
-        self, drone: Drone, step_size: float
-    ) -> List[List[float]]:
+    def _detour_candidates(self, drone: Drone, step_size: float) -> List[List[float]]:
         candidates: List[List[float]] = []
         offsets = [
-            (1, 0, 0), (-1, 0, 0),
-            (0, 1, 0), (0, -1, 0),
-            (0, 0, 1), (0, 0, -1),
-            (1, 1, 0), (1, -1, 0), (-1, 1, 0), (-1, -1, 0),
-            (1, 0, 1), (1, 0, -1), (-1, 0, 1), (-1, 0, -1),
-            (0, 1, 1), (0, 1, -1), (0, -1, 1), (0, -1, -1),
-            (1, 1, 1), (1, 1, -1), (1, -1, 1), (1, -1, -1),
-            (-1, 1, 1), (-1, 1, -1), (-1, -1, 1), (-1, -1, -1),
-            (0, 0, 4), (0, 0, -4),
-            (1, 0, 4), (-1, 0, 4), (0, 1, 4), (0, -1, 4),
-            (1, 0, -4), (-1, 0, -4), (0, 1, -4), (0, -1, -4),
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+            (1, 1, 0),
+            (1, -1, 0),
+            (-1, 1, 0),
+            (-1, -1, 0),
+            (1, 0, 1),
+            (1, 0, -1),
+            (-1, 0, 1),
+            (-1, 0, -1),
+            (0, 1, 1),
+            (0, 1, -1),
+            (0, -1, 1),
+            (0, -1, -1),
+            (1, 1, 1),
+            (1, 1, -1),
+            (1, -1, 1),
+            (1, -1, -1),
+            (-1, 1, 1),
+            (-1, 1, -1),
+            (-1, -1, 1),
+            (-1, -1, -1),
+            (0, 0, 4),
+            (0, 0, -4),
+            (1, 0, 4),
+            (-1, 0, 4),
+            (0, 1, 4),
+            (0, -1, 4),
+            (1, 0, -4),
+            (-1, 0, -4),
+            (0, 1, -4),
+            (0, -1, -4),
         ]
         for ox, oy, oz in offsets:
             mag = math.sqrt(ox * ox + oy * oy + oz * oz)
@@ -170,19 +187,15 @@ class PathSolver:
                     colliding_ids.add(a_id)
                     colliding_ids.add(b_id)
 
-                arrived_ids: Set[int] = {
-                    d.drone_id for d in self.drones if d.arrived
-                }
+                arrived_ids: Set[int] = {d.drone_id for d in self.drones if d.arrived}
 
-                def priority(did: int) -> float:
-                    if did in arrived_ids:
+                def priority(did: int, arrived: Set[int] = arrived_ids) -> float:
+                    if did in arrived:
                         return float("inf")
                     d = next(dr for dr in self.drones if dr.drone_id == did)
                     return d.remaining_distance()
 
-                sorted_colliders = sorted(
-                    colliding_ids, key=priority, reverse=True
-                )
+                sorted_colliders = sorted(colliding_ids, key=priority, reverse=True)
                 survivor = sorted_colliders[0]
                 reverted = [
                     did

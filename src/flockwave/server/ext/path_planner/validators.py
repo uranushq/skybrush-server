@@ -22,7 +22,7 @@ the request but are surfaced in the response payload.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple, cast
 
 __all__ = (
     "ValidationIssue",
@@ -165,23 +165,55 @@ class MinFlightAltitudeValidator(PathValidator):
         EPS = 1e-3
 
         violations: List[dict] = []
-        for label, points in (("initial", ctx.initial), ("target", ctx.target)):
-            for i, pt in enumerate(points):
-                if len(pt) < 3:
+        body = ctx.body if isinstance(ctx.body, Mapping) else {}
+        drones = body.get("drones")
+        if (
+            isinstance(drones, list)
+            and drones
+            and all(isinstance(d, dict) and "path" in d for d in drones)
+        ):
+            for di, d in enumerate(drones):
+                d_map = cast(dict[str, Any], d)
+                path = d_map.get("path")
+                if not isinstance(path, list):
                     continue
-                z = float(pt[2])
-                if z + EPS < min_alt:
-                    violations.append(
-                        {"label": label, "index": i, "z": z}
-                    )
+                flight_started = False
+                for wi, wp in enumerate(path):
+                    if not isinstance(wp, dict) or "z" not in wp:
+                        continue
+                    wp_map = cast(dict[str, Any], wp)
+                    try:
+                        z = float(wp_map["z"])
+                    except (TypeError, ValueError):
+                        continue
+                    # Explicit waypoint mode often starts on the ground.
+                    # Ignore pre-flight keyframes until the first point
+                    # reaches the minimum altitude.
+                    if not flight_started and z + EPS < min_alt:
+                        continue
+                    flight_started = True
+                    if z + EPS < min_alt:
+                        violations.append(
+                            {
+                                "label": f"drones[{di}].path",
+                                "index": wi,
+                                "z": z,
+                            }
+                        )
+        else:
+            for label, points in (("initial", ctx.initial), ("target", ctx.target)):
+                for i, pt in enumerate(points):
+                    if len(pt) < 3:
+                        continue
+                    z = float(pt[2])
+                    if z + EPS < min_alt:
+                        violations.append({"label": label, "index": i, "z": z})
 
         if not violations:
             return
 
         if source is None:
-            source_msg = (
-                f"firmware parameter not readable, using fallback {min_alt} m"
-            )
+            source_msg = f"firmware parameter not readable, using fallback {min_alt} m"
         else:
             source_msg = f"firmware parameter {source} = {min_alt} m"
 
@@ -250,8 +282,7 @@ async def fetch_required_params(
     if get_param is None:
         if log:
             log.warning(
-                "UAV does not expose get_parameter(); skipping parameter "
-                "validation."
+                "UAV does not expose get_parameter(); skipping parameter validation."
             )
         return out
 
