@@ -22,7 +22,7 @@ from .drone import Drone, Vec3
 # collision envelope per axis
 COLLISION_X = 1.0
 COLLISION_Y = 1.0
-COLLISION_Z = 4.0
+COLLISION_Z = 1.0
 
 MAX_STEPS = 50_000
 DEADLOCK_THRESHOLD = 2
