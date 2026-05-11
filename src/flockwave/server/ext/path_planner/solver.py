@@ -3,7 +3,8 @@
 Algorithm
 ---------
 1. Each step, every drone moves one step toward its target (greedy).
-2. Collision check after proposed moves (|dx| < 1, |dy| < 1, |dz| < 4).
+2. Collision check: endpoints *and* linear motion over the step share the same
+   axis-aligned envelope (|dx| < COLLISION_X on all three axes simultaneously).
 3. Colliding drones revert to their previous position (hold), prioritised
    by remaining distance.
 4. Deadlocked drones attempt detour moves.
@@ -26,6 +27,9 @@ COLLISION_Z = 1.0
 
 MAX_STEPS = 50_000
 DEADLOCK_THRESHOLD = 2
+
+# Numerical slack for swept-interval intersection (open inequalities vs. FP).
+_SWEPT_TIME_EPS = 1e-9
 
 
 @dataclass
@@ -98,6 +102,77 @@ class PathSolver:
                     collisions.append((a_id, b_id))
         return collisions
 
+    @staticmethod
+    def _axis_open_interval_on_unit_segment(
+        d0: float, v: float, limit: float
+    ) -> tuple[float, float] | None:
+        """``{ t in [0,1] : |d0 + v*t| < limit }`` as ``(lo, hi)``, or empty."""
+        if abs(v) <= _SWEPT_TIME_EPS:
+            if abs(d0) < limit:
+                return (0.0, 1.0)
+            return None
+        t_lo = min((limit - d0) / v, (-limit - d0) / v)
+        t_hi = max((limit - d0) / v, (-limit - d0) / v)
+        lo = max(0.0, t_lo)
+        hi = min(1.0, t_hi)
+        if hi <= lo + _SWEPT_TIME_EPS:
+            return None
+        return (lo, hi)
+
+    @classmethod
+    def _swept_colliding(
+        cls,
+        a0: List[float],
+        a1: List[float],
+        b0: List[float],
+        b1: List[float],
+    ) -> bool:
+        """True if some ``t in [0,1]`` has both drones inside the collision box.
+
+        Each drone moves linearly ``p(t) = p0 + t*(p1-p0)`` with the same ``t``.
+        """
+        d0 = [a0[k] - b0[k] for k in range(3)]
+        vrel = [(a1[k] - a0[k]) - (b1[k] - b0[k]) for k in range(3)]
+        limits = (COLLISION_X, COLLISION_Y, COLLISION_Z)
+        lo, hi = 0.0, 1.0
+        for k in range(3):
+            seg = cls._axis_open_interval_on_unit_segment(d0[k], vrel[k], limits[k])
+            if seg is None:
+                return False
+            lo = max(lo, seg[0])
+            hi = min(hi, seg[1])
+            if hi <= lo + _SWEPT_TIME_EPS:
+                return False
+        return True
+
+    def _pair_step_conflict(
+        self,
+        prev_a: List[float],
+        next_a: List[float],
+        prev_b: List[float],
+        next_b: List[float],
+    ) -> bool:
+        """Endpoint or simultaneous linear motion violates the collision box."""
+        if self._is_colliding(prev_a, prev_b):
+            return True
+        if self._is_colliding(next_a, next_b):
+            return True
+        return self._swept_colliding(prev_a, next_a, prev_b, next_b)
+
+    def _find_step_collisions(
+        self, prev: Dict[int, List[float]], proposed: Dict[int, List[float]]
+    ) -> List[Tuple[int, int]]:
+        ids = list(proposed.keys())
+        collisions: List[Tuple[int, int]] = []
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a_id, b_id = ids[i], ids[j]
+                if self._pair_step_conflict(
+                    prev[a_id], proposed[a_id], prev[b_id], proposed[b_id]
+                ):
+                    collisions.append((a_id, b_id))
+        return collisions
+
     # ── detour candidates ────────────────────────────────────────────────
 
     def _detour_candidates(
@@ -162,8 +237,8 @@ class PathSolver:
                         d.peek_next_position(self.step_size)
                     )
 
-            # Phase 2 — collision resolution
-            collisions = self._find_collisions(proposed)
+            # Phase 2 — collision resolution (endpoints + swept motion this step)
+            collisions = self._find_step_collisions(prev_positions, proposed)
             reverted: List[int] = []
 
             if collisions:
@@ -198,7 +273,9 @@ class PathSolver:
                 # Phase 2.5 — iterative resolution
                 max_resolve_iter = len(self.drones) + 5
                 for _ in range(max_resolve_iter):
-                    post_collisions = self._find_collisions(proposed)
+                    post_collisions = self._find_step_collisions(
+                        prev_positions, proposed
+                    )
                     if not post_collisions:
                         break
                     for a_id, b_id in post_collisions:
@@ -217,7 +294,9 @@ class PathSolver:
                     for cand_pos in candidates:
                         test_proposed = dict(proposed)
                         test_proposed[did] = cand_pos
-                        if not self._find_collisions(test_proposed):
+                        if not self._find_step_collisions(
+                            prev_positions, test_proposed
+                        ):
                             proposed[did] = cand_pos
                             reverted.remove(did)
                             break
