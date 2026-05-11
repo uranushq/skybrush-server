@@ -55,7 +55,14 @@ from flockwave.server.utils import overridden
 from .converter import build_show_dicts, save_skyb_files
 from .drone import Drone
 from .output import build_output, build_show_specifications, build_skyc_bytes
-from .solver import COLLISION_X, COLLISION_Y, COLLISION_Z, PathSolver, SolverResult, StepRecord
+from .solver import (
+    COLLISION_X,
+    COLLISION_Y,
+    COLLISION_Z,
+    PathSolver,
+    SolverResult,
+    StepRecord,
+)
 from .validators import (
     SEVERITY_ERROR,
     ValidationContext,
@@ -355,6 +362,7 @@ def _plan_formation_phases(
     duration_ms: int,
     seed: Optional[int],
     return_to_initial: bool = True,
+    min_z: float = 0.0,
 ) -> tuple[SolverResult, list[dict]]:
     """Plan synced formation phases with collision avoidance between phases."""
     num_drones = len(initial)
@@ -383,6 +391,7 @@ def _plan_formation_phases(
                 targets=targets,
                 step_size=step_size,
                 seed=seed,
+                min_z=min_z,
             )
             result = solver.solve()
             step_offset = combined_steps[-1].step
@@ -443,6 +452,7 @@ def _plan_formation_phases(
                 targets=final_targets,
                 step_size=step_size,
                 seed=seed,
+                min_z=min_z,
             )
             result = solver.solve()
             step_offset = combined_steps[-1].step
@@ -682,6 +692,7 @@ async def plan():
             duration_ms=duration_ms,
             seed=seed,
             return_to_initial=bool(body.get("return_to_initial", True)),
+            min_z=initial_altitude,
         )
     else:
         initials = [tuple(p) for p in initial]

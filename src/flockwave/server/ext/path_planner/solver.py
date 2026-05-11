@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .drone import Drone, Vec3
@@ -55,12 +55,14 @@ class PathSolver:
         step_size: float = 1.0,
         seed: Optional[int] = None,
         on_step: Optional[Callable[[StepRecord], None]] = None,
+        min_z: float = 0.0,
     ) -> None:
         assert len(initials) == len(targets), (
             "initial and target counts must match"
         )
         self.step_size = step_size
         self.on_step = on_step
+        self.min_z = float(min_z)
 
         if seed is not None:
             random.seed(seed)
@@ -72,9 +74,7 @@ class PathSolver:
             )
 
         self.history: List[StepRecord] = []
-        self._consecutive_holds: Dict[int, int] = {
-            i: 0 for i in range(len(initials))
-        }
+        self._consecutive_holds: Dict[int, int] = dict.fromkeys(range(len(initials)), 0)
 
     # ── collision detection ──────────────────────────────────────────────
 
@@ -121,7 +121,7 @@ class PathSolver:
             mag = math.sqrt(ox * ox + oy * oy + oz * oz)
             nx = drone.position[0] + ox / mag * step_size
             ny = drone.position[1] + oy / mag * step_size
-            nz = drone.position[2] + oz / mag * step_size
+            nz = max(self.min_z, drone.position[2] + oz / mag * step_size)
             candidates.append([nx, ny, nz])
         random.shuffle(candidates)
         return candidates
@@ -158,7 +158,9 @@ class PathSolver:
                 if d.arrived:
                     proposed[d.drone_id] = list(d.position)
                 else:
-                    proposed[d.drone_id] = d.peek_next_position(self.step_size)
+                    proposed[d.drone_id] = self._clamp_position(
+                        d.peek_next_position(self.step_size)
+                    )
 
             # Phase 2 — collision resolution
             collisions = self._find_collisions(proposed)
@@ -174,7 +176,7 @@ class PathSolver:
                     d.drone_id for d in self.drones if d.arrived
                 }
 
-                def priority(did: int) -> float:
+                def priority(did: int, arrived_ids=arrived_ids) -> float:
                     if did in arrived_ids:
                         return float("inf")
                     d = next(dr for dr in self.drones if dr.drone_id == did)
@@ -255,3 +257,7 @@ class PathSolver:
             drones=self.drones,
             success=success,
         )
+
+    def _clamp_position(self, position: List[float]) -> List[float]:
+        """Keep generated paths inside the allowed altitude envelope."""
+        return [position[0], position[1], max(self.min_z, position[2])]
