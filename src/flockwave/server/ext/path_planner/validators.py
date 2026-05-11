@@ -164,12 +164,31 @@ class MinFlightAltitudeValidator(PathValidator):
         # (e.g. user typed 2.5 against a 2.5 m limit).
         EPS = 1e-3
 
+        point_groups: list[tuple[str, Sequence]] = [
+            ("initial", ctx.initial),
+            ("target", ctx.target),
+        ]
+        phases = ctx.body.get("phases")
+        if isinstance(phases, list):
+            for phase_index, phase in enumerate(phases):
+                if isinstance(phase, Mapping) and isinstance(phase.get("points"), list):
+                    point_groups.append(
+                        (f"phases[{phase_index}].points", phase["points"])
+                    )
+
         violations: List[dict] = []
-        for label, points in (("initial", ctx.initial), ("target", ctx.target)):
+        for label, points in point_groups:
             for i, pt in enumerate(points):
-                if len(pt) < 3:
+                if isinstance(pt, Mapping):
+                    z_value = pt.get("z")
+                elif len(pt) >= 3:
+                    z_value = pt[2]
+                else:
                     continue
-                z = float(pt[2])
+                try:
+                    z = float(z_value)
+                except (TypeError, ValueError):
+                    continue
                 if z + EPS < min_alt:
                     violations.append(
                         {"label": label, "index": i, "z": z}
