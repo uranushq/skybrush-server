@@ -21,9 +21,9 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from .drone import Drone, Vec3
 
 # collision envelope per axis
-COLLISION_X = 1.0
-COLLISION_Y = 1.0
-COLLISION_Z = 1.0
+COLLISION_X = 1.5
+COLLISION_Y = 1.5
+COLLISION_Z = 1.5
 
 MAX_STEPS = 50_000
 DEADLOCK_THRESHOLD = 2

@@ -3029,16 +3029,33 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     async def _set_armed_state(
         self, armed: bool, *, force: bool = False, channel: str = Channel.PRIMARY
     ) -> None:
-        if not await self.driver.send_command_long(
-            self,
-            MAVCommand.COMPONENT_ARM_DISARM,
-            1 if armed else 0,
-            FORCE_MAGIC if force else 0,
-            channel=channel,
-        ):
-            raise RuntimeError(
-                "Failed to arm the motors" if armed else "Failed to disarm the motors"
-            )
+        # Arm: try a normal COMMAND_ACK path first, then MAVLink force (param2)
+        # if pre-arm fails (e.g. no RC). Disarm: single attempt using `force` only.
+        if armed and not force:
+            force_attempts: tuple[bool, ...] = (False, True)
+        else:
+            force_attempts = (force,)
+
+        for index, use_force in enumerate(force_attempts):
+            if await self.driver.send_command_long(
+                self,
+                MAVCommand.COMPONENT_ARM_DISARM,
+                1 if armed else 0,
+                FORCE_MAGIC if use_force else 0,
+                channel=channel,
+            ):
+                if armed and index > 0:
+                    self.driver.log.warning(
+                        "Arm succeeded after autopilot rejected normal arm; used "
+                        "MAVLink force flag (e.g. missing RC). Prefer vehicle params "
+                        "for GCS-only setups.",
+                        extra={"id": log_id_for_uav(self)},
+                    )
+                return
+
+        raise RuntimeError(
+            "Failed to arm the motors" if armed else "Failed to disarm the motors"
+        )
 
     def _set_connection_state(
         self, value: ConnectionState, heartbeat: MAVLinkMessage | None
