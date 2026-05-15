@@ -709,6 +709,7 @@ class VirtualUAV(UAVBase):
         if state is VirtualUAVState.TAKEOFF or state is VirtualUAVState.AIRBORNE:
             if self._trajectory_player and self._mission_started_at is not None:
                 self._update_target_from_trajectory()
+                state = self._state
 
         # Do we have a target?
         if self._target_xyz is not None:
