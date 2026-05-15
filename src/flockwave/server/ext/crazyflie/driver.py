@@ -497,6 +497,17 @@ class CrazyflieDriver(UAVDriver["CrazyflieUAV"]):
     ) -> None:
         await uav.shutdown()
 
+    async def _send_show_start_signal_single(
+        self,
+        uav: "CrazyflieUAV",
+        *,
+        authorization_scope=None,
+        transport: TransportOptions | None = None,
+    ) -> None:
+        if not uav.is_in_drone_show_mode:
+            raise RuntimeError("UAV is not in drone show mode")
+        await uav.start_drone_show()
+
     async def _send_takeoff_signal_single(
         self, uav, *, scheduled: bool = False, transport: TransportOptions | None = None
     ) -> None:

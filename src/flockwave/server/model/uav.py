@@ -964,6 +964,39 @@ class UAVDriver(Generic[TUAV], ABC):
             transport=transport,
         )
 
+    def send_show_start_signal(
+        self,
+        uavs: list[TUAV],
+        *,
+        authorization_scope: Any = None,
+        transport: TransportOptions | None = None,
+    ):
+        """Asks the driver to start the pre-uploaded show on the given UAVs.
+
+        Unlike :meth:`send_takeoff_signal`, this method must not arm the UAVs or
+        issue a regular takeoff command. It is intended for cases where the UAVs
+        were armed manually and only the uploaded show path should be started.
+
+        Parameters:
+            uavs: the UAVs to address with this request.
+            authorization_scope: optional show authorization scope used by
+                drivers that need to forward it to the UAV firmware.
+            transport: transport options for sending the signal.
+
+        Returns:
+            dict mapping UAVs to the corresponding results (which may also be
+            errors or awaitables; it is the responsibility of the caller to
+            evaluate errors and wait for awaitables)
+        """
+        return self._dispatch_request(
+            uavs,
+            "show start signal",
+            self._send_show_start_signal_single,
+            getattr(self, "_send_show_start_signal_broadcast", None),
+            authorization_scope=authorization_scope,
+            transport=transport,
+        )
+
     def send_takeoff_signal(
         self,
         uavs: list[TUAV],
@@ -1540,6 +1573,20 @@ class UAVDriver(Generic[TUAV], ABC):
                 driver and will not be supported in the future either
         """
         raise NotImplementedError
+
+    def _send_show_start_signal_single(
+        self,
+        uav: TUAV,
+        *,
+        authorization_scope: Any = None,
+        transport: TransportOptions | None = None,
+    ) -> None | Awaitable[None]:
+        """Asks the driver to start the uploaded show on a single UAV.
+
+        Implementations must not arm the UAV or issue a regular takeoff
+        command. Raise an exception if the uploaded show cannot be started.
+        """
+        raise NotSupportedError
 
     def _send_takeoff_signal_single(
         self,

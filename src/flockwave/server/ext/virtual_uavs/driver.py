@@ -1304,6 +1304,12 @@ class VirtualUAVDriver(UAVDriver[VirtualUAV]):
     def _send_shutdown_signal_single(self, uav: VirtualUAV, *, transport=None) -> None:
         uav.shutdown()
 
+    async def _send_show_start_signal_single(
+        self, uav: VirtualUAV, *, authorization_scope=None, transport=None
+    ) -> None:
+        await sleep(0.2)
+        uav.takeoff()
+
     async def _send_takeoff_signal_single(
         self, uav: VirtualUAV, *, scheduled: bool = False, transport=None
     ) -> None:

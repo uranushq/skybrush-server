@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from functools import partial
 from logging import Logger
 from math import inf, isfinite
-from time import monotonic
+from time import monotonic, time
 from typing import Any, Sequence
 
 from colour import Color
@@ -1001,6 +1001,21 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             channel=channel,
         ):
             raise RuntimeError("Failed to send shutdown command to autopilot")
+
+    async def _send_show_start_signal_single(
+        self,
+        uav: "MAVLinkUAV",
+        *,
+        authorization_scope: AuthorizationScope | None = None,
+        transport=None,
+    ) -> None:
+        if authorization_scope is None:
+            authorization_scope = AuthorizationScope.LIVE
+        if authorization_scope is AuthorizationScope.NONE:
+            raise RuntimeError("Show start is not authorized")
+
+        await uav.set_authorization_scope(authorization_scope)
+        await uav.set_scheduled_takeoff_time(int(time()) + 1)
 
     async def _send_takeoff_signal_single(
         self, uav: "MAVLinkUAV", *, scheduled: bool = False, transport=None

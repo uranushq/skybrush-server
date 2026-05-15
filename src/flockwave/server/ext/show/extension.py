@@ -6,6 +6,7 @@ from math import inf
 from typing import Any
 
 from flockwave.concurrency import CancellableTaskGroup
+from flockwave.spec.errors import FlockwaveErrorCode
 from trio import Nursery, TooSlowError, fail_after, open_nursery, sleep_forever
 from trio_util import periodic
 
@@ -123,6 +124,47 @@ class DroneShowExtension(Extension):
         except Exception as ex:
             return hub.acknowledge(message, outcome=False, reason=str(ex))
 
+    async def handle_SHOW_START(self, message, sender, hub):
+        if not self._config.authorized_to_start:
+            return hub.acknowledge(
+                message, outcome=False, reason="Show start is not authorized"
+            )
+
+        uav_ids = tuple(message.get_ids()) or tuple(
+            uav_id for uav_id in self._config.uav_ids if uav_id is not None
+        )
+        if not uav_ids:
+            return hub.acknowledge(message, outcome=False, reason="No UAVs selected")
+
+        response = hub.create_response_or_notification(body={}, in_response_to=message)
+        uavs_by_drivers = self.app.sort_uavs_by_drivers(uav_ids, response)
+        authorization_scope = self._config.scope_iff_authorized
+
+        self.log.info(
+            "Manual show start requested for %s",
+            ", ".join(uav_ids),
+        )
+
+        for driver, uavs in uavs_by_drivers.items():
+            armed_uavs = []
+            for uav in uavs:
+                if self._is_uav_known_to_be_disarmed(uav):
+                    response.add_error(uav.id, "UAV is not armed")
+                else:
+                    armed_uavs.append(uav)
+
+            if not armed_uavs:
+                continue
+
+            results = driver.send_show_start_signal(
+                armed_uavs, authorization_scope=authorization_scope
+            )
+            await self._add_show_start_results_to_response(
+                response, results, armed_uavs
+            )
+
+        return response
+
     async def run(self, app, configuration, logger):
         self._clock = ShowClock()
         self._end_clock = ShowEndClock()
@@ -135,6 +177,8 @@ class DroneShowExtension(Extension):
             "SHOW-LIGHTS": self.handle_SHOW_LIGHTS,
             "SHOW-SETCFG": self.handle_SHOW_SETCFG,
             "SHOW-SETLIGHTS": self.handle_SHOW_SETLIGHTS,
+            "SHOW-START": self.handle_SHOW_START,
+            "X-SHOW-START": self.handle_SHOW_START,
         }
 
         self._config.start_method = StartMethod(
@@ -380,6 +424,36 @@ class DroneShowExtension(Extension):
         assert self.app is not None
         countdown_signal = self.app.import_api("signals").get("show:countdown")
         countdown_signal.send(self, delay=seconds_left if not cancelled else None)
+
+    async def _add_show_start_results_to_response(
+        self, response, results, uavs
+    ) -> None:
+        try:
+            with fail_after(5):
+                results = await wait_for_dict_items(results)
+        except TooSlowError:
+            for uav in uavs:
+                response.add_error(uav.id, "Show start signal timed out")
+            return
+
+        if isinstance(results, Exception):
+            for uav in uavs:
+                response.add_error(uav.id, str(results))
+            self.log.warning("Manual show start failed: %s", results)
+            return
+
+        for uav in uavs:
+            result = results.get(uav) if isinstance(results, dict) else results
+            if isinstance(result, Exception):
+                response.add_error(uav.id, str(result))
+                self.log.warning("Manual show start failed for %s: %s", uav.id, result)
+            else:
+                response.add_result(uav.id, True)
+                self.log.info("Manual show start succeeded for %s", uav.id)
+
+    @staticmethod
+    def _is_uav_known_to_be_disarmed(uav) -> bool:
+        return FlockwaveErrorCode.DISARMED.value in uav.status.errors
 
     def _start_uavs_if_needed(self) -> None:
         assert self.app is not None
