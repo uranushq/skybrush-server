@@ -966,7 +966,10 @@ async def _upload_to_connected_uavs(
             details[uav_id] = "ok"
             uploaded += 1
             if log:
-                log.info(f"Show uploaded to {uav_id} (drone-{idx + 1})")
+                log.info(
+                    f"path-planner: show upload completed for UAV {uav_id} "
+                    f"(planned drone {idx + 1} of {num_drones})"
+                )
         except Exception as exc:
             details[uav_id] = f"error: {exc}"
             if log:

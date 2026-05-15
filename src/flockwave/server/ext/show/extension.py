@@ -205,6 +205,11 @@ class DroneShowExtension(Extension):
                 stack.enter_context(
                     app.message_hub.use_request_middleware(self._log_middleware)
                 )
+                stack.enter_context(
+                    app.import_api("signals")
+                    .get("show:uav_upload_finished")
+                    .connected_to(self._on_uav_show_upload_finished)
+                )
                 stack.enter_context(self._clock_sync.use_secondary_clock(self._clock))
                 stack.enter_context(
                     self._end_clock_sync.use_secondary_clock(self._end_clock)
@@ -249,6 +254,29 @@ class DroneShowExtension(Extension):
         assert self.app is not None
         updated_signal = self.app.import_api("signals").get("show:config_updated")
         updated_signal.send(self, config=self._config.clone())
+
+    def _on_uav_show_upload_finished(self, sender, **kwargs) -> None:
+        """Logs per-UAV show upload outcomes on the show extension logger.
+
+        MAVLink (and other drivers) emit ``show:uav_upload_finished`` so these
+        lines appear together with ``Show upload started`` from the upload
+        middleware when operators filter the log by the show channel.
+        """
+        uav_id = kwargs.get("uav_id")
+        success = bool(kwargs.get("success"))
+        error = kwargs.get("error")
+        extra = {"id": uav_id} if isinstance(uav_id, str) and uav_id else {}
+        if success:
+            self.log.info(
+                f"Show upload completed for UAV {uav_id!r} "
+                "(MAVFTP, origin/config, geofence, reload)",
+                extra=extra,
+            )
+        elif uav_id:
+            self.log.error(
+                f"Show upload failed for UAV {uav_id!r}: {error or 'unknown error'}",
+                extra=extra,
+            )
 
     def _on_lights_updated(self, sender) -> None:
         """Handler that is called when the configuration of the LED lights was

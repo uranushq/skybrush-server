@@ -185,6 +185,13 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
     the autopilot supports bulk uploads.
     """
 
+    show_path_stream_stuck_warning_seconds: float = 15.0
+    """If positive, each UAV raises ``INVALID_MISSION_CONFIGURATION`` when the
+    Skybrush show execution stage stays in ``TAKEOFF`` longer than this many
+    seconds (proxy for missing live GUI path setpoints on the flight controller).
+    Set to zero to disable the check.
+    """
+
     def __init__(self, app=None):
         """Constructor.
 
@@ -402,9 +409,11 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         try:
             await uav.upload_show(show)
         except TooSlowError as ex:
+            uav._emit_show_uav_upload_finished(success=False, error=str(ex))
             self.log.error(str(ex), extra={"id": log_id_for_uav(uav)})
             raise
         except Exception as ex:
+            uav._emit_show_uav_upload_finished(success=False, error=str(ex))
             self.log.error(str(ex), extra={"id": log_id_for_uav(uav)})
             raise
 
@@ -495,9 +504,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             raise TooSlowError(f"No response received for command {command_id} in time")
 
         if result != MAVResult.ACCEPTED:
-            self.log.warning(
-                f"COMMAND_ACK for cmd_int {command_id}: result={result}"
-            )
+            self.log.warning(f"COMMAND_ACK for cmd_int {command_id}: result={result}")
 
         if result == MAVResult.UNSUPPORTED:
             raise NotSupportedError
@@ -615,9 +622,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             raise TooSlowError(f"No response received for command {command_id} in time")
 
         if result != MAVResult.ACCEPTED:
-            self.log.warning(
-                f"COMMAND_ACK for cmd_long {command_id}: result={result}"
-            )
+            self.log.warning(f"COMMAND_ACK for cmd_long {command_id}: result={result}")
 
         if result == MAVResult.UNSUPPORTED:
             raise NotSupportedError
@@ -1133,8 +1138,6 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     drone any more.
     """
 
-    _last_skybrush_status_info: DroneShowStatus | None = None
-
     _log_downloader: MAVLinkLogDownloader | None = None
     """Log downloader for the drone, constructed lazily.
 
@@ -1185,6 +1188,17 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     sent one.
     """
 
+    _show_path_stream_warning_active: bool = False
+    """Whether this UAV currently has ``INVALID_MISSION_CONFIGURATION`` from the
+    show path-stream watchdog (cleared when leaving the TAKEOFF stage).
+    """
+
+    _show_path_stream_warning_logged: bool = False
+    """Whether we logged the current TAKEOFF-stuck episode already."""
+
+    _show_takeoff_since_monotonic: float | None = None
+    """``monotonic()`` time when we first observed show stage ``TAKEOFF``."""
+
     _preflight_status: PreflightCheckInfo
     """The status of the preflight checks on the drone"""
 
@@ -1226,6 +1240,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
 
         self.notify_updated = None  # type: ignore
         self.send_log_message_to_gcs = nop
+
+        self._show_path_stream_warning_active = False
+        self._show_path_stream_warning_logged = False
+        self._show_takeoff_since_monotonic = None
 
         self._reset_mavlink_version()
 
@@ -1801,6 +1819,8 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
 
         self._last_skybrush_status_info = data
 
+        self._update_show_path_stream_watchdog(data)
+
         # Process the basic part of the packet that is always present (both with
         # the standard and the compact telemetry profile)
         self._update_gps_fix_type_and_satellite_count(data.gps_fix, data.num_satellites)
@@ -2117,6 +2137,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         disconnected from the network. In other words, the heartbeats from the
         drone have ceased arriving.
         """
+        self._clear_show_path_stream_watchdog()
         self._set_connection_state(ConnectionState.DISCONNECTED, None)
 
     def _notify_rebooted_by_us(self) -> None:
@@ -2191,7 +2212,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """Asks the UAV to reload the current drone show file."""
         # param1 = 0 if we want to reload the show file
         success = await self.driver.send_command_long(
-            self, MAVCommand.USER_1, SkybrushUserCommand.RELOAD_SHOW,
+            self,
+            MAVCommand.USER_1,
+            SkybrushUserCommand.RELOAD_SHOW,
             timeout=10,
         )
         if not success:
@@ -2222,26 +2245,60 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         # FENCE_STATUS=162, POWER_STATUS=125
         log = self.driver.log
         diagnostics: list[tuple[int, str, tuple[str, ...]]] = [
-            (1,   "SYS_STATUS",         (
-                "onboard_control_sensors_present",
-                "onboard_control_sensors_enabled",
-                "onboard_control_sensors_health",
-                "voltage_battery", "current_battery", "battery_remaining",
-                "errors_count1", "errors_count2", "errors_count3", "errors_count4",
-            )),
-            (24,  "GPS_RAW_INT",        (
-                "fix_type", "satellites_visible", "eph", "epv", "lat", "lon", "alt",
-            )),
-            (125, "POWER_STATUS",       ("Vcc", "Vservo", "flags")),
-            (148, "AUTOPILOT_VERSION",  ("flight_sw_version", "capabilities")),
-            (162, "FENCE_STATUS",       (
-                "breach_status", "breach_count", "breach_type", "breach_time",
-            )),
-            (193, "EKF_STATUS_REPORT",  (
-                "flags", "velocity_variance", "pos_horiz_variance",
-                "pos_vert_variance", "compass_variance", "terrain_alt_variance",
-            )),
-            (242, "HOME_POSITION",      ("latitude", "longitude", "altitude")),
+            (
+                1,
+                "SYS_STATUS",
+                (
+                    "onboard_control_sensors_present",
+                    "onboard_control_sensors_enabled",
+                    "onboard_control_sensors_health",
+                    "voltage_battery",
+                    "current_battery",
+                    "battery_remaining",
+                    "errors_count1",
+                    "errors_count2",
+                    "errors_count3",
+                    "errors_count4",
+                ),
+            ),
+            (
+                24,
+                "GPS_RAW_INT",
+                (
+                    "fix_type",
+                    "satellites_visible",
+                    "eph",
+                    "epv",
+                    "lat",
+                    "lon",
+                    "alt",
+                ),
+            ),
+            (125, "POWER_STATUS", ("Vcc", "Vservo", "flags")),
+            (148, "AUTOPILOT_VERSION", ("flight_sw_version", "capabilities")),
+            (
+                162,
+                "FENCE_STATUS",
+                (
+                    "breach_status",
+                    "breach_count",
+                    "breach_type",
+                    "breach_time",
+                ),
+            ),
+            (
+                193,
+                "EKF_STATUS_REPORT",
+                (
+                    "flags",
+                    "velocity_variance",
+                    "pos_horiz_variance",
+                    "pos_vert_variance",
+                    "compass_variance",
+                    "terrain_alt_variance",
+                ),
+            ),
+            (242, "HOME_POSITION", ("latitude", "longitude", "altitude")),
         ]
         for msg_id, name, fields in diagnostics:
             msg = self.get_last_message(msg_id)
@@ -2665,6 +2722,25 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         if not success:
             raise RuntimeError("Failed to trigger camera shutter")
 
+    def _emit_show_uav_upload_finished(
+        self, *, success: bool, error: str | None = None
+    ) -> None:
+        """Notifies the show extension (via signals) so upload outcomes appear on
+        the same logger channel as ``Show upload started`` from the client.
+        """
+        app = self.driver.app
+        if app is None:
+            return
+        try:
+            app.import_api("signals").get("show:uav_upload_finished").send(
+                self,
+                uav_id=log_id_for_uav(self),
+                success=success,
+                error=error,
+            )
+        except Exception:
+            pass
+
     async def upload_show(self, show: ShowSpecification) -> None:
         coordinate_system = get_coordinate_system_from_show_specification(show)
         if coordinate_system.type != "nwu":
@@ -2675,10 +2751,12 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         trajectory = get_trajectory_from_show_specification(show)
         geofence = get_geofence_configuration_from_show_specification(show)
 
+        _uav_log_id = log_id_for_uav(self)
         self.driver.log.info(
             f"Show upload: origin=({coordinate_system.origin.lat}, {coordinate_system.origin.lon}), "
             f"alt_ref={altitude_reference}, trajectory_duration={trajectory.duration}s, "
-            f"light_program={len(light_program)}B"
+            f"light_program={len(light_program)}B",
+            extra={"id": _uav_log_id},
         )
 
         pyro_program = None
@@ -2711,14 +2789,18 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             await show_file.finalize()
             data = show_file.get_contents()
 
-        self.driver.log.info(f"Show file built: {len(data)} bytes")
-        self.driver.log.info(f"Show file hex: {data.hex()}")
+        self.driver.log.info(
+            f"Show file built: {len(data)} bytes", extra={"id": _uav_log_id}
+        )
+        self.driver.log.info(f"Show file hex: {data.hex()}", extra={"id": _uav_log_id})
 
         # Upload show file
         async with aclosing(MAVFTP.for_uav(self)) as ftp:
             await ftp.put(data, "/collmot/show.skyb")
 
-        self.driver.log.info("Show file uploaded via MAVFTP")
+        self.driver.log.info(
+            "Show file uploaded via MAVFTP", extra={"id": _uav_log_id}
+        )
 
         # We give some time for the filesystem to flush caches etc before
         # asking the drone to reload the show file. There were some reports
@@ -2754,10 +2836,16 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 encoded_lon,
                 encoded_amsl,
             )
-            self.driver.log.info(f"USER_2 origin config: success={success}")
+            self.driver.log.info(
+                f"USER_2 origin config: success={success}",
+                extra={"id": _uav_log_id},
+            )
         except NotSupportedError:
             success = False
-            self.driver.log.info("USER_2 not supported, falling back to params")
+            self.driver.log.info(
+                "USER_2 not supported, falling back to params",
+                extra={"id": _uav_log_id},
+            )
 
         if not success:
             # Configure show origin, orientation and altitude reference using
@@ -2777,7 +2865,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
 
         # Configure and enable geofence
         await self.configure_geofence(geofence)
-        self.driver.log.info("Geofence configured, now reloading show...")
+        self.driver.log.info(
+            "Geofence configured, now reloading show...",
+            extra={"id": _uav_log_id},
+        )
 
         # Force flight-mode switch positions 5 and 6 to map to DRONE_SHOW
         # (custom_mode = 127) so the operator can flip into show mode from
@@ -2786,9 +2877,15 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         for _param_name in ("FLTMODE5", "FLTMODE6"):
             try:
                 await self.set_parameter(_param_name, 127)
-                self.driver.log.info(f"{_param_name} set to 127 (drone show)")
+                self.driver.log.info(
+                    f"{_param_name} set to 127 (drone show)",
+                    extra={"id": _uav_log_id},
+                )
             except Exception as ex:
-                self.driver.log.warning(f"Failed to set {_param_name}=127: {ex}")
+                self.driver.log.warning(
+                    f"Failed to set {_param_name}=127: {ex}",
+                    extra={"id": _uav_log_id},
+                )
 
         # NOTE: previously we automatically switched the vehicle into
         # DRONE_SHOW mode (custom_mode=127) here because RELOAD_SHOW used
@@ -2799,7 +2896,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         # Ask drone to reload show file now that we are done with everything
         # else
         await self.reload_show()
-        self.driver.log.info("Show reloaded successfully")
+        self.driver.log.info(
+            "Show reloaded successfully", extra={"id": _uav_log_id}
+        )
+        self._emit_show_uav_upload_finished(success=True)
 
     async def wait_until_connected(self) -> None:
         """Waits until the UAV becomes connected (i.e. when we see the next
@@ -2953,6 +3053,8 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             # Don't set the mode immediately because the drone might not
             # respond right after bootup
             self.driver.run_in_background(self._configure_mandatory_custom_mode)
+
+        self._clear_show_path_stream_watchdog()
 
         # Reset our internal state object of the compass calibration procedure
         self.compass_calibration.reset()
@@ -3151,6 +3253,61 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         has_geofence_error = not_healthy_sensors & MAVSysStatusSensor.GEOFENCE.value
         are_motors_running = heartbeat.base_mode & MAVModeFlag.SAFETY_ARMED.value
         return heartbeat, sys_status, bool(has_geofence_error), bool(are_motors_running)
+
+    def _clear_show_path_stream_watchdog(self) -> None:
+        """Clears the takeoff timer and any path-stream watchdog error we set."""
+        self._show_takeoff_since_monotonic = None
+        self._show_path_stream_warning_logged = False
+        if self._show_path_stream_warning_active:
+            self.ensure_error(
+                FlockwaveErrorCode.INVALID_MISSION_CONFIGURATION,
+                present=False,
+            )
+            self._show_path_stream_warning_active = False
+
+    def _update_show_path_stream_watchdog(self, status: DroneShowStatus) -> None:
+        """Detects when the vehicle stays in show TAKEOFF without reaching PERFORMING.
+
+        This approximates a missing live GUI path stream to the flight controller
+        (often visible as zero GUIP lines in an onboard log): stage 3 should
+        normally be brief before stage 4 when trajectory setpoints are flowing.
+        After a configurable timeout we set ``INVALID_MISSION_CONFIGURATION``.
+
+        Args:
+            status: parsed Skybrush drone show status from the latest DATA packet.
+        """
+        limit = self.driver.show_path_stream_stuck_warning_seconds
+        if limit <= 0:
+            self._clear_show_path_stream_watchdog()
+            return
+
+        if status.stage is DroneShowExecutionStage.TAKEOFF:
+            now = monotonic()
+            if self._show_takeoff_since_monotonic is None:
+                self._show_takeoff_since_monotonic = now
+            elif (now - self._show_takeoff_since_monotonic) >= limit:
+                self.ensure_error(
+                    FlockwaveErrorCode.INVALID_MISSION_CONFIGURATION,
+                    present=True,
+                )
+                self._show_path_stream_warning_active = True
+                if not self._show_path_stream_warning_logged:
+                    self._show_path_stream_warning_logged = True
+                    self.driver.log.warning(
+                        "Show TAKEOFF stage exceeded "
+                        f"{limit:g}s without reaching PERFORMING; likely missing "
+                        "live GUI path stream to the flight controller (GUIP).",
+                        extra={"id": log_id_for_uav(self)},
+                    )
+        else:
+            self._show_takeoff_since_monotonic = None
+            self._show_path_stream_warning_logged = False
+            if self._show_path_stream_warning_active:
+                self.ensure_error(
+                    FlockwaveErrorCode.INVALID_MISSION_CONFIGURATION,
+                    present=False,
+                )
+                self._show_path_stream_warning_active = False
 
     def _update_errors_from_drone_show_status_packet(self, status: DroneShowStatus):
         """Updates the error codes based on the most recent drone show status

@@ -292,6 +292,20 @@ schema = {
             "format": "checkbox",
             "propertyOrder": 14000,
         },
+        "show_path_stream_stuck_warning_seconds": {
+            "type": "number",
+            "title": "Show path stream stuck warning (seconds)",
+            "minimum": 0,
+            "default": 15,
+            "description": (
+                "If greater than zero, the server sets the mission-configuration "
+                "warning when the Skybrush show stage stays in TAKEOFF longer than "
+                "this many seconds without reaching PERFORMING — a proxy for a "
+                "missing live GUI path setpoint stream (GUIP) to the flight "
+                "controller. Set to zero to disable."
+            ),
+            "propertyOrder": 14500,
+        },
         # packet_loss is an advanced setting and is not included here
     }
 }

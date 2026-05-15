@@ -154,6 +154,16 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         driver.send_packet = self._send_packet
         driver.use_bulk_parameter_uploads = use_bulk_parameter_uploads
 
+        raw_limit = configuration.get("show_path_stream_stuck_warning_seconds", 15)
+        try:
+            driver.show_path_stream_stuck_warning_seconds = max(0.0, float(raw_limit))
+        except (TypeError, ValueError):
+            driver.show_path_stream_stuck_warning_seconds = 15.0
+            self.log.warning(
+                "Invalid show_path_stream_stuck_warning_seconds in MAVLink config; "
+                "using default 15"
+            )
+
     def exports(self) -> dict[str, Any]:
         return {
             "find_network_by_id": self._find_network_by_id,
