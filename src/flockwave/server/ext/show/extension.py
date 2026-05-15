@@ -205,6 +205,11 @@ class DroneShowExtension(Extension):
                 stack.enter_context(
                     app.message_hub.use_request_middleware(self._log_middleware)
                 )
+                stack.enter_context(
+                    app.message_hub.use_response_middleware(
+                        self._log_middleware.log_response
+                    )
+                )
                 stack.enter_context(self._clock_sync.use_secondary_clock(self._clock))
                 stack.enter_context(
                     self._end_clock_sync.use_secondary_clock(self._end_clock)

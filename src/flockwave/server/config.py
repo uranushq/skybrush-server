@@ -102,7 +102,7 @@ EXTENSIONS = {
         "add_noise": False,
         "count": 5,
         "delay": 0.2,
-        "enabled": False,
+        "enabled": True,
         "id_format": "{0}",
         "origin": [18.915125, 47.486305, 215],  # Fahegy
         # "origin": [19.062159, 47.473360],  # ELTE kert
