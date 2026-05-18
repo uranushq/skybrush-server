@@ -135,7 +135,8 @@ def _normalize_vec3_array(name: str, value: list) -> list[list[float]]:
         drone_index = _phase_point_drone_index(point, point_index, len(value))
         if drone_index is None:
             raise ValueError(
-                f"'{name}[{point_index}].droneId' must match one of drone-1..drone-N"
+                f"'{name}[{point_index}].droneId' must match one of "
+                "drone-1..drone-N or show-drone-1..show-drone-N"
             )
         if normalized[drone_index] is not None:
             raise ValueError(
@@ -226,7 +227,8 @@ def _validate_phases(phases, *, num_drones: int):
                         {
                             "error": (
                                 f"'phases[{phase_index}].points[{point_index}].droneId' "
-                                "must match one of drone-1..drone-N, or be omitted "
+                                "must match one of drone-1..drone-N, "
+                                "show-drone-1..show-drone-N, or be omitted "
                                 "when points are already in drone order"
                             )
                         }
@@ -250,21 +252,32 @@ def _validate_phases(phases, *, num_drones: int):
     return None
 
 
+_DRONE_ID_STRING_PREFIXES = ("show-drone-", "drone-")
+
+
+def _drone_index_from_id(drone_id: int | str) -> int | None:
+    """Map a 1-based drone identifier to a 0-based index."""
+    if isinstance(drone_id, int):
+        return drone_id - 1
+    if not isinstance(drone_id, str):
+        return None
+    for prefix in _DRONE_ID_STRING_PREFIXES:
+        if drone_id.startswith(prefix):
+            try:
+                return int(drone_id.removeprefix(prefix)) - 1
+            except ValueError:
+                return None
+    return None
+
+
 def _phase_point_drone_index(point: dict, fallback_index: int, num_drones: int) -> int | None:
     drone_id = point.get("droneId", point.get("id"))
     if drone_id is None:
         return fallback_index if fallback_index < num_drones else None
-    if isinstance(drone_id, int):
-        index = drone_id - 1
-    elif isinstance(drone_id, str) and drone_id.startswith("drone-"):
-        try:
-            index = int(drone_id.removeprefix("drone-")) - 1
-        except ValueError:
-            return None
-    else:
+    index = _drone_index_from_id(drone_id)
+    if index is None or not (0 <= index < num_drones):
         return None
-
-    return index if 0 <= index < num_drones else None
+    return index
 
 
 def _phase_targets(phase: dict, num_drones: int) -> list[tuple[float, float, float]]:
