@@ -52,6 +52,28 @@ class Drone:
         vec = self.compute_step_vector(step_size)
         return [self.position[i] + vec[i] for i in range(3)]
 
+    def peek_next_position_toward(
+        self, waypoint: Vec3, step_size: float = 1.0
+    ) -> List[float]:
+        """Move one step toward *waypoint* (e.g. GJK closest point in BVC)."""
+        dx = waypoint[0] - self.position[0]
+        dy = waypoint[1] - self.position[1]
+        dz = waypoint[2] - self.position[2]
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+        if dist < 1e-9:
+            if self.remaining_distance() < 1e-9:
+                self.arrived = True
+            return list(self.position)
+
+        move = min(step_size, dist)
+        ratio = move / dist
+        return [
+            self.position[0] + dx * ratio,
+            self.position[1] + dy * ratio,
+            self.position[2] + dz * ratio,
+        ]
+
     def apply_move(self, new_pos: List[float]) -> None:
         self.position = list(new_pos)
         if self.remaining_distance() < 1e-9:

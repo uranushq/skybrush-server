@@ -115,7 +115,9 @@ def _normalize_vec3_array(name: str, value: list) -> list[list[float]]:
     When objects include ``droneId``, the return value is ordered by
     ``drone-1``, ``drone-2`` ... so later phase targets line up with drones.
     """
-    has_drone_ids = any(isinstance(point, dict) and "droneId" in point for point in value)
+    has_drone_ids = any(
+        isinstance(point, dict) and "droneId" in point for point in value
+    )
     if not has_drone_ids:
         return [
             (
@@ -182,7 +184,9 @@ def _validate_phases(phases, *, num_drones: int):
             hold_ms = int(phase.get("holdMs", 0))
         except (TypeError, ValueError):
             return (
-                jsonify({"error": f"'phases[{phase_index}].holdMs' must be an integer"}),
+                jsonify(
+                    {"error": f"'phases[{phase_index}].holdMs' must be an integer"}
+                ),
                 400,
             )
         if hold_ms < 0:
@@ -270,7 +274,9 @@ def _drone_index_from_id(drone_id: int | str) -> int | None:
     return None
 
 
-def _phase_point_drone_index(point: dict, fallback_index: int, num_drones: int) -> int | None:
+def _phase_point_drone_index(
+    point: dict, fallback_index: int, num_drones: int
+) -> int | None:
     drone_id = point.get("droneId", point.get("id"))
     if drone_id is None:
         return fallback_index if fallback_index < num_drones else None
@@ -433,7 +439,9 @@ def _plan_formation_phases(
             combined_steps.append(
                 StepRecord(
                     step=combined_steps[-1].step + 1,
-                    positions={idx: list(pos) for idx, pos in enumerate(current_positions)},
+                    positions={
+                        idx: list(pos) for idx, pos in enumerate(current_positions)
+                    },
                     collisions=[],
                     reverted_drones=[],
                     verified=True,
@@ -588,10 +596,7 @@ async def plan():
     if uses_phases and initial_altitude <= 0:
         return jsonify({"error": "'initial_altitude' must be > 0"}), 400
     planning_initial = (
-        [
-            [point[0], point[1], max(point[2], initial_altitude)]
-            for point in initial
-        ]
+        [[point[0], point[1], max(point[2], initial_altitude)] for point in initial]
         if uses_phases
         else initial
     )
@@ -658,6 +663,7 @@ async def plan():
         if param_names and app is not None:
             try:
                 from flockwave.server.model.uav import UAV
+
                 uav_ids = sorted(app.object_registry.ids_by_type(UAV))
                 if uav_ids:
                     first_uav = app.object_registry.find_by_id(uav_ids[0])
@@ -837,10 +843,7 @@ def _derive_coordinate_system_from_first_uav() -> Optional[dict]:
         return None
 
     if log:
-        log.info(
-            f"Auto-derived show origin from {uav_ids[0]}: "
-            f"lat={lat}, lon={lon}"
-        )
+        log.info(f"Auto-derived show origin from {uav_ids[0]}: lat={lat}, lon={lon}")
     return {"type": "nwu", "origin": [lon, lat], "orientation": 0}
 
 
@@ -891,9 +894,7 @@ def _derive_amsl_reference_from_first_uav() -> Optional[float]:
         return None
 
     if log:
-        log.info(
-            f"Auto-derived AMSL reference from {uav_ids[0]}: {amsl_value:.2f} m"
-        )
+        log.info(f"Auto-derived AMSL reference from {uav_ids[0]}: {amsl_value:.2f} m")
     return amsl_value
 
 
@@ -999,9 +1000,7 @@ class PathPlannerExtension(Extension):
         http_server = app.import_api("http_server")
 
         with ExitStack() as stack:
-            stack.enter_context(
-                overridden(globals(), app=app, log=logger)
-            )
+            stack.enter_context(overridden(globals(), app=app, log=logger))
             stack.enter_context(http_server.mounted(blueprint, path=route))
             logger.info(f"Path-planner API mounted at {route}/plan")
             await sleep_forever()

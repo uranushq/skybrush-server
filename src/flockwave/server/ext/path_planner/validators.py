@@ -190,17 +190,13 @@ class MinFlightAltitudeValidator(PathValidator):
                 except (TypeError, ValueError):
                     continue
                 if z + EPS < min_alt:
-                    violations.append(
-                        {"label": label, "index": i, "z": z}
-                    )
+                    violations.append({"label": label, "index": i, "z": z})
 
         if not violations:
             return
 
         if source is None:
-            source_msg = (
-                f"firmware parameter not readable, using fallback {min_alt} m"
-            )
+            source_msg = f"firmware parameter not readable, using fallback {min_alt} m"
         else:
             source_msg = f"firmware parameter {source} = {min_alt} m"
 
@@ -269,8 +265,7 @@ async def fetch_required_params(
     if get_param is None:
         if log:
             log.warning(
-                "UAV does not expose get_parameter(); skipping parameter "
-                "validation."
+                "UAV does not expose get_parameter(); skipping parameter validation."
             )
         return out
 

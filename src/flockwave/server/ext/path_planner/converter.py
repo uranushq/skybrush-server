@@ -17,16 +17,15 @@ All generated files are written to a caller-supplied output directory
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from .solver import SolverResult
-
 
 # ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
+
 
 def solver_result_to_trajectory_dicts(
     result: SolverResult,
@@ -77,10 +76,14 @@ def solver_result_to_trajectory_dicts(
         for rec in result.steps:
             t_sec = round(rec.step * duration_sec, 4)
             pos = rec.positions[did]
-            raw_points.append([t_sec, [round(pos[0], 4), round(pos[1], 4), round(pos[2], 4)], []])
+            raw_points.append(
+                [t_sec, [round(pos[0], 4), round(pos[1], 4), round(pos[2], 4)], []]
+            )
 
         if not raw_points:
-            trajectories.append({"version": 1, "takeoffTime": takeoff_time, "points": []})
+            trajectories.append(
+                {"version": 1, "takeoffTime": takeoff_time, "points": []}
+            )
             continue
 
         first_pos = raw_points[0][1]  # [x, y, z]
@@ -92,11 +95,15 @@ def solver_result_to_trajectory_dicts(
 
         # Takeoff duration based on altitude and speed
         takeoff_alt = abs(first_pos[2])
-        takeoff_duration = round(takeoff_alt / takeoff_speed, 4) if takeoff_alt > 0 else 0
+        takeoff_duration = (
+            round(takeoff_alt / takeoff_speed, 4) if takeoff_alt > 0 else 0
+        )
 
         # Landing duration based on altitude and speed
         landing_alt = abs(last_pos[2])
-        landing_duration = round(landing_alt / landing_speed, 4) if landing_alt > 0 else 0
+        landing_duration = (
+            round(landing_alt / landing_speed, 4) if landing_alt > 0 else 0
+        )
 
         # Build full trajectory:
         # 1) Ground start at t=0
@@ -176,7 +183,11 @@ def build_show_dicts(
     shows: List[dict] = []
 
     for drone, traj in zip(result.drones, traj_dicts):
-        home = [round(drone.initial[0], 4), round(drone.initial[1], 4), round(drone.initial[2], 4)]
+        home = [
+            round(drone.initial[0], 4),
+            round(drone.initial[1], 4),
+            round(drone.initial[2], 4),
+        ]
 
         # Minimal light program: a single END (0x00) byte
         minimal_light = base64.b64encode(b"\x00").decode("ascii")
@@ -231,8 +242,8 @@ async def save_skyb_files(
 
     Returns a dict mapping drone id strings to their ``.skyb`` file paths.
     """
-    from flockwave.server.show.trajectory import TrajectorySpecification
     from flockwave.server.show.formats import SkybrushBinaryShowFile
+    from flockwave.server.show.trajectory import TrajectorySpecification
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -287,6 +298,7 @@ async def save_skyb_files(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _collapse_stationary(points: List[list]) -> List[list]:
     """Remove consecutive keyframes with identical positions.
