@@ -25,7 +25,13 @@ from flockwave.gps.vectors import (
     ECEFToGPSCoordinateTransformation,
     GPSCoordinate,
 )
-from trio import CancelScope, open_memory_channel, open_nursery, sleep
+from trio import (
+    BrokenResourceError,
+    CancelScope,
+    open_memory_channel,
+    open_nursery,
+    sleep,
+)
 from trio.abc import SendChannel
 from trio_util import AsyncBool, periodic
 
@@ -135,7 +141,7 @@ class RTKExtension(Extension):
             )
 
         self._dynamic_serial_port_configurations = []
-        serial_port_specs = configuration.get("add_serial_ports")
+        serial_port_specs = configuration.get("add_serial_ports", True)
         if serial_port_specs is not None:
             serial_port_spec_list: list[dict | int]
             serial_port_specs_iter: Iterator[dict | int] | None = None
@@ -434,6 +440,20 @@ class RTKExtension(Extension):
         """Handles an incoming RTK-STAT message."""
         return self._statistics.json
 
+    def handle_RTK_REFRESH(
+        self, message: FlockwaveMessage, sender, hub: MessageHub
+    ) -> FlockwaveResponse:
+        """Handles an incoming X-RTK-REFRESH message.
+
+        Re-scans serial ports and updates the list of dynamically discovered RTK
+        base station presets. This allows newly connected COM ports to appear in
+        RTK-LIST without restarting the server.
+        """
+        result = self._update_dynamic_presets(full_refresh=True)
+        if self._registry is not None:
+            result["ids"] = list(self._registry.ids)
+        return hub.create_response_to(message, result)
+
     async def run(self, app, configuration, logger):
         hotplug_event = app.import_api("signals").get("hotplug:event")
 
@@ -502,6 +522,7 @@ class RTKExtension(Extension):
                             handle_RTK_DEL
                         ),
                         "X-RTK-NEW": self.handle_RTK_NEW,
+                        "X-RTK-REFRESH": self.handle_RTK_REFRESH,
                         "X-RTK-SAVE": self.handle_RTK_SAVE,
                         "X-RTK-UPDATE": create_multi_object_message_handler(
                             handle_RTK_UPDATE
@@ -1003,6 +1024,41 @@ class RTKExtension(Extension):
         """
         self._update_dynamic_presets()
 
+    def _notify_rtk_preset_list_changed(
+        self,
+        *,
+        added: Sequence[RTKConfigurationPreset],
+        removed: Sequence[str],
+    ) -> None:
+        """Notifies connected clients that the RTK preset list has changed.
+
+        Skybrush Live and other frontends typically cache ``RTK-LIST`` and rely
+        on these notifications to refresh their RTK source picker.
+        """
+        if not self.app:
+            return
+
+        hub = self.app.message_hub
+
+        try:
+            if removed:
+                hub.enqueue_message(
+                    hub.create_notification({"type": "OBJ-DEL", "ids": list(removed)})
+                )
+            if added:
+                hub.enqueue_message(
+                    hub.create_notification(
+                        {
+                            "type": "RTK-INF",
+                            "preset": {
+                                preset.id: preset.json for preset in added
+                            },
+                        }
+                    )
+                )
+        except BrokenResourceError:
+            pass
+
     def _should_use_serial_port_as_dynamic_preset(
         self, port: SerialPortDescriptor
     ) -> bool:
@@ -1023,16 +1079,52 @@ class RTKExtension(Extension):
 
         return True
 
-    def _update_dynamic_presets(self, first: bool = False) -> None:
+    def _update_dynamic_presets(
+        self, first: bool = False, *, full_refresh: bool = False
+    ) -> dict[str, list[str]]:
         """Enumerates all the serial ports on the computer and creates a list of
         dynamic presets, one or more for each serial port.
 
         Parameters:
             first: whether the list of dynamic presets is being updated for the
                 first time during the initialization of the extension
+            full_refresh: when ``True``, all dynamic presets are removed first
+                and the serial port list is scanned from scratch. This is used
+                for manual refresh requests and helps when a COM port was
+                plugged in after the server started or when a stale connection
+                must be replaced.
+
+        Returns:
+            dict with ``added`` and ``removed`` keys, each mapping to the list
+            of preset IDs that were added or removed during this update
         """
         if self._registry is None:
-            return
+            return {"added": [], "removed": []}
+
+        if not self._dynamic_serial_port_configurations:
+            if self.log and full_refresh:
+                self.log.warning(
+                    "Serial port scan skipped; enable add_serial_ports in the "
+                    "RTK extension configuration to discover COM ports"
+                )
+            return {"added": [], "removed": []}
+
+        removed_ids: list[str] = []
+        reconnect_to: str | None = None
+
+        if full_refresh:
+            if self._current_preset and self._current_preset.dynamic:
+                reconnect_to = self._current_preset.id
+                self._request_preset_switch_later(None)
+
+            for existing_preset in list(self._registry):
+                if existing_preset.dynamic:
+                    removed_ids.append(existing_preset.id)
+                    self._registry.remove(existing_preset)
+                    if self.log:
+                        self.log.info(
+                            f"Cleared RTK preset {existing_preset.title!r} for refresh"
+                        )
 
         to_add = []
         seen = set()
@@ -1065,6 +1157,7 @@ class RTKExtension(Extension):
         ]
 
         for preset in to_remove:
+            removed_ids.append(preset.id)
             self._registry.remove(preset)
             if self.log:
                 self.log.info(
@@ -1103,6 +1196,25 @@ class RTKExtension(Extension):
                         )
                     req.touch()
                     self._request_preset_switch_later(last_used_preset)
+
+        if full_refresh and reconnect_to:
+            preset = self.find_preset_by_id(reconnect_to)
+            if preset is not None:
+                self._request_preset_switch_later(preset)
+        elif full_refresh and to_add and self._current_preset is None:
+            if len(to_add) == 1:
+                self._request_preset_switch_later(to_add[0])
+
+        if not first and (to_add or removed_ids):
+            self._notify_rtk_preset_list_changed(
+                added=to_add,
+                removed=removed_ids,
+            )
+
+        return {
+            "added": [preset.id for preset in to_add],
+            "removed": removed_ids,
+        }
 
     @staticmethod
     def _get_dynamic_preset_id_for_serial_port(port, index: int = 0) -> str:

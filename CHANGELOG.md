@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - It is now possible to trigger a collective RTH when the show is suspended.
 
+- Added `X-RTK-REFRESH` message handler to re-scan serial ports for RTK base
+  stations without restarting the server. A full refresh clears stale dynamic
+  presets, rescans COM ports, reconnects to the previously selected source
+  when possible, broadcasts ``RTK-INF`` / ``OBJ-DEL`` notifications to update
+  connected frontends, and returns the full preset ID list in the response.
+
 ## [2.45.1] - 2026-03-24
 
 ### Fixed

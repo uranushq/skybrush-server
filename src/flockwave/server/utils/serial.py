@@ -92,13 +92,15 @@ def describe_serial_port_configuration(
     return ", ".join(parts).capitalize()
 
 
-def list_serial_ports() -> Iterable[SerialPortDescriptor]:
-    """Enumerates all serial ports and USB-to-serial interfaces on the computer
-    and returns an iterable that can be used to iterate over them.
+def list_serial_ports() -> list[SerialPortDescriptor]:
+    """Enumerates all serial ports and USB-to-serial interfaces on the computer.
+
+    Returns a new list on every call so callers always see the current set of
+    ports (e.g. after a USB device is plugged in).
     """
     from serial.tools.list_ports import comports
 
-    return comports()
+    return list(comports())
 
 
 _RTK_BASE_BLACKLIST: frozenset[tuple[int, int]] = frozenset(
