@@ -55,14 +55,8 @@ from flockwave.server.utils import overridden
 from .converter import build_show_dicts, save_skyb_files
 from .drone import Drone
 from .output import build_output, build_show_specifications, build_skyc_bytes
-from .solver import (
-    COLLISION_X,
-    COLLISION_Y,
-    COLLISION_Z,
-    PathSolver,
-    SolverResult,
-    StepRecord,
-)
+from .collision_volume import describe_collision_envelope, volumes_overlap
+from .solver import PathSolver, SolverResult, StepRecord
 from .validators import (
     SEVERITY_ERROR,
     ValidationContext,
@@ -317,16 +311,17 @@ def _find_collision_envelope_pairs(
         for j in range(i + 1, len(points)):
             a = points[i]
             b = points[j]
-            dx = abs(a[0] - b[0])
-            dy = abs(a[1] - b[1])
-            dz = abs(a[2] - b[2])
-            if dx < COLLISION_X and dy < COLLISION_Y and dz < COLLISION_Z:
+            if volumes_overlap(a, b):
                 pairs.append(
                     {
                         "label": label,
                         "first": f"drone-{i + 1}",
                         "second": f"drone-{j + 1}",
-                        "delta": [round(dx, 4), round(dy, 4), round(dz, 4)],
+                        "delta": [
+                            round(abs(a[0] - b[0]), 4),
+                            round(abs(a[1] - b[1]), 4),
+                            round(abs(a[2] - b[2]), 4),
+                        ],
                     }
                 )
     return pairs
@@ -354,11 +349,7 @@ def _validate_phase_spacing(
                 "error": "Formation points are too close to each other",
                 "code": "FORMATION_SPACING_TOO_CLOSE",
                 "details": {
-                    "collision_envelope": {
-                        "x": COLLISION_X,
-                        "y": COLLISION_Y,
-                        "z": COLLISION_Z,
-                    },
+                    "collision_envelope": describe_collision_envelope(),
                     "violations": violations,
                 },
             }
