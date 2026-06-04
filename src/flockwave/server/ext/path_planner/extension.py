@@ -109,7 +109,9 @@ def _normalize_vec3_array(name: str, value: list) -> list[list[float]]:
     When objects include ``droneId``, the return value is ordered by
     ``drone-1``, ``drone-2`` ... so later phase targets line up with drones.
     """
-    has_drone_ids = any(isinstance(point, dict) and "droneId" in point for point in value)
+    has_drone_ids = any(
+        isinstance(point, dict) and "droneId" in point for point in value
+    )
     if not has_drone_ids:
         return [
             (
@@ -176,7 +178,9 @@ def _validate_phases(phases, *, num_drones: int):
             hold_ms = int(phase.get("holdMs", 0))
         except (TypeError, ValueError):
             return (
-                jsonify({"error": f"'phases[{phase_index}].holdMs' must be an integer"}),
+                jsonify(
+                    {"error": f"'phases[{phase_index}].holdMs' must be an integer"}
+                ),
                 400,
             )
         if hold_ms < 0:
@@ -213,6 +217,20 @@ def _validate_phases(phases, *, num_drones: int):
                         ),
                         400,
                     )
+
+            yaw = point.get("yaw")
+            if yaw is not None and not isinstance(yaw, (int, float)):
+                return (
+                    jsonify(
+                        {
+                            "error": (
+                                f"'phases[{phase_index}].points[{point_index}].yaw' "
+                                "must be a number"
+                            )
+                        }
+                    ),
+                    400,
+                )
 
             drone_index = _phase_point_drone_index(point, point_index, num_drones)
             if drone_index is None:
@@ -264,7 +282,9 @@ def _drone_index_from_id(drone_id: int | str) -> int | None:
     return None
 
 
-def _phase_point_drone_index(point: dict, fallback_index: int, num_drones: int) -> int | None:
+def _phase_point_drone_index(
+    point: dict, fallback_index: int, num_drones: int
+) -> int | None:
     drone_id = point.get("droneId", point.get("id"))
     if drone_id is None:
         return fallback_index if fallback_index < num_drones else None
@@ -272,6 +292,85 @@ def _phase_point_drone_index(point: dict, fallback_index: int, num_drones: int) 
     if index is None or not (0 <= index < num_drones):
         return None
     return index
+
+
+def _yaw_from_point(point: dict, default: float = 0.0) -> float:
+    yaw = point.get("yaw")
+    if yaw is None:
+        return default
+    return float(yaw)
+
+
+def _normalize_yaw_array(name: str, value: list, num_drones: int) -> list[float]:
+    """Return per-drone yaw angles ordered like ``_normalize_vec3_array``."""
+    has_drone_ids = any(
+        isinstance(point, dict) and "droneId" in point for point in value
+    )
+    if not has_drone_ids:
+        yaws = [0.0] * len(value)
+        for point_index, point in enumerate(value):
+            if isinstance(point, dict):
+                yaws[point_index] = _yaw_from_point(point)
+        return yaws
+
+    normalized: list[float | None] = [None] * num_drones
+    for point_index, point in enumerate(value):
+        if not isinstance(point, dict):
+            raise ValueError(
+                f"'{name}[{point_index}]' must be an object when droneId is used"
+            )
+        drone_index = _phase_point_drone_index(point, point_index, num_drones)
+        if drone_index is None:
+            raise ValueError(
+                f"'{name}[{point_index}].droneId' must match one of "
+                "drone-1..drone-N or show-drone-1..show-drone-N"
+            )
+        if normalized[drone_index] is not None:
+            raise ValueError(
+                f"'{name}' contains duplicate yaw entry for drone-{drone_index + 1}"
+            )
+        normalized[drone_index] = _yaw_from_point(point)
+
+    if any(yaw is None for yaw in normalized):
+        raise ValueError(f"'{name}' is missing one or more drone yaw entries")
+    return [float(yaw) for yaw in normalized if yaw is not None]
+
+
+def _phase_target_yaws(phase: dict, num_drones: int) -> list[float]:
+    yaws: list[float | None] = [None] * num_drones
+    for point_index, point in enumerate(phase["points"]):
+        drone_index = _phase_point_drone_index(point, point_index, num_drones)
+        if drone_index is None:
+            continue
+        yaws[drone_index] = _yaw_from_point(point)
+
+    if any(yaw is None for yaw in yaws):
+        raise ValueError("phase is missing one or more drone yaw entries")
+    return [float(yaw) for yaw in yaws if yaw is not None]
+
+
+def _append_in_place_yaw_change_step(
+    *,
+    steps: list[StepRecord],
+    positions: list[tuple[float, float, float]],
+    yaws: list[float],
+) -> None:
+    """Append one extra step that changes only yaw at the same position."""
+    steps.append(
+        StepRecord(
+            step=steps[-1].step + 1,
+            positions={idx: list(pos) for idx, pos in enumerate(positions)},
+            collisions=[],
+            reverted_drones=[],
+            verified=True,
+            yaws={idx: yaws[idx] for idx in range(len(positions))},
+        )
+    )
+
+
+def _yaw_lists_match(current_yaws: list[float], target_yaws: list[float]) -> bool:
+    """Return whether two per-drone yaw arrays are effectively equal."""
+    return all(abs(current - target) < 1e-9 for current, target in zip(current_yaws, target_yaws))
 
 
 def _phase_targets(phase: dict, num_drones: int) -> list[tuple[float, float, float]]:
@@ -367,11 +466,14 @@ def _plan_formation_phases(
     seed: Optional[int],
     return_to_initial: bool = True,
     min_z: float = 0.0,
+    initial_yaws: list[float] | None = None,
 ) -> tuple[SolverResult, list[dict]]:
     """Plan synced formation phases with collision avoidance between phases."""
     num_drones = len(initial)
     current_positions = [tuple(float(v) for v in point) for point in initial]
     original_initials = list(current_positions)
+    current_yaws = list(initial_yaws or [0.0] * num_drones)
+    original_yaws = list(current_yaws)
     combined_steps: list[StepRecord] = [
         StepRecord(
             step=0,
@@ -379,6 +481,7 @@ def _plan_formation_phases(
             collisions=[],
             reverted_drones=[],
             verified=True,
+            yaws={idx: current_yaws[idx] for idx in range(num_drones)},
         )
     ]
     phase_summaries: list[dict] = []
@@ -386,9 +489,26 @@ def _plan_formation_phases(
 
     for phase_index, phase in enumerate(phases):
         targets = _phase_targets(phase, num_drones)
+        target_yaws = _phase_target_yaws(phase, num_drones)
         phase_success = True
         if _positions_match(current_positions, targets):
             current_positions = list(targets)
+            if _yaw_lists_match(current_yaws, target_yaws):
+                combined_steps[-1] = StepRecord(
+                    step=combined_steps[-1].step,
+                    positions=combined_steps[-1].positions,
+                    collisions=combined_steps[-1].collisions,
+                    reverted_drones=combined_steps[-1].reverted_drones,
+                    verified=combined_steps[-1].verified,
+                    yaws={idx: target_yaws[idx] for idx in range(num_drones)},
+                )
+            else:
+                _append_in_place_yaw_change_step(
+                    steps=combined_steps,
+                    positions=current_positions,
+                    yaws=target_yaws,
+                )
+            current_yaws = list(target_yaws)
         else:
             solver = PathSolver(
                 initials=current_positions,
@@ -399,8 +519,9 @@ def _plan_formation_phases(
             )
             result = solver.solve()
             step_offset = combined_steps[-1].step
+            move_steps = result.steps[1:]
 
-            for record in result.steps[1:]:
+            for record in move_steps:
                 combined_steps.append(
                     StepRecord(
                         step=step_offset + record.step,
@@ -408,26 +529,37 @@ def _plan_formation_phases(
                         collisions=list(record.collisions),
                         reverted_drones=list(record.reverted_drones),
                         verified=record.verified,
+                        yaws={idx: current_yaws[idx] for idx in range(num_drones)},
                     )
                 )
 
             current_positions = [
                 tuple(result.steps[-1].positions[idx]) for idx in range(num_drones)
             ]
+            _append_in_place_yaw_change_step(
+                steps=combined_steps,
+                positions=current_positions,
+                yaws=target_yaws,
+            )
+            current_yaws = list(target_yaws)
             phase_success = result.success
             success = success and phase_success
 
         arrival_step = combined_steps[-1].step
         hold_ms = int(phase.get("holdMs", 0))
         hold_steps = ceil(hold_ms / duration_ms) if hold_ms > 0 else 0
+        hold_yaws = {idx: current_yaws[idx] for idx in range(num_drones)}
         for _ in range(hold_steps):
             combined_steps.append(
                 StepRecord(
                     step=combined_steps[-1].step + 1,
-                    positions={idx: list(pos) for idx, pos in enumerate(current_positions)},
+                    positions={
+                        idx: list(pos) for idx, pos in enumerate(current_positions)
+                    },
                     collisions=[],
                     reverted_drones=[],
                     verified=True,
+                    yaws=dict(hold_yaws),
                 )
             )
 
@@ -447,9 +579,26 @@ def _plan_formation_phases(
     final_targets = _phase_targets(phases[-1], num_drones)
     if return_to_initial:
         final_targets = original_initials
+        final_yaws = original_yaws
         return_success = True
         if _positions_match(current_positions, final_targets):
             current_positions = list(final_targets)
+            if _yaw_lists_match(current_yaws, final_yaws):
+                combined_steps[-1] = StepRecord(
+                    step=combined_steps[-1].step,
+                    positions=combined_steps[-1].positions,
+                    collisions=combined_steps[-1].collisions,
+                    reverted_drones=combined_steps[-1].reverted_drones,
+                    verified=combined_steps[-1].verified,
+                    yaws={idx: final_yaws[idx] for idx in range(num_drones)},
+                )
+            else:
+                _append_in_place_yaw_change_step(
+                    steps=combined_steps,
+                    positions=current_positions,
+                    yaws=final_yaws,
+                )
+            current_yaws = list(final_yaws)
         else:
             solver = PathSolver(
                 initials=current_positions,
@@ -460,8 +609,9 @@ def _plan_formation_phases(
             )
             result = solver.solve()
             step_offset = combined_steps[-1].step
+            move_steps = result.steps[1:]
 
-            for record in result.steps[1:]:
+            for record in move_steps:
                 combined_steps.append(
                     StepRecord(
                         step=step_offset + record.step,
@@ -469,12 +619,19 @@ def _plan_formation_phases(
                         collisions=list(record.collisions),
                         reverted_drones=list(record.reverted_drones),
                         verified=record.verified,
+                        yaws={idx: current_yaws[idx] for idx in range(num_drones)},
                     )
                 )
 
             current_positions = [
                 tuple(result.steps[-1].positions[idx]) for idx in range(num_drones)
             ]
+            _append_in_place_yaw_change_step(
+                steps=combined_steps,
+                positions=current_positions,
+                yaws=final_yaws,
+            )
+            current_yaws = list(final_yaws)
             return_success = result.success
             success = success and return_success
 
@@ -579,10 +736,7 @@ async def plan():
     if uses_phases and initial_altitude <= 0:
         return jsonify({"error": "'initial_altitude' must be > 0"}), 400
     planning_initial = (
-        [
-            [point[0], point[1], max(point[2], initial_altitude)]
-            for point in initial
-        ]
+        [[point[0], point[1], max(point[2], initial_altitude)] for point in initial]
         if uses_phases
         else initial
     )
@@ -649,6 +803,7 @@ async def plan():
         if param_names and app is not None:
             try:
                 from flockwave.server.model.uav import UAV
+
                 uav_ids = sorted(app.object_registry.ids_by_type(UAV))
                 if uav_ids:
                     first_uav = app.object_registry.find_by_id(uav_ids[0])
@@ -688,6 +843,15 @@ async def plan():
             )
 
     # --- run solver ---
+    initial_yaws: list[float] | None = None
+    if uses_phases:
+        try:
+            initial_yaws = _normalize_yaw_array(
+                "initial", body.get("initial", []), len(initial)
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
     if uses_phases:
         result, phase_summaries = _plan_formation_phases(
             initial=planning_initial,
@@ -697,6 +861,7 @@ async def plan():
             seed=seed,
             return_to_initial=bool(body.get("return_to_initial", True)),
             min_z=initial_altitude,
+            initial_yaws=initial_yaws,
         )
     else:
         initials = [tuple(p) for p in initial]
@@ -828,10 +993,7 @@ def _derive_coordinate_system_from_first_uav() -> Optional[dict]:
         return None
 
     if log:
-        log.info(
-            f"Auto-derived show origin from {uav_ids[0]}: "
-            f"lat={lat}, lon={lon}"
-        )
+        log.info(f"Auto-derived show origin from {uav_ids[0]}: lat={lat}, lon={lon}")
     return {"type": "nwu", "origin": [lon, lat], "orientation": 0}
 
 
@@ -882,9 +1044,7 @@ def _derive_amsl_reference_from_first_uav() -> Optional[float]:
         return None
 
     if log:
-        log.info(
-            f"Auto-derived AMSL reference from {uav_ids[0]}: {amsl_value:.2f} m"
-        )
+        log.info(f"Auto-derived AMSL reference from {uav_ids[0]}: {amsl_value:.2f} m")
     return amsl_value
 
 
@@ -990,9 +1150,7 @@ class PathPlannerExtension(Extension):
         http_server = app.import_api("http_server")
 
         with ExitStack() as stack:
-            stack.enter_context(
-                overridden(globals(), app=app, log=logger)
-            )
+            stack.enter_context(overridden(globals(), app=app, log=logger))
             stack.enter_context(http_server.mounted(blueprint, path=route))
             logger.info(f"Path-planner API mounted at {route}/plan")
             await sleep_forever()

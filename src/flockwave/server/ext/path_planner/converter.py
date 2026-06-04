@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .solver import SolverResult
 
@@ -27,6 +27,7 @@ from .solver import SolverResult
 # ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
+
 
 def solver_result_to_trajectory_dicts(
     result: SolverResult,
@@ -77,10 +78,14 @@ def solver_result_to_trajectory_dicts(
         for rec in result.steps:
             t_sec = round(rec.step * duration_sec, 4)
             pos = rec.positions[did]
-            raw_points.append([t_sec, [round(pos[0], 4), round(pos[1], 4), round(pos[2], 4)], []])
+            raw_points.append(
+                [t_sec, [round(pos[0], 4), round(pos[1], 4), round(pos[2], 4)], []]
+            )
 
         if not raw_points:
-            trajectories.append({"version": 1, "takeoffTime": takeoff_time, "points": []})
+            trajectories.append(
+                {"version": 1, "takeoffTime": takeoff_time, "points": []}
+            )
             continue
 
         first_pos = raw_points[0][1]  # [x, y, z]
@@ -92,11 +97,15 @@ def solver_result_to_trajectory_dicts(
 
         # Takeoff duration based on altitude and speed
         takeoff_alt = abs(first_pos[2])
-        takeoff_duration = round(takeoff_alt / takeoff_speed, 4) if takeoff_alt > 0 else 0
+        takeoff_duration = (
+            round(takeoff_alt / takeoff_speed, 4) if takeoff_alt > 0 else 0
+        )
 
         # Landing duration based on altitude and speed
         landing_alt = abs(last_pos[2])
-        landing_duration = round(landing_alt / landing_speed, 4) if landing_alt > 0 else 0
+        landing_duration = (
+            round(landing_alt / landing_speed, 4) if landing_alt > 0 else 0
+        )
 
         # Build full trajectory:
         # 1) Ground start at t=0
@@ -142,6 +151,121 @@ def solver_result_to_trajectory_dicts(
     return trajectories
 
 
+def _lerp_yaw_deg(start: float, end: float, fraction: float) -> float:
+    """Linearly interpolate yaw along the shortest path on the circle."""
+    delta = (end - start + 180.0) % 360.0 - 180.0
+    return (start + delta * fraction) % 360.0
+
+
+def _yaw_at_step(
+    record_yaws: Dict[int, float] | None, drone_idx: int, default: float = 0.0
+) -> float:
+    if not record_yaws:
+        return default
+    return float(record_yaws.get(drone_idx, default))
+
+
+def build_yaw_control_dict(
+    result: SolverResult,
+    drone_idx: int,
+    duration_ms: int,
+    *,
+    takeoff_speed: float = 1.5,
+    landing_speed: float = 1.0,
+) -> dict[str, Any] | None:
+    """Build a Skybrush ``yawControl`` block for one drone.
+
+    Yaw setpoint times follow the same timeline as
+    :func:`solver_result_to_trajectory_dicts`, including takeoff and landing
+    segments. Between setpoints the firmware interpolates yaw linearly.
+    """
+    if not result.steps or not any(rec.yaws for rec in result.steps):
+        return None
+
+    did = result.drones[drone_idx].drone_id
+    duration_sec = duration_ms / 1000.0
+
+    raw_points: list[tuple[float, int]] = []
+    for rec in result.steps:
+        t_sec = round(rec.step * duration_sec, 4)
+        raw_points.append((t_sec, rec.step))
+
+    if not raw_points:
+        return None
+
+    first_pos = result.steps[0].positions[did]
+    last_pos = result.steps[-1].positions[did]
+    takeoff_alt = abs(first_pos[2])
+    takeoff_duration = round(takeoff_alt / takeoff_speed, 4) if takeoff_alt > 0 else 0.0
+    landing_alt = abs(last_pos[2])
+    landing_duration = round(landing_alt / landing_speed, 4) if landing_alt > 0 else 0.0
+
+    def yaw_for_step(step: int) -> float:
+        for rec in result.steps:
+            if rec.step == step:
+                return _yaw_at_step(rec.yaws, did)
+        return 0.0
+
+    def position_for_step(step: int) -> list[float] | None:
+        for rec in result.steps:
+            if rec.step == step:
+                pos = rec.positions.get(did)
+                return list(pos) if pos is not None else None
+        return None
+
+    setpoints: list[list[float]] = []
+
+    def append_setpoint(t: float, step: int) -> None:
+        yaw = round(yaw_for_step(step), 4)
+        key = round(t, 4)
+        if setpoints and setpoints[-1][0] == key:
+            setpoints[-1][1] = yaw
+        else:
+            setpoints.append([key, yaw])
+
+    append_setpoint(0.0, 0)
+    if takeoff_duration > 0:
+        append_setpoint(takeoff_duration, 0)
+
+    for raw_idx, (t_sec, step) in enumerate(raw_points):
+        t_shifted = round(t_sec + takeoff_duration, 4)
+        if takeoff_duration > 0 and step == 0:
+            continue
+        if takeoff_duration == 0 and step == 0 and first_pos[2] == 0:
+            continue
+        if raw_idx > 0:
+            prev_t_sec, prev_step = raw_points[raw_idx - 1]
+            prev_t_shifted = round(prev_t_sec + takeoff_duration, 4)
+            prev_pos = position_for_step(prev_step)
+            curr_pos = position_for_step(step)
+            prev_yaw = yaw_for_step(prev_step)
+            curr_yaw = yaw_for_step(step)
+            if (
+                prev_pos is not None
+                and curr_pos is not None
+                and prev_pos == curr_pos
+                and abs(prev_yaw - curr_yaw) > 1e-9
+            ):
+                # Keep yaw changes that happen at the same position near-instant.
+                epsilon = max(0.001, min(duration_sec * 0.05, 0.1))
+                t_shifted = round(min(t_shifted, prev_t_shifted + epsilon), 4)
+        append_setpoint(t_shifted, step)
+
+    last_t = setpoints[-1][0]
+    if landing_duration > 0:
+        append_setpoint(last_t + landing_duration, result.steps[-1].step)
+
+    if len(setpoints) < 2:
+        return None
+
+    return {
+        "version": 1,
+        "autoYaw": False,
+        "autoYawOffset": setpoints[0][1],
+        "setpoints": setpoints,
+    }
+
+
 def build_show_dicts(
     result: SolverResult,
     duration_ms: int = 300,
@@ -175,8 +299,12 @@ def build_show_dicts(
     traj_dicts = solver_result_to_trajectory_dicts(result, duration_ms, takeoff_time)
     shows: List[dict] = []
 
-    for drone, traj in zip(result.drones, traj_dicts):
-        home = [round(drone.initial[0], 4), round(drone.initial[1], 4), round(drone.initial[2], 4)]
+    for idx, (drone, traj) in enumerate(zip(result.drones, traj_dicts)):
+        home = [
+            round(drone.initial[0], 4),
+            round(drone.initial[1], 4),
+            round(drone.initial[2], 4),
+        ]
 
         # Minimal light program: a single END (0x00) byte
         minimal_light = base64.b64encode(b"\x00").decode("ascii")
@@ -208,6 +336,11 @@ def build_show_dicts(
         # corresponds to the "AMSL" altitude reference in the Live UI.
         if amsl_reference is not None:
             show_dict["amslReference"] = float(amsl_reference)
+
+        yaw_control = build_yaw_control_dict(result, idx, duration_ms)
+        if yaw_control is not None:
+            show_dict["yawControl"] = yaw_control
+
         shows.append(show_dict)
 
     return shows
@@ -287,6 +420,7 @@ async def save_skyb_files(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _collapse_stationary(points: List[list]) -> List[list]:
     """Remove consecutive keyframes with identical positions.

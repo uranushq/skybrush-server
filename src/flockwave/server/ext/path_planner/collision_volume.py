@@ -115,7 +115,12 @@ def _combined_aabb_relative(components: tuple[AABB, ...]) -> AABB:
     )
 
 
-def _aabb_overlap(a_min: Sequence[float], a_max: Sequence[float], b_min: Sequence[float], b_max: Sequence[float]) -> bool:
+def _aabb_overlap(
+    a_min: Sequence[float],
+    a_max: Sequence[float],
+    b_min: Sequence[float],
+    b_max: Sequence[float],
+) -> bool:
     return (
         _axis_overlap(a_min[0], a_max[0], b_min[0], b_max[0])
         and _axis_overlap(a_min[1], a_max[1], b_min[1], b_max[1])
@@ -188,9 +193,7 @@ def describe_collision_envelope() -> dict[str, float | dict[str, float] | list]:
             "angle_deg": WAKE_ANGLE_DEG,
             "length": WAKE_LENGTH,
             "radius": WAKE_RADIUS,
-            "motors": [
-                {"x": m[0], "y": m[1], "z": m[2]} for m in MOTOR_POSITIONS
-            ],
+            "motors": [{"x": m[0], "y": m[1], "z": m[2]} for m in MOTOR_POSITIONS],
         },
         "components": [
             {
