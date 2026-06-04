@@ -27,7 +27,7 @@ from json import dumps
 from typing import Any, List, Optional
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from .converter import build_show_dicts
+from .converter import DEFAULT_MAX_YAW_RATE_DEG_S, build_show_dicts
 from .solver import SolverResult
 
 DEFAULT_DURATION_MS = 300
@@ -119,6 +119,7 @@ def build_skyc_bytes(
     takeoff_time: float = 0.0,
     coordinate_system: Optional[dict] = None,
     amsl_reference: Optional[float] = None,
+    max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
 ) -> bytes:
     """Build a ``.skyc`` ZIP for Skybrush Viewer.
 
@@ -132,6 +133,7 @@ def build_skyc_bytes(
         takeoff_time,
         coordinate_system=coordinate_system,
         amsl_reference=amsl_reference,
+        max_yaw_rate_deg_s=max_yaw_rate_deg_s,
     )
     cues = {"version": 1, "items": [{"time": 0.0, "name": "start"}]}
 

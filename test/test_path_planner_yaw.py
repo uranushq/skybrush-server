@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from flockwave.server.ext.path_planner.converter import (
+    DEFAULT_MAX_YAW_RATE_DEG_S,
     build_show_dicts,
     build_yaw_control_dict,
 )
@@ -78,7 +79,99 @@ def test_build_yaw_control_dict_matches_phase_target() -> None:
     shows = build_show_dicts(result, duration_ms=1000, takeoff_time=5.0)
     assert "yawControl" in shows[0]
     assert shows[0]["yawControl"]["setpoints"][-1][1] == 45.0
-    assert shows[0]["yawControl"]["setpoints"][-1][0] == 1.7167
+
+
+def test_in_place_yaw_change_is_rate_limited() -> None:
+    steps = [
+        StepRecord(
+            step=0,
+            positions={0: [0, 0, 1]},
+            collisions=[],
+            reverted_drones=[],
+            verified=True,
+            yaws={0: 0.0},
+        ),
+        StepRecord(
+            step=1,
+            positions={0: [0, 0, 1]},
+            collisions=[],
+            reverted_drones=[],
+            verified=True,
+            yaws={0: 90.0},
+        ),
+    ]
+    from flockwave.server.ext.path_planner.drone import Drone
+    from flockwave.server.ext.path_planner.solver import SolverResult
+
+    result = SolverResult(
+        steps=steps,
+        total_steps=1,
+        drones=[Drone(drone_id=0, initial=(0, 0, 1), target=(0, 0, 1))],
+        success=True,
+    )
+
+    yaw_control = build_yaw_control_dict(
+        result,
+        0,
+        duration_ms=1000,
+        max_yaw_rate_deg_s=90.0,
+    )
+    assert yaw_control is not None
+    setpoints = yaw_control["setpoints"]
+    assert setpoints[-1][1] == 90.0
+    assert len(setpoints) >= 3
+
+    first_90_t = min(t for t, yaw in setpoints if yaw == 90.0)
+    last_0_before_turn = max(
+        t for t, yaw in setpoints if yaw == 0.0 and t <= first_90_t
+    )
+    assert round(first_90_t - last_0_before_turn, 4) == round(90.0 / 90.0, 4)
+
+    for idx in range(1, len(setpoints)):
+        dt = setpoints[idx][0] - setpoints[idx - 1][0]
+        dyaw = abs(
+            (setpoints[idx][1] - setpoints[idx - 1][1] + 180.0) % 360.0 - 180.0
+        )
+        if dt > 1e-6 and dyaw > 1e-6:
+            assert dyaw / dt <= 90.0 + 1.0
+
+
+def test_in_place_yaw_uses_full_step_when_rate_allows() -> None:
+    """90 deg in 2 s at 90 deg/s needs 1 s; hold setpoint remains at step end."""
+    steps = [
+        StepRecord(
+            step=0,
+            positions={0: [0, 5, 0]},
+            collisions=[],
+            reverted_drones=[],
+            verified=True,
+            yaws={0: 0.0},
+        ),
+        StepRecord(
+            step=2,
+            positions={0: [0, 5, 0]},
+            collisions=[],
+            reverted_drones=[],
+            verified=True,
+            yaws={0: 90.0},
+        ),
+    ]
+    from flockwave.server.ext.path_planner.drone import Drone
+    from flockwave.server.ext.path_planner.solver import SolverResult
+
+    result = SolverResult(
+        steps=steps,
+        total_steps=2,
+        drones=[Drone(drone_id=0, initial=(0, 5, 0), target=(0, 5, 0))],
+        success=True,
+    )
+
+    yaw_control = build_yaw_control_dict(result, 0, duration_ms=1000)
+    setpoints = yaw_control["setpoints"]
+    ramp_times = [t for t, yaw in setpoints if 0.0 < yaw < 90.0]
+    assert ramp_times
+    assert setpoints[-1] == [2.0, 90.0]
+    assert DEFAULT_MAX_YAW_RATE_DEG_S == 90.0
 
 
 def test_phase_hold_starts_after_yaw_change() -> None:

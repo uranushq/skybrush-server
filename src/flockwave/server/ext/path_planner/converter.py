@@ -17,11 +17,15 @@ All generated files are written to a caller-supplied output directory
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .solver import SolverResult
+
+# Conservative default for small quadrotors (e.g. Crazyflie) during in-place turns.
+DEFAULT_MAX_YAW_RATE_DEG_S = 90.0
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +157,51 @@ def solver_result_to_trajectory_dicts(
 
 def _lerp_yaw_deg(start: float, end: float, fraction: float) -> float:
     """Linearly interpolate yaw along the shortest path on the circle."""
-    delta = (end - start + 180.0) % 360.0 - 180.0
+    delta = _yaw_delta_deg(start, end)
     return (start + delta * fraction) % 360.0
+
+
+def _yaw_delta_deg(start: float, end: float) -> float:
+    """Shortest signed yaw change from *start* to *end* in degrees."""
+    return (end - start + 180.0) % 360.0 - 180.0
+
+
+def _append_yaw_setpoint(setpoints: list[list[float]], t: float, yaw: float) -> None:
+    key = round(t, 4)
+    yaw_rounded = round(yaw, 4)
+    if setpoints and setpoints[-1][0] == key:
+        setpoints[-1][1] = yaw_rounded
+    else:
+        setpoints.append([key, yaw_rounded])
+
+
+def _append_yaw_ramp_setpoints(
+    setpoints: list[list[float]],
+    *,
+    t_start: float,
+    t_budget: float,
+    yaw_start: float,
+    yaw_end: float,
+    max_yaw_rate_deg_s: float,
+    min_segment_s: float = 0.05,
+) -> float:
+    """Append rate-limited yaw setpoints; return the ramp end time."""
+    delta = _yaw_delta_deg(yaw_start, yaw_end)
+    if abs(delta) < 1e-9:
+        return t_start
+
+    needed = abs(delta) / max_yaw_rate_deg_s
+    duration = min(t_budget, needed) if t_budget > 0 else needed
+    duration = max(duration, 0.001)
+
+    n_segments = max(1, int(math.ceil(duration / min_segment_s)))
+    for i in range(1, n_segments + 1):
+        frac = i / n_segments
+        t = round(t_start + duration * frac, 4)
+        yaw = _lerp_yaw_deg(yaw_start, yaw_end, frac)
+        _append_yaw_setpoint(setpoints, t, yaw)
+
+    return round(t_start + duration, 4)
 
 
 def _yaw_at_step(
@@ -172,12 +219,16 @@ def build_yaw_control_dict(
     *,
     takeoff_speed: float = 1.5,
     landing_speed: float = 1.0,
+    max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
 ) -> dict[str, Any] | None:
     """Build a Skybrush ``yawControl`` block for one drone.
 
     Yaw setpoint times follow the same timeline as
     :func:`solver_result_to_trajectory_dicts`, including takeoff and landing
     segments. Between setpoints the firmware interpolates yaw linearly.
+
+    In-place yaw changes (same position, different yaw) are spread over time
+    according to *max_yaw_rate_deg_s*, up to the solver step interval.
     """
     if not result.steps or not any(rec.yaws for rec in result.steps):
         return None
@@ -213,15 +264,13 @@ def build_yaw_control_dict(
                 return list(pos) if pos is not None else None
         return None
 
+    if max_yaw_rate_deg_s <= 0:
+        raise ValueError("max_yaw_rate_deg_s must be > 0")
+
     setpoints: list[list[float]] = []
 
     def append_setpoint(t: float, step: int) -> None:
-        yaw = round(yaw_for_step(step), 4)
-        key = round(t, 4)
-        if setpoints and setpoints[-1][0] == key:
-            setpoints[-1][1] = yaw
-        else:
-            setpoints.append([key, yaw])
+        _append_yaw_setpoint(setpoints, t, yaw_for_step(step))
 
     append_setpoint(0.0, 0)
     if takeoff_duration > 0:
@@ -246,9 +295,18 @@ def build_yaw_control_dict(
                 and prev_pos == curr_pos
                 and abs(prev_yaw - curr_yaw) > 1e-9
             ):
-                # Keep yaw changes that happen at the same position near-instant.
-                epsilon = max(0.001, min(duration_sec * 0.05, 0.1))
-                t_shifted = round(min(t_shifted, prev_t_shifted + epsilon), 4)
+                t_budget = max(t_shifted - prev_t_shifted, 0.001)
+                ramp_end = _append_yaw_ramp_setpoints(
+                    setpoints,
+                    t_start=prev_t_shifted,
+                    t_budget=t_budget,
+                    yaw_start=prev_yaw,
+                    yaw_end=curr_yaw,
+                    max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+                )
+                if ramp_end < t_shifted - 1e-6:
+                    append_setpoint(t_shifted, step)
+                continue
         append_setpoint(t_shifted, step)
 
     last_t = setpoints[-1][0]
@@ -272,6 +330,7 @@ def build_show_dicts(
     takeoff_time: float = 0.0,
     coordinate_system: Optional[dict] = None,
     amsl_reference: Optional[float] = None,
+    max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
 ) -> List[dict]:
     """Build a list of full *show specification* dicts (one per drone).
 
@@ -337,7 +396,12 @@ def build_show_dicts(
         if amsl_reference is not None:
             show_dict["amslReference"] = float(amsl_reference)
 
-        yaw_control = build_yaw_control_dict(result, idx, duration_ms)
+        yaw_control = build_yaw_control_dict(
+            result,
+            idx,
+            duration_ms,
+            max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+        )
         if yaw_control is not None:
             show_dict["yawControl"] = yaw_control
 
@@ -353,6 +417,7 @@ async def save_skyb_files(
     takeoff_time: float = 0.0,
     coordinate_system: Optional[dict] = None,
     amsl_reference: Optional[float] = None,
+    max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
 ) -> Dict[str, str]:
     """Generate ``.skyb`` files for every drone and save them to *output_dir*.
 
@@ -376,6 +441,7 @@ async def save_skyb_files(
         takeoff_time,
         coordinate_system=coordinate_system,
         amsl_reference=amsl_reference,
+        max_yaw_rate_deg_s=max_yaw_rate_deg_s,
     )
     traj_dicts = solver_result_to_trajectory_dicts(result, duration_ms, takeoff_time)
     skyb_paths: Dict[str, str] = {}

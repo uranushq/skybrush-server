@@ -52,7 +52,11 @@ from trio import sleep_forever
 from flockwave.server.ext.base import Extension
 from flockwave.server.utils import overridden
 
-from .converter import build_show_dicts, save_skyb_files
+from .converter import (
+    DEFAULT_MAX_YAW_RATE_DEG_S,
+    build_show_dicts,
+    save_skyb_files,
+)
 from .drone import Drone
 from .output import build_output, build_show_specifications, build_skyc_bytes
 from .collision_volume import describe_collision_envelope, volumes_overlap
@@ -754,11 +758,16 @@ async def plan():
     # firmware acceptance limits and avoids reload rejection on small shows.
     duration_ms: int = int(body.get("duration_ms", 5000))
     seed: Optional[int] = body.get("seed")
+    max_yaw_rate_deg_s: float = float(
+        body.get("max_yaw_rate_deg_s", DEFAULT_MAX_YAW_RATE_DEG_S)
+    )
 
     if step_size <= 0:
         return jsonify({"error": "'step_size' must be > 0"}), 400
     if duration_ms <= 0:
         return jsonify({"error": "'duration_ms' must be > 0"}), 400
+    if max_yaw_rate_deg_s <= 0:
+        return jsonify({"error": "'max_yaw_rate_deg_s' must be > 0"}), 400
     initial_altitude: float = float(
         body.get("initial_altitude", body.get("takeoff_altitude", 2.5))
     )
@@ -925,6 +934,7 @@ async def plan():
             takeoff_time=takeoff_time,
             coordinate_system=coordinate_system,
             amsl_reference=amsl_reference,
+            max_yaw_rate_deg_s=max_yaw_rate_deg_s,
         )
         output["skybrush_files"] = saved
         if log:
@@ -947,6 +957,7 @@ async def plan():
             takeoff_time=takeoff_time,
             coordinate_system=coordinate_system,
             amsl_reference=amsl_reference,
+            max_yaw_rate_deg_s=max_yaw_rate_deg_s,
         )
         output["upload"] = upload_results
 
@@ -966,6 +977,7 @@ async def plan():
                         takeoff_time=takeoff_time,
                         coordinate_system=coordinate_system,
                         amsl_reference=amsl_reference,
+                        max_yaw_rate_deg_s=max_yaw_rate_deg_s,
                     ),
                     mimetype="application/zip",
                 )
@@ -1084,6 +1096,7 @@ async def _upload_to_connected_uavs(
     takeoff_time: float = 0.0,
     coordinate_system: Optional[dict] = None,
     amsl_reference: Optional[float] = None,
+    max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
 ) -> dict:
     """Upload per-drone show specs to connected UAVs.
 
@@ -1124,6 +1137,7 @@ async def _upload_to_connected_uavs(
         takeoff_time=takeoff_time,
         coordinate_system=coordinate_system,
         amsl_reference=amsl_reference,
+        max_yaw_rate_deg_s=max_yaw_rate_deg_s,
     )
     num_drones = len(show_dicts)
 
