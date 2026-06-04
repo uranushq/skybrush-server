@@ -373,6 +373,24 @@ def _yaw_lists_match(current_yaws: list[float], target_yaws: list[float]) -> boo
     return all(abs(current - target) < 1e-9 for current, target in zip(current_yaws, target_yaws))
 
 
+def _reset_yaw_to_neutral_before_move(
+    *,
+    steps: list[StepRecord],
+    positions: list[tuple[float, float, float]],
+    current_yaws: list[float],
+) -> list[float]:
+    """Reset per-drone yaw to 0 in place before starting a translation."""
+    neutral_yaws = [0.0] * len(positions)
+    if _yaw_lists_match(current_yaws, neutral_yaws):
+        return current_yaws
+    _append_in_place_yaw_change_step(
+        steps=steps,
+        positions=positions,
+        yaws=neutral_yaws,
+    )
+    return neutral_yaws
+
+
 def _phase_targets(phase: dict, num_drones: int) -> list[tuple[float, float, float]]:
     targets: list[tuple[float, float, float] | None] = [None] * num_drones
     for point_index, point in enumerate(phase["points"]):
@@ -563,6 +581,17 @@ def _plan_formation_phases(
                 )
             )
 
+        hold_end_step = combined_steps[-1].step
+        will_move_after_phase = phase_index < len(phases) - 1 or (
+            phase_index == len(phases) - 1 and return_to_initial
+        )
+        if will_move_after_phase:
+            current_yaws = _reset_yaw_to_neutral_before_move(
+                steps=combined_steps,
+                positions=current_positions,
+                current_yaws=current_yaws,
+            )
+
         phase_summaries.append(
             {
                 "name": phase.get("name", f"phase-{phase_index + 1}"),
@@ -570,8 +599,8 @@ def _plan_formation_phases(
                 "arrivalTimeMs": arrival_step * duration_ms,
                 "holdMs": hold_ms,
                 "holdSteps": hold_steps,
-                "endStep": combined_steps[-1].step,
-                "endTimeMs": combined_steps[-1].step * duration_ms,
+                "endStep": hold_end_step,
+                "endTimeMs": hold_end_step * duration_ms,
                 "success": phase_success,
             }
         )

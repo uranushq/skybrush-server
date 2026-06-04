@@ -110,3 +110,45 @@ def test_phase_hold_starts_after_yaw_change() -> None:
     assert result.steps[1].yaws[0] == 90.0
     assert result.steps[2].yaws[0] == 90.0
     assert result.steps[3].yaws[0] == 90.0
+
+
+def test_plan_formation_phases_resets_yaw_after_hold_before_return() -> None:
+    initial = [[0.0, 0.0, 1.0], [2.0, 0.0, 1.0]]
+    phases = [
+        {
+            "name": "pose",
+            "holdMs": 1000,
+            "points": [
+                {"droneId": "drone-1", "x": 0, "y": 5, "z": 0, "yaw": 90.0},
+                {"droneId": "drone-2", "x": 2, "y": 5, "z": 0, "yaw": 45.0},
+            ],
+        }
+    ]
+    result, summaries = _plan_formation_phases(
+        initial=initial,
+        phases=phases,
+        step_size=1.0,
+        duration_ms=1000,
+        seed=42,
+        return_to_initial=True,
+        initial_yaws=[0.0, 0.0],
+    )
+
+    hold_end_step = summaries[0]["endStep"]
+    reset_step_idx = next(
+        idx for idx, rec in enumerate(result.steps) if rec.step == hold_end_step + 1
+    )
+    assert result.steps[reset_step_idx - 1].yaws[0] == 90.0
+    assert result.steps[reset_step_idx].yaws[0] == 0.0
+    assert (
+        result.steps[reset_step_idx].positions
+        == result.steps[reset_step_idx - 1].positions
+    )
+
+    return_move_records = [
+        rec
+        for rec in result.steps[reset_step_idx + 1 :]
+        if rec.positions[0] != list(initial[0])
+    ]
+    assert return_move_records
+    assert all(abs(rec.yaws[0] - 0.0) < 1e-6 for rec in return_move_records[:-1])
