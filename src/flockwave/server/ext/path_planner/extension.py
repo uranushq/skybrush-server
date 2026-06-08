@@ -515,22 +515,6 @@ def _plan_formation_phases(
         phase_success = True
         if _positions_match(current_positions, targets):
             current_positions = list(targets)
-            if _yaw_lists_match(current_yaws, target_yaws):
-                combined_steps[-1] = StepRecord(
-                    step=combined_steps[-1].step,
-                    positions=combined_steps[-1].positions,
-                    collisions=combined_steps[-1].collisions,
-                    reverted_drones=combined_steps[-1].reverted_drones,
-                    verified=combined_steps[-1].verified,
-                    yaws={idx: target_yaws[idx] for idx in range(num_drones)},
-                )
-            else:
-                _append_in_place_yaw_change_step(
-                    steps=combined_steps,
-                    positions=current_positions,
-                    yaws=target_yaws,
-                )
-            current_yaws = list(target_yaws)
         else:
             solver = PathSolver(
                 initials=current_positions,
@@ -558,32 +542,37 @@ def _plan_formation_phases(
             current_positions = [
                 tuple(result.steps[-1].positions[idx]) for idx in range(num_drones)
             ]
-            _append_in_place_yaw_change_step(
-                steps=combined_steps,
-                positions=current_positions,
-                yaws=target_yaws,
-            )
-            current_yaws = list(target_yaws)
             phase_success = result.success
             success = success and phase_success
 
         arrival_step = combined_steps[-1].step
         hold_ms = int(phase.get("holdMs", 0))
         hold_steps = ceil(hold_ms / duration_ms) if hold_ms > 0 else 0
-        hold_yaws = {idx: current_yaws[idx] for idx in range(num_drones)}
-        for _ in range(hold_steps):
-            combined_steps.append(
-                StepRecord(
-                    step=combined_steps[-1].step + 1,
-                    positions={
-                        idx: list(pos) for idx, pos in enumerate(current_positions)
-                    },
-                    collisions=[],
-                    reverted_drones=[],
-                    verified=True,
-                    yaws=dict(hold_yaws),
+        needs_yaw_change = not _yaw_lists_match(current_yaws, target_yaws)
+
+        if hold_steps > 0:
+            hold_yaws = {idx: target_yaws[idx] for idx in range(num_drones)}
+            for _ in range(hold_steps):
+                combined_steps.append(
+                    StepRecord(
+                        step=combined_steps[-1].step + 1,
+                        positions={
+                            idx: list(pos) for idx, pos in enumerate(current_positions)
+                        },
+                        collisions=[],
+                        reverted_drones=[],
+                        verified=True,
+                        yaws=dict(hold_yaws),
+                    )
                 )
+            current_yaws = list(target_yaws)
+        elif needs_yaw_change:
+            _append_in_place_yaw_change_step(
+                steps=combined_steps,
+                positions=current_positions,
+                yaws=target_yaws,
             )
+            current_yaws = list(target_yaws)
 
         hold_end_step = combined_steps[-1].step
         will_move_after_phase = phase_index < len(phases) - 1 or (

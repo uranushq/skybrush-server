@@ -155,10 +155,22 @@ def solver_result_to_trajectory_dicts(
     return trajectories
 
 
+def _normalize_yaw_deg(yaw: float) -> float:
+    """Normalize yaw to [-180, 180) for linear setpoint interpolation."""
+    yaw = yaw % 360.0
+    if yaw >= 180.0:
+        yaw -= 360.0
+    return yaw
+
+
 def _lerp_yaw_deg(start: float, end: float, fraction: float) -> float:
-    """Linearly interpolate yaw along the shortest path on the circle."""
+    """Linearly interpolate yaw along the shortest path on the circle.
+
+    Setpoints must stay on one continuous branch (no 0/360 wrap) because
+    firmware interpolates yaw linearly between consecutive entries.
+    """
     delta = _yaw_delta_deg(start, end)
-    return (start + delta * fraction) % 360.0
+    return _normalize_yaw_deg(start + delta * fraction)
 
 
 def _yaw_delta_deg(start: float, end: float) -> float:
@@ -168,7 +180,7 @@ def _yaw_delta_deg(start: float, end: float) -> float:
 
 def _append_yaw_setpoint(setpoints: list[list[float]], t: float, yaw: float) -> None:
     key = round(t, 4)
-    yaw_rounded = round(yaw, 4)
+    yaw_rounded = round(_normalize_yaw_deg(yaw), 4)
     if setpoints and setpoints[-1][0] == key:
         setpoints[-1][1] = yaw_rounded
     else:
@@ -212,11 +224,28 @@ def _yaw_at_step(
     return float(record_yaws.get(drone_idx, default))
 
 
+def _apply_takeoff_time_to_yaw_setpoints(
+    setpoints: list[list[float]], takeoff_time: float
+) -> list[list[float]]:
+    """Shift yaw setpoints onto the show-wide timeline used by Skybrush Viewer."""
+    if takeoff_time <= 0:
+        return setpoints
+
+    initial_yaw = setpoints[0][1]
+    shifted = [
+        [round(t + takeoff_time, 4), yaw] for t, yaw in setpoints
+    ]
+    if shifted[0][0] > 0:
+        shifted.insert(0, [0.0, initial_yaw])
+    return shifted
+
+
 def build_yaw_control_dict(
     result: SolverResult,
     drone_idx: int,
     duration_ms: int,
     *,
+    takeoff_time: float = 0.0,
     takeoff_speed: float = 1.5,
     landing_speed: float = 1.0,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
@@ -225,7 +254,8 @@ def build_yaw_control_dict(
 
     Yaw setpoint times follow the same timeline as
     :func:`solver_result_to_trajectory_dicts`, including takeoff and landing
-    segments. Between setpoints the firmware interpolates yaw linearly.
+    segments, plus *takeoff_time* (ground wait before the trajectory starts).
+    Between setpoints the firmware interpolates yaw linearly.
 
     In-place yaw changes (same position, different yaw) are spread over time
     according to *max_yaw_rate_deg_s*, up to the solver step interval.
@@ -316,6 +346,8 @@ def build_yaw_control_dict(
     if len(setpoints) < 2:
         return None
 
+    setpoints = _apply_takeoff_time_to_yaw_setpoints(setpoints, takeoff_time)
+
     return {
         "version": 1,
         "autoYaw": False,
@@ -400,6 +432,7 @@ def build_show_dicts(
             result,
             idx,
             duration_ms,
+            takeoff_time=takeoff_time,
             max_yaw_rate_deg_s=max_yaw_rate_deg_s,
         )
         if yaw_control is not None:
