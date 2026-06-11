@@ -16,7 +16,9 @@
     "rtk": {
       // Add all serial ports as potential RTK data sources with baud rates 9600
       // and 57600
-      "add_serial_ports": [9600, 57600]
+      "add_serial_ports": [9600, 57600],
+      "survey_accuracy": 150,
+      "survey_duration": 60
     },
 
     // Listen for MAVLink-based drones
