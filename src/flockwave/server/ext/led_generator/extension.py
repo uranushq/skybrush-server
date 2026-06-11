@@ -10,13 +10,12 @@ Request body (JSON) — the ``LedShow`` model authored in Skybrush Live
 
     {
       "ledsPerDrone": 4,
-      "droneRows": 3,
-      "droneCols": 7,
       "droneCount": 21,
       "fps": 15,
       "boards": [
-        {"id": "...", "name": "...", "pixels": [[r,g,b], ...],
-         "startSec": 0.0, "durationSec": 2.0}
+        {"startSec": 0.0, "durationSec": 2.0,
+         "drones": [ [[r,g,b], ... (k*k)], ... (droneCount) ],
+         "rows": 3, "cols": 7}        // formation; optional, ignored for .bin
       ],
       "upload": true,                 // optional, default true
       "upload_url": "http://..."      // optional, overrides the default server
@@ -40,6 +39,9 @@ Response body (JSON)::
 """
 
 from __future__ import annotations
+
+import re
+import uuid
 
 from contextlib import ExitStack
 from logging import Logger
@@ -65,6 +67,20 @@ log: Optional[Logger] = None
 default_upload_url: str = DEFAULT_UPLOAD_URL
 
 
+def _make_show_id(body: dict) -> str:
+    """Return a 6-character alphanumeric prefix for the ``xxxxxx_tile_nn.bin``
+    filenames the download server expects.
+
+    Uses a ``showId``/``show_id`` field from the request body when present
+    (sanitised to 6 alphanumeric characters); otherwise generates one.
+    """
+    raw = str(body.get("showId") or body.get("show_id") or "")
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", raw)[:6]
+    if len(cleaned) < 6:
+        cleaned = (cleaned + uuid.uuid4().hex)[:6]
+    return cleaned
+
+
 @blueprint.route("/compile", methods=["POST"])
 async def compile_endpoint():
     """Compile an LED show and (optionally) upload the per-drone files."""
@@ -79,6 +95,7 @@ async def compile_endpoint():
 
     do_upload = bool(body.get("upload", True))
     upload_url = str(body.get("upload_url", default_upload_url))
+    show_id = _make_show_id(body)
 
     tiles: list[dict] = []
     for per_drone in compiled.bins:
@@ -87,8 +104,9 @@ async def compile_endpoint():
             "bytes": len(per_drone.data),
         }
         if do_upload:
-            # The download server assigns the real filename/id; this is a hint.
-            filename = f"drone{per_drone.drone_index + 1}.bin"
+            # The download server requires the pattern ``xxxxxx_tile_nn.bin``:
+            # a 6-char show id, then the 2-digit (1-based) tile/drone number.
+            filename = f"{show_id}_tile_{per_drone.drone_index + 1:02d}.bin"
             try:
                 result = await upload_bin(filename, per_drone.data, url=upload_url)
                 entry["filename"] = result.get("filename")
@@ -123,6 +141,7 @@ async def compile_endpoint():
             "tileHeight": compiled.tile_height,
             "droneCount": len(compiled.bins),
             "uploaded": do_upload,
+            "showId": show_id,
             "tiles": tiles,
         }
     )

@@ -54,35 +54,30 @@ def test_build_bin_rejects_wrong_frame_size():
 
 
 # --------------------------------------------------------------------------- #
-# compile_show
+# compile_show (per-drone model)
 # --------------------------------------------------------------------------- #
 
 
-def _gradient_grid(grid_w: int, grid_h: int):
-    """Build a board whose pixel at (x, y) encodes its position as [x, y, 0]."""
-    return [[x % 256, y % 256, 0] for y in range(grid_h) for x in range(grid_w)]
+def _make_drones(count, k, fn):
+    """Build per-drone colour sets; fn(drone, local) -> [r, g, b]."""
+    return [[fn(d, l) for l in range(k * k)] for d in range(count)]
 
 
 def _base_model(**overrides):
     k = overrides.pop("ledsPerDrone", 4)
-    rows = overrides.pop("droneRows", 3)
-    cols = overrides.pop("droneCols", 7)
-    grid_w, grid_h = cols * k, rows * k
+    count = overrides.pop("droneCount", 21)
+    fn = overrides.pop("fn", lambda d, l: [d % 256, l, 0])
     model = {
         "ledsPerDrone": k,
-        "droneRows": rows,
-        "droneCols": cols,
-        "droneCount": overrides.pop("droneCount", rows * cols),
+        "droneCount": count,
         "fps": overrides.pop("fps", 10),
         "boards": overrides.pop(
             "boards",
             [
                 {
-                    "id": "b0",
-                    "name": "board 0",
-                    "pixels": _gradient_grid(grid_w, grid_h),
                     "startSec": 0.0,
                     "durationSec": 1.0,
+                    "drones": _make_drones(count, k, fn),
                 }
             ],
         ),
@@ -91,105 +86,103 @@ def _base_model(**overrides):
     return model
 
 
-def test_compile_basic_3x7_4x4():
-    model = _base_model()  # 21 drones, 4x4, 10 fps, 1s board
-    result = compile_show(model)
-
+def test_compile_basic():
+    result = compile_show(_base_model())  # 21 drones, 4x4, 10fps, 1s board
     assert len(result.bins) == 21
-    assert result.total_frames == 10  # 1s * 10fps
+    assert result.total_frames == 10
     assert result.tile_width == 4 and result.tile_height == 4
-
     for per_drone in result.bins:
         parsed = parse_bin(per_drone.data)
         assert parsed["total_frames"] == 10
         assert parsed["width"] == 4 and parsed["height"] == 4
 
 
-def test_compile_tile_extraction_reading_order():
-    k, cols = 4, 7
-    model = _base_model()
-    result = compile_show(model)
-
-    # Drone 9 -> row 1, col 2 -> grid origin (x=8, y=4)
-    drone_index = 9
-    drone_row, drone_col = drone_index // cols, drone_index % cols
-    origin_x, origin_y = drone_col * k, drone_row * k
-
-    frame0 = parse_bin(result.bins[drone_index].data)["frames"][0]
-    # Check tile pixel (ty=1, tx=2): grid (y=origin_y+1, x=origin_x+2) -> [x, y, 0]
-    ty, tx = 1, 2
-    base = (ty * k + tx) * 3
-    r, g, b = frame0[base], frame0[base + 1], frame0[base + 2]
-    assert (r, g, b) == (origin_x + tx, origin_y + ty, 0)
+def test_compile_preserves_per_drone_content_and_order():
+    # Each drone's local pixel l encodes (drone, local) so we can verify that a
+    # drone's LED set stays intact and is mapped to the right .bin (reading order).
+    k = 4
+    result = compile_show(_base_model(fn=lambda d, l: [d % 256, l, 0]))
+    for drone_index in (0, 5, 9, 20):
+        frame0 = parse_bin(result.bins[drone_index].data)["frames"][0]
+        for local in range(k * k):
+            base = local * 3
+            assert (frame0[base], frame0[base + 1], frame0[base + 2]) == (
+                drone_index % 256,
+                local,
+                0,
+            )
 
 
-def test_compile_missing_drones_removed_from_bottom_right():
-    model = _base_model(droneCount=18)  # 21 slots, only 18 drones
-    result = compile_show(model)
-
+def test_compile_drone_count():
+    result = compile_show(_base_model(droneCount=18))
     assert len(result.bins) == 18
-    indices = [b.drone_index for b in result.bins]
-    assert indices == list(range(18))  # 18, 19, 20 (bottom-right) dropped
+    assert [b.drone_index for b in result.bins] == list(range(18))
 
 
 def test_compile_black_gap_before_board():
-    k, cols, rows, fps = 4, 7, 3, 10
-    grid_w, grid_h = cols * k, rows * k
+    k, fps, count = 4, 10, 21
     model = _base_model(
         fps=fps,
+        droneCount=count,
         boards=[
             {
-                "id": "b0",
-                "name": "delayed",
-                "pixels": _gradient_grid(grid_w, grid_h),
-                "startSec": 1.0,  # starts at 1s
+                "startSec": 1.0,
                 "durationSec": 1.0,
+                "drones": _make_drones(count, k, lambda d, l: [255, 255, 255]),
             }
         ],
     )
     result = compile_show(model)
-    assert result.total_frames == 20  # total duration 2s * 10fps
+    assert result.total_frames == 20  # 2s * 10fps
 
     frames = parse_bin(result.bins[0].data)["frames"]
     black = bytes(k * k * 3)
-    assert all(f == black for f in frames[:10])  # first second is black
-    assert all(f != black for f in frames[10:])  # board active afterwards
+    assert all(f == black for f in frames[:10])
+    assert all(f != black for f in frames[10:])
 
 
 def test_compile_rejects_overlapping_boards():
-    k, cols, rows = 4, 7, 3
-    grid_w, grid_h = cols * k, rows * k
-    grid = _gradient_grid(grid_w, grid_h)
+    k, count = 4, 21
+    drones = _make_drones(count, k, lambda d, l: [1, 2, 3])
     model = _base_model(
         boards=[
-            {"id": "a", "name": "a", "pixels": grid, "startSec": 0.0, "durationSec": 1.0},
-            {"id": "b", "name": "b", "pixels": grid, "startSec": 0.5, "durationSec": 1.0},
+            {"startSec": 0.0, "durationSec": 1.0, "drones": drones},
+            {"startSec": 0.5, "durationSec": 1.0, "drones": drones},
         ]
     )
     with pytest.raises(CompileError):
         compile_show(model)
 
 
-def test_compile_rejects_dronecount_over_grid():
+def test_compile_rejects_wrong_drones_length():
+    model = _base_model(
+        boards=[
+            {
+                "startSec": 0.0,
+                "durationSec": 1.0,
+                "drones": _make_drones(5, 4, lambda d, l: [0, 0, 0]),  # not 21
+            }
+        ]
+    )
     with pytest.raises(CompileError):
-        compile_show(_base_model(droneCount=22))  # > 3*7
+        compile_show(model)
 
 
-def test_compile_rejects_bad_pixel_count():
-    model = _base_model(boards=[
-        {"id": "a", "name": "a", "pixels": [[0, 0, 0]], "startSec": 0.0, "durationSec": 1.0}
-    ])
+def test_compile_rejects_bad_drone_pixel_count():
+    model = _base_model(
+        boards=[
+            {
+                "startSec": 0.0,
+                "durationSec": 1.0,
+                "drones": [[[0, 0, 0]] for _ in range(21)],  # each drone too short
+            }
+        ]
+    )
     with pytest.raises(CompileError):
         compile_show(model)
 
 
 def test_compile_clamps_channel_values():
-    k, cols, rows = 4, 7, 3
-    grid_w, grid_h = cols * k, rows * k
-    pixels = [[300, -5, 128] for _ in range(grid_w * grid_h)]
-    model = _base_model(boards=[
-        {"id": "a", "name": "a", "pixels": pixels, "startSec": 0.0, "durationSec": 1.0}
-    ])
-    result = compile_show(model)
+    result = compile_show(_base_model(fn=lambda d, l: [300, -5, 128]))
     frame0 = parse_bin(result.bins[0].data)["frames"][0]
     assert frame0[0:3] == bytes([255, 0, 128])

@@ -1,44 +1,35 @@
 """Compile a Skybrush-Live "LED show" model into per-drone ``.bin`` files.
 
-The model mirrors the TypeScript ``LedShow`` type authored in the browser::
+The model mirrors the TypeScript ``LedShow`` type authored in the browser.
+Drone count, LEDs-per-drone and FPS are global; colours are stored **per drone**
+(each drone's ``k*k`` set), so the per-board formation does not affect the
+generated ``.bin`` files — a drone's file only depends on its own LED sequence::
 
     {
       "ledsPerDrone": 4,          # k -> each drone has a k x k LED panel
-      "droneRows": 3,             # drone arrangement (rows)
-      "droneCols": 7,             # drone arrangement (cols)
-      "droneCount": 21,           # <= droneRows * droneCols; extras are removed
-                                  # from the bottom-right (highest tile indices)
+      "droneCount": 21,           # number of drones (reading order)
       "fps": 15,                  # global export frame rate
       "boards": [
         {
-          "id": "...",
-          "name": "...",
-          "pixels": [[r, g, b], ...],   # length gridH*gridW, row-major
           "startSec": 0.0,
-          "durationSec": 2.0
+          "durationSec": 2.0,
+          # one entry per drone (length droneCount); each is k*k row-major RGB
+          "drones": [ [[r, g, b], ... (k*k) ], ... (droneCount) ],
+          "rows": 3, "cols": 7    # formation (optional, ignored for .bin)
         },
         ...
       ]
     }
 
-with ``gridW = droneCols * k`` and ``gridH = droneRows * k``.
-
 A board is a *static* still frame held for ``durationSec``. On export the
 timeline is sampled at ``fps``; a board fills every frame inside its span and
 gaps between boards render black ``(0, 0, 0)``.
-
-Drones are numbered in reading order (left->right, top->bottom)::
-
-    tile_id = drone_row * droneCols + drone_col
-
-so dropping drones ``>= droneCount`` naturally removes them from the
-bottom-right of the grid.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from .binformat import build_bin
 
@@ -51,7 +42,7 @@ class CompileError(ValueError):
 
 @dataclass(frozen=True)
 class PerDroneBin:
-    """A single compiled per-drone tile file."""
+    """A single compiled per-drone file."""
 
     drone_index: int  # 0-based, reading order
     data: bytes  # complete .bin byte string
@@ -85,19 +76,20 @@ def _clamp_channel(value: Any) -> int:
     return 0 if ivalue < 0 else 255 if ivalue > 255 else ivalue
 
 
-def _grid_bytes(pixels: Sequence[Any], *, grid_w: int, grid_h: int) -> bytes:
-    """Flatten a row-major ``[[r,g,b], ...]`` board into raw RGB bytes."""
-    expected = grid_w * grid_h
+def _drone_bytes(pixels: Any, *, leds: int, board_index: int, drone_index: int) -> bytes:
+    """Flatten one drone's ``k*k`` row-major ``[[r,g,b], ...]`` into RGB bytes."""
+    expected = leds * leds
     if not isinstance(pixels, (list, tuple)) or len(pixels) != expected:
         raise CompileError(
-            f"'pixels' must have exactly {expected} entries "
-            f"({grid_w}x{grid_h}), got "
-            f"{len(pixels) if isinstance(pixels, (list, tuple)) else type(pixels)}"
+            f"'boards[{board_index}].drones[{drone_index}]' must have "
+            f"{expected} pixels ({leds}x{leds})"
         )
     out = bytearray(expected * 3)
     for i, pixel in enumerate(pixels):
         if not isinstance(pixel, (list, tuple)) or len(pixel) != 3:
-            raise CompileError(f"'pixels[{i}]' must be [r, g, b]")
+            raise CompileError(
+                f"'boards[{board_index}].drones[{drone_index}][{i}]' must be [r, g, b]"
+            )
         base = i * 3
         out[base] = _clamp_channel(pixel[0])
         out[base + 1] = _clamp_channel(pixel[1])
@@ -105,47 +97,20 @@ def _grid_bytes(pixels: Sequence[Any], *, grid_w: int, grid_h: int) -> bytes:
     return bytes(out)
 
 
-def _extract_tile(
-    grid: bytes, *, drone_index: int, cols: int, k: int, grid_w: int
-) -> bytes:
-    """Extract the k x k RGB sub-block for a drone from a full-grid RGB buffer."""
-    drone_row = drone_index // cols
-    drone_col = drone_index % cols
-    start_y = drone_row * k
-    start_x = drone_col * k
-    row_stride = grid_w * 3
-    tile = bytearray(k * k * 3)
-    for y in range(k):
-        src = ((start_y + y) * grid_w + start_x) * 3
-        dst = y * k * 3
-        tile[dst : dst + k * 3] = grid[src : src + k * 3]
-    return bytes(tile)
-
-
 def compile_show(model: Mapping[str, Any]) -> CompiledShow:
     """Compile an LED-show model into per-drone ``.bin`` byte strings."""
-    k = _require_int(model, "ledsPerDrone", minimum=1)
-    if k not in (3, 4):
+    leds = _require_int(model, "ledsPerDrone", minimum=1)
+    if leds not in (3, 4):
         raise CompileError("'ledsPerDrone' must be 3 or 4")
-    rows = _require_int(model, "droneRows", minimum=1)
-    cols = _require_int(model, "droneCols", minimum=1)
-    fps = _require_int(model, "fps", minimum=1)
     drone_count = _require_int(model, "droneCount", minimum=1)
-    if drone_count > rows * cols:
-        raise CompileError(
-            f"'droneCount' ({drone_count}) exceeds droneRows*droneCols "
-            f"({rows * cols})"
-        )
-
-    grid_w = cols * k
-    grid_h = rows * k
+    fps = _require_int(model, "fps", minimum=1)
 
     boards = model.get("boards")
     if not isinstance(boards, list) or len(boards) == 0:
         raise CompileError("'boards' must be a non-empty array")
 
-    # Validate / normalize boards and pre-compute their full-grid RGB bytes.
-    spans: list[tuple[float, float, bytes]] = []  # (start, end, grid_bytes)
+    # Validate boards and pre-compute each board's per-drone byte buffers.
+    spans: list[tuple[float, float, list[bytes]]] = []  # (start, end, drone_bytes)
     for index, board in enumerate(boards):
         if not isinstance(board, Mapping):
             raise CompileError(f"'boards[{index}]' must be an object")
@@ -160,36 +125,34 @@ def compile_show(model: Mapping[str, Any]) -> CompiledShow:
             raise CompileError(f"'boards[{index}].durationSec' must be > 0")
         if start < 0:
             raise CompileError(f"'boards[{index}].startSec' must be >= 0")
-        grid = _grid_bytes(board.get("pixels"), grid_w=grid_w, grid_h=grid_h)
-        spans.append((start, start + duration, grid))
 
-    # Reject overlapping boards (the timeline UI enforces this, but be safe).
+        drones = board.get("drones")
+        if not isinstance(drones, list) or len(drones) != drone_count:
+            raise CompileError(
+                f"'boards[{index}].drones' must have exactly {drone_count} entries"
+            )
+        drone_bytes = [
+            _drone_bytes(drones[d], leds=leds, board_index=index, drone_index=d)
+            for d in range(drone_count)
+        ]
+        spans.append((start, start + duration, drone_bytes))
+
     ordered = sorted(spans, key=lambda s: s[0])
-    for (s0, e0, _), (s1, _e1, _g) in zip(ordered, ordered[1:]):
+    for (s0, e0, _), (s1, _e1, _d) in zip(ordered, ordered[1:]):
         if s1 < e0 - 1e-9:
             raise CompileError("boards on the timeline must not overlap")
 
-    total_duration = max(end for _s, end, _g in spans)
+    total_duration = max(end for _s, end, _d in spans)
     total_frames = max(1, round(total_duration * fps))
 
-    black_tile = bytes(k * k * 3)
+    black = bytes(leds * leds * 3)
 
-    # For each board pre-compute its per-drone tile bytes so the per-frame loop
-    # is just a list of references.
-    board_tiles: list[list[bytes]] = []
-    for _s, _e, grid in spans:
-        tiles = [
-            _extract_tile(grid, drone_index=d, cols=cols, k=k, grid_w=grid_w)
-            for d in range(drone_count)
-        ]
-        board_tiles.append(tiles)
-
-    # Assign a board (or None) to every frame.
+    # Which board (or None) is active for every frame.
     frame_board: list[int | None] = []
     for i in range(total_frames):
         t = i / fps
         active: int | None = None
-        for bindex, (start, end, _g) in enumerate(spans):
+        for bindex, (start, end, _d) in enumerate(spans):
             if start <= t < end:
                 active = bindex
                 break
@@ -198,16 +161,16 @@ def compile_show(model: Mapping[str, Any]) -> CompiledShow:
     bins: list[PerDroneBin] = []
     for drone_index in range(drone_count):
         frames = [
-            board_tiles[b][drone_index] if b is not None else black_tile
+            spans[b][2][drone_index] if b is not None else black
             for b in frame_board
         ]
-        data = build_bin(frames, width=k, height=k, fps=fps)
+        data = build_bin(frames, width=leds, height=leds, fps=fps)
         bins.append(PerDroneBin(drone_index=drone_index, data=data))
 
     return CompiledShow(
         total_frames=total_frames,
         fps=fps,
-        tile_width=k,
-        tile_height=k,
+        tile_width=leds,
+        tile_height=leds,
         bins=bins,
     )
