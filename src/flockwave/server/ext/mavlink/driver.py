@@ -914,6 +914,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             MAVCommand.COMPONENT_ARM_DISARM,
             1 if start else 0,
             FORCE_MAGIC if force else 0,
+            retries=1,
             channel=channel,
         )
 
@@ -924,7 +925,9 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         if start:
             await uav.arm(force=force, channel=channel)
         else:
-            await uav.disarm(force=force, channel=channel)
+            await uav.disarm(
+                force=force, channel=channel, clear_show_start=True
+            )
 
     async def _send_reset_signal_broadcast(self, component, *, transport=None) -> None:
         channel = transport_options_to_channel(transport)
@@ -1221,6 +1224,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     """Scheduled takeoff time of the drone, as a GPS time-of-week timestamp,
     in seconds"""
 
+    _last_show_execution_stage: DroneShowExecutionStage | None = None
+    """The last reported drone show execution stage, used to detect transitions."""
+
     _velocity: VelocityNED
     """Current velocity of the drone in NED coordinate system, m/sec"""
 
@@ -1392,6 +1398,48 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """Clears the scheduled takeoff time of the UAV."""
         await self.set_scheduled_takeoff_time(None)
 
+    async def clear_show_start_configuration(self) -> None:
+        """Clears show start authorization and the scheduled takeoff time."""
+        if not self.supports_scheduled_takeoff:
+            return
+
+        if (
+            self._scheduled_takeoff_authorization_scope is AuthorizationScope.NONE
+            and self._scheduled_takeoff_time is None
+        ):
+            return
+
+        await self.set_authorization_scope(AuthorizationScope.NONE)
+        await self.clear_scheduled_takeoff_time()
+
+    def _on_show_execution_stage_changed(
+        self, stage: DroneShowExecutionStage
+    ) -> None:
+        """Handles transitions in the drone show execution stage."""
+        previous = self._last_show_execution_stage
+        self._last_show_execution_stage = stage
+
+        if (
+            stage is not DroneShowExecutionStage.LANDED
+            or previous is DroneShowExecutionStage.LANDED
+            or not self.supports_scheduled_takeoff
+        ):
+            return
+
+        self.driver.run_in_background(
+            self._clear_show_start_configuration_after_landing
+        )
+
+    async def _clear_show_start_configuration_after_landing(self) -> None:
+        """Clears show start settings after the drone has landed from a show."""
+        try:
+            await self.clear_show_start_configuration()
+        except Exception:
+            self.driver.log.warning(
+                "Show landed but failed to clear show start configuration",
+                extra={"id": log_id_for_uav(self)},
+            )
+
     async def configure_geofence(
         self, configuration: GeofenceConfigurationRequest
     ) -> None:
@@ -1407,13 +1455,27 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         *,
         force: bool = False,
         channel: str = Channel.PRIMARY,
+        clear_show_start: bool = False,
     ) -> None:
         """Disarms the motors of the UAV.
 
         Args:
             force: whether to force the arming even if the UAV thinks it is not safe
+            clear_show_start: whether to clear show start authorization and the
+                scheduled takeoff time after a successful disarm
         """
-        return await self._set_armed_state(False, force=force, channel=channel)
+        await self._set_armed_state(False, force=force, channel=channel)
+
+        if not clear_show_start:
+            return
+
+        try:
+            await self.clear_show_start_configuration()
+        except Exception:
+            self.driver.log.warning(
+                "Disarmed the UAV but failed to clear show start configuration",
+                extra={"id": log_id_for_uav(self)},
+            )
 
     def get_age_of_message(self, type: int, now: float | None = None) -> float:
         """Returns the number of seconds elapsed since we have last seen a
@@ -1831,6 +1893,8 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 )
 
         self._scheduled_takeoff_authorization_scope = data.authorization_scope
+
+        self._on_show_execution_stage_changed(data.stage)
 
         debug = data.message.encode("utf-8")
 
@@ -2348,6 +2412,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         automatic takeoff.
         """
         await self.set_parameter("SHOW_START_AUTH", authorization_scope_to_int(scope))
+        self._scheduled_takeoff_authorization_scope = scope
 
     async def set_scheduled_takeoff_time(self, seconds: int | None) -> None:
         """Sets the scheduled takeoff time of the UAV to the given timestamp in
@@ -2366,6 +2431,13 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             _, gps_time_of_week = datetime_to_gps_time_of_week(dt)
 
         await self.set_parameter("SHOW_START_TIME", gps_time_of_week)
+
+        if seconds is None or seconds < 0:
+            self._scheduled_takeoff_time = None
+            self._scheduled_takeoff_time_gps_time_of_week = None
+        else:
+            self._scheduled_takeoff_time = int(seconds)
+            self._scheduled_takeoff_time_gps_time_of_week = gps_time_of_week
 
     async def set_led_color(
         self,
@@ -3044,33 +3116,19 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     async def _set_armed_state(
         self, armed: bool, *, force: bool = False, channel: str = Channel.PRIMARY
     ) -> None:
-        # Arm: try a normal COMMAND_ACK path first, then MAVLink force (param2)
-        # if pre-arm fails (e.g. no RC). Disarm: single attempt using `force` only.
-        if armed and not force:
-            force_attempts: tuple[bool, ...] = (False, True)
-        else:
-            force_attempts = (force,)
-
-        for index, use_force in enumerate(force_attempts):
-            if await self.driver.send_command_long(
-                self,
-                MAVCommand.COMPONENT_ARM_DISARM,
-                1 if armed else 0,
-                FORCE_MAGIC if use_force else 0,
-                channel=channel,
-            ):
-                if armed and index > 0:
-                    self.driver.log.warning(
-                        "Arm succeeded after autopilot rejected normal arm; used "
-                        "MAVLink force flag (e.g. missing RC). Prefer vehicle params "
-                        "for GCS-only setups.",
-                        extra={"id": log_id_for_uav(self)},
-                    )
-                return
-
-        raise RuntimeError(
-            "Failed to arm the motors" if armed else "Failed to disarm the motors"
-        )
+        # Send a single arm/disarm attempt without transport-level retries or an
+        # automatic force-arm fallback. Use force=True explicitly when needed.
+        if not await self.driver.send_command_long(
+            self,
+            MAVCommand.COMPONENT_ARM_DISARM,
+            1 if armed else 0,
+            FORCE_MAGIC if force else 0,
+            channel=channel,
+            retries=0,
+        ):
+            raise RuntimeError(
+                "Failed to arm the motors" if armed else "Failed to disarm the motors"
+            )
 
     def _set_connection_state(
         self, value: ConnectionState, heartbeat: MAVLinkMessage | None
@@ -3098,6 +3156,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             # was somehow reset and it does not "understand" MAVLink v2 in its new
             # configuration
             self._reset_mavlink_version()
+            self._last_show_execution_stage = None
 
         elif value is ConnectionState.CONNECTED:
             # We assume that the autopilot type stays the same even if we lost
