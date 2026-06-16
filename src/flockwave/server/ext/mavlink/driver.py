@@ -2870,12 +2870,17 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         # (custom_mode = 127) so the operator can flip into show mode from
         # the RC without losing it after a reboot. Failures are logged but
         # do not abort the upload.
-        for _param_name in ("FLTMODE5", "FLTMODE6"):
-            try:
-                await self.set_parameter(_param_name, 127)
-                self.driver.log.info(f"{_param_name} set to 127 (drone show)")
-            except Exception as ex:
-                self.driver.log.warning(f"Failed to set {_param_name}=127: {ex}")
+        from .flight_modes import configure_show_mode_flight_mode_slots
+
+        for param_name, result in (
+            await configure_show_mode_flight_mode_slots(self)
+        ).items():
+            if isinstance(result, str) and result.startswith("error:"):
+                self.driver.log.warning(
+                    f"Failed to set {param_name}=127: {result[7:]}"
+                )
+            else:
+                self.driver.log.info(f"{param_name} set to 127 (drone show)")
 
         # NOTE: previously we automatically switched the vehicle into
         # DRONE_SHOW mode (custom_mode=127) here because RELOAD_SHOW used
