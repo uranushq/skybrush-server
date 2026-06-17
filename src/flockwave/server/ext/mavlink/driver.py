@@ -2786,6 +2786,17 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 rth_plan = api.encode_rth_plan(show)
                 yaw_setpoints = api.encode_yaw(show)
 
+        if yaw_setpoints is None and "yawControl" in show:
+            from flockwave.server.show.yaw_control import encode_yaw_control_from_show
+
+            yaw_setpoints = encode_yaw_control_from_show(show)
+            if yaw_setpoints is not None:
+                self.driver.log.info(
+                    f"Encoded yaw control block ({len(yaw_setpoints)} bytes)"
+                )
+            else:
+                self.driver.log.warning("Failed to encode yawControl from show dict")
+
         async with SkybrushBinaryShowFile.create_in_memory() as show_file:
             await show_file.add_trajectory(trajectory)
             await show_file.add_encoded_light_program(light_program)
