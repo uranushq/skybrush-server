@@ -21,6 +21,8 @@ from flockwave.server.utils import optional_int, overridden
 
 from .autopilots import PX4, ArduPilot, ArduPilotWithSkybrush, Autopilot
 from .channel import use_mavlink_message_channel_factory
+from . import api as mavlink_api
+from .api import blueprint as mavlink_api_blueprint
 from .driver import MAVLinkDriver, MAVLinkUAV
 from .errors import InvalidSigningKeyError
 from .led_lights import LEDLightConfigurationSignalDispatcher
@@ -203,9 +205,21 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         # to other extensions that are interested in them
         rtk_correction_packet_signal_manager = RTKCorrectionPacketSignalManager()
 
+        api_route = configuration.get("api_route", "/api/v1/mavlink")
+
         # Create a cleanup context and run the extension
         with ExitStack() as stack:
             stack.enter_context(overridden(self, _uavs=uavs, _networks=networks))
+
+            if api_route:
+                http_server = app.import_api("http_server")
+                stack.enter_context(
+                    overridden(mavlink_api, app=app, log=self.log)
+                )
+                stack.enter_context(
+                    http_server.mounted(mavlink_api_blueprint, path=api_route)
+                )
+                self.log.info(f"MAVLink REST API mounted at {api_route}")
 
             # Connect the signals to our signal handlers
             stack.enter_context(

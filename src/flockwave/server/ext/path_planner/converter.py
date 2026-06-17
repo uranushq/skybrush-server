@@ -462,8 +462,9 @@ async def save_skyb_files(
 
     Returns a dict mapping drone id strings to their ``.skyb`` file paths.
     """
-    from flockwave.server.show.trajectory import TrajectorySpecification
     from flockwave.server.show.formats import SkybrushBinaryShowFile
+    from flockwave.server.show.trajectory import TrajectorySpecification
+    from flockwave.server.show.yaw_control import encode_yaw_control_from_show
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -490,6 +491,10 @@ async def save_skyb_files(
 
             # Minimal light program (single END opcode)
             await f.add_encoded_light_program(b"\x00")
+
+            yaw_payload = encode_yaw_control_from_show(show_dict)
+            if yaw_payload is not None:
+                await f.add_encoded_yaw_setpoints(yaw_payload)
 
             await f.add_comment(f"path_planner:{drone_id}")
             await f.finalize()

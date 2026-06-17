@@ -209,6 +209,17 @@ NETWORK_PROPERTIES = {
 
 schema = {
     "properties": {
+        "api_route": {
+            "type": "string",
+            "title": "REST API URL root",
+            "description": (
+                "URL prefix where MAVLink helper endpoints (e.g. flight-mode "
+                "parameter updates) are mounted. Set to an empty string to "
+                "disable the REST API."
+            ),
+            "default": "/api/v1/mavlink",
+            "propertyOrder": 500,
+        },
         "networks": {
             "title": "MAVLink networks",
             "type": "object",
