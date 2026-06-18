@@ -601,13 +601,23 @@ class ArduPilot(Autopilot):
         # https://gitter.im/ArduPilot/pymavlink?at=5bfb975587c4b86bcc1af3ee
         return float(value)
 
+    def _iter_flight_mode_maps(self) -> Iterable[FlightModeMap]:
+        """Yields all custom-mode maps known to this autopilot implementation."""
+        seen: set[int] = set()
+        for mapping in (self._custom_modes, *self._custom_modes_by_mav_type.values()):
+            if id(mapping) in seen:
+                continue
+            seen.add(id(mapping))
+            yield mapping
+
     def get_flight_mode_numbers(self, mode: str) -> MAVLinkFlightModeNumbers:
         mode = mode.lower().replace(" ", "")
-        for number, names in self._custom_modes.items():
-            for name in names:
-                name = name.lower().replace(" ", "")
-                if name == mode:
-                    return (MAVModeFlag.CUSTOM_MODE_ENABLED, number, 0)
+        for mode_map in self._iter_flight_mode_maps():
+            for number, names in mode_map.items():
+                for name in names:
+                    name = name.lower().replace(" ", "")
+                    if name == mode:
+                        return (MAVModeFlag.CUSTOM_MODE_ENABLED, number, 0)
 
         raise UnknownFlightModeError(mode)
 
@@ -813,7 +823,7 @@ class ArduPilotWithSkybrush(ArduPilot):
 
     name = "ArduPilot + Skybrush"
     _custom_modes_by_mav_type = extend_custom_modes(
-        ArduPilot, MAVType.QUADROTOR, {127: ("show",)}
+        ArduPilot, MAVType.QUADROTOR, {127: ("show", "drone show")}
     )
 
     CAPABILITY_MASK = (

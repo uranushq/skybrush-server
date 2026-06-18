@@ -1,10 +1,12 @@
 from pathlib import Path
 
 from flockwave.server.ext.mavlink.autopilots.ardupilot import (
+    ArduPilot,
+    ArduPilotWithSkybrush,
     decode_parameters_from_packed_format,
     encode_parameters_to_packed_format,
 )
-from flockwave.server.ext.mavlink.enums import MAVParamType
+from flockwave.server.ext.mavlink.enums import MAVModeFlag, MAVParamType, MAVType
 
 
 def test_decode_parameters_from_packed_format(datadir: Path) -> None:
@@ -53,3 +55,35 @@ def test_encode_parameters_to_packed_format() -> None:
         b"\x03\x3bTIME\xb1\xcbt\x00"
         # fmt: on
     )
+
+
+def test_ardupilot_get_flight_mode_numbers_includes_standard_modes() -> None:
+    autopilot = ArduPilot()
+    assert autopilot.get_flight_mode_numbers("stab") == (
+        MAVModeFlag.CUSTOM_MODE_ENABLED,
+        0,
+        0,
+    )
+    assert autopilot.get_flight_mode_numbers("guided") == (
+        MAVModeFlag.CUSTOM_MODE_ENABLED,
+        4,
+        0,
+    )
+
+
+def test_ardupilot_with_skybrush_get_flight_mode_numbers_includes_show_mode() -> None:
+    autopilot = ArduPilotWithSkybrush()
+    assert autopilot.get_flight_mode_numbers("show") == (
+        MAVModeFlag.CUSTOM_MODE_ENABLED,
+        127,
+        0,
+    )
+    assert autopilot.get_flight_mode_numbers("drone show") == (
+        MAVModeFlag.CUSTOM_MODE_ENABLED,
+        127,
+        0,
+    )
+
+
+def test_ardupilot_with_skybrush_describes_show_mode_for_quadcopter() -> None:
+    assert ArduPilotWithSkybrush.describe_custom_mode(1, 127, MAVType.QUADROTOR) == "show"
