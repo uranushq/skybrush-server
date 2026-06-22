@@ -81,8 +81,9 @@ async def arm_endpoint():
 
     if log:
         log.info(
-            f"JR ARM broadcast: cmd={summary['cmd']} target={summary['target']} "
-            f"sent={summary['sent']}"
+            f"JR ARM broadcast: cmd={summary['cmd']} "
+            f"targets={summary['targets']} sent={summary['sent']} "
+            f"startTimeUs={summary['startTimeUs']}"
         )
     return jsonify({"success": True, **summary})
 
