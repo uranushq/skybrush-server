@@ -399,4 +399,33 @@ def test_plan_formation_phases_resets_yaw_after_hold_before_return() -> None:
         if rec.positions[0] != list(initial[0])
     ]
     assert return_move_records
-    assert all(abs(rec.yaws[0] - 0.0) < 1e-6 for rec in return_move_records[:-1])
+    assert all(abs(rec.yaws[0] - 0.0) < 1e-6 for rec in return_move_records)
+    assert result.steps[-1].positions[0] == list(initial[0])
+    assert abs(result.steps[-1].yaws[0] - 0.0) < 1e-6
+
+
+def test_build_show_dicts_includes_rth_plan_for_return_to_initial() -> None:
+    initial = [[0.0, 0.0, 1.0], [2.0, 0.0, 1.0]]
+    phases = [
+        {
+            "name": "pose",
+            "holdMs": 0,
+            "points": [
+                {"droneId": "drone-1", "x": 0, "y": 5, "z": 0, "yaw": 90.0},
+                {"droneId": "drone-2", "x": 2, "y": 5, "z": 0, "yaw": 45.0},
+            ],
+        }
+    ]
+    result, _ = _plan_formation_phases(
+        initial=initial,
+        phases=phases,
+        step_size=1.0,
+        duration_ms=1000,
+        seed=42,
+        return_to_initial=True,
+        initial_yaws=[0.0, 0.0],
+    )
+    shows = build_show_dicts(result, duration_ms=1000, include_rth_plan=True)
+    assert "rthPlan" in shows[0]
+    assert shows[0]["rthPlan"]["entries"][-1]["action"] == "land"
+    assert shows[0]["rthPlan"]["entries"][0]["target"] == [0.0, 0.0]

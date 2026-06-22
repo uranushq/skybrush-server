@@ -356,6 +356,56 @@ def build_yaw_control_dict(
     }
 
 
+def build_rth_plan_dict(
+    result: SolverResult,
+    drone_idx: int,
+    duration_ms: int,
+    *,
+    takeoff_speed: float = 1.5,
+    rth_speed: float = 2.0,
+) -> dict[str, Any] | None:
+    """Build an ``rthPlan`` block that returns the drone to its home XY."""
+    if not result.steps:
+        return None
+
+    home = result.drones[drone_idx].initial
+    home_xy = (float(home[0]), float(home[1]))
+    did = result.drones[drone_idx].drone_id
+    duration_sec = duration_ms / 1000.0
+
+    first_pos = result.steps[0].positions[did]
+    takeoff_alt = abs(first_pos[2])
+    takeoff_duration = round(takeoff_alt / takeoff_speed, 4) if takeoff_alt > 0 else 0.0
+
+    entries: list[dict[str, Any]] = []
+    prev_time = -1
+
+    for rec in result.steps:
+        show_time = int(rec.step * duration_sec + takeoff_duration)
+        if show_time <= prev_time:
+            show_time = prev_time + 1
+
+        pos = rec.positions[did]
+        horiz_dist = math.hypot(pos[0] - home_xy[0], pos[1] - home_xy[1])
+        move_duration = (
+            max(1, int(math.ceil(horiz_dist / rth_speed)))
+            if horiz_dist > 1e-6
+            else 1
+        )
+        entries.append(
+            {
+                "time": show_time,
+                "action": "goTo",
+                "target": [round(home_xy[0], 4), round(home_xy[1], 4)],
+                "duration": move_duration,
+            }
+        )
+        prev_time = show_time
+
+    entries.append({"time": prev_time + entries[-1]["duration"] + 1, "action": "land"})
+    return {"version": 1, "entries": entries}
+
+
 def build_show_dicts(
     result: SolverResult,
     duration_ms: int = 300,
@@ -363,6 +413,7 @@ def build_show_dicts(
     coordinate_system: Optional[dict] = None,
     amsl_reference: Optional[float] = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
+    include_rth_plan: bool = True,
 ) -> List[dict]:
     """Build a list of full *show specification* dicts (one per drone).
 
@@ -438,6 +489,11 @@ def build_show_dicts(
         if yaw_control is not None:
             show_dict["yawControl"] = yaw_control
 
+        if include_rth_plan:
+            rth_plan = build_rth_plan_dict(result, idx, duration_ms)
+            if rth_plan is not None:
+                show_dict["rthPlan"] = rth_plan
+
         shows.append(show_dict)
 
     return shows
@@ -451,6 +507,7 @@ async def save_skyb_files(
     coordinate_system: Optional[dict] = None,
     amsl_reference: Optional[float] = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
+    include_rth_plan: bool = True,
 ) -> Dict[str, str]:
     """Generate ``.skyb`` files for every drone and save them to *output_dir*.
 
@@ -464,6 +521,7 @@ async def save_skyb_files(
     """
     from flockwave.server.show.formats import SkybrushBinaryShowFile
     from flockwave.server.show.trajectory import TrajectorySpecification
+    from flockwave.server.show.rth_plan import encode_rth_plan_from_show
     from flockwave.server.show.yaw_control import encode_yaw_control_from_show
 
     output_dir = Path(output_dir)
@@ -476,6 +534,7 @@ async def save_skyb_files(
         coordinate_system=coordinate_system,
         amsl_reference=amsl_reference,
         max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+        include_rth_plan=include_rth_plan,
     )
     traj_dicts = solver_result_to_trajectory_dicts(result, duration_ms, takeoff_time)
     skyb_paths: Dict[str, str] = {}
@@ -495,6 +554,10 @@ async def save_skyb_files(
             yaw_payload = encode_yaw_control_from_show(show_dict)
             if yaw_payload is not None:
                 await f.add_encoded_yaw_setpoints(yaw_payload)
+
+            rth_payload = encode_rth_plan_from_show(show_dict)
+            if rth_payload is not None:
+                await f.add_encoded_rth_plan(rth_payload)
 
             await f.add_comment(f"path_planner:{drone_id}")
             await f.finalize()

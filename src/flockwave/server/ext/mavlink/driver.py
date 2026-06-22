@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import aclosing, asynccontextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -1017,6 +1018,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         if authorization_scope is AuthorizationScope.NONE:
             raise RuntimeError("Show start is not authorized")
 
+        await uav.prepare_for_show_start()
         await uav.set_authorization_scope(authorization_scope)
         await uav.set_scheduled_takeoff_time(int(time()) + 1)
 
@@ -1227,6 +1229,12 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     _last_show_execution_stage: DroneShowExecutionStage | None = None
     """The last reported drone show execution stage, used to detect transitions."""
 
+    _landing_clear_generation: int = 0
+    """Incremented to cancel stale post-landing show-start clears."""
+
+    _uploaded_show: ShowSpecification | None = None
+    """Last show specification uploaded to the drone, for clean restarts."""
+
     _velocity: VelocityNED
     """Current velocity of the drone in NED coordinate system, m/sec"""
 
@@ -1426,12 +1434,67 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         ):
             return
 
+        self._landing_clear_generation += 1
+        generation = self._landing_clear_generation
         self.driver.run_in_background(
-            self._clear_show_start_configuration_after_landing
+            lambda: self._clear_show_start_configuration_after_landing(generation)
         )
 
-    async def _clear_show_start_configuration_after_landing(self) -> None:
+    async def prepare_for_show_start(self) -> None:
+        """Prepare the UAV for a new show start after a previous flight.
+
+        ``RELOAD_SHOW`` alone is not enough after RTL/land: the firmware may
+        keep the trajectory player at its final keyframe and only re-apply yaw
+        or altitude on the next authorization. When we still have the last
+        uploaded show cached, remove it and upload it again to force a full
+        trajectory rewind.
+        """
+        if not self.supports_scheduled_takeoff:
+            self.driver.log.info(
+                "Skipping show start preparation (scheduled takeoff not supported)",
+                extra={"id": log_id_for_uav(self)},
+            )
+            return
+
+        self._landing_clear_generation += 1
+
+        await self.clear_show_start_configuration()
+
+        from .flight_modes import SHOW_MODE_CUSTOM_MODE
+
+        try:
+            await self.set_mode(SHOW_MODE_CUSTOM_MODE)
+        except Exception:
+            self.driver.log.warning(
+                "Failed to switch to drone show mode before restarting show",
+                extra={"id": log_id_for_uav(self)},
+            )
+
+        if self._uploaded_show is not None:
+            cached_show = self._uploaded_show
+            self.driver.log.info(
+                "Re-uploading cached show before show start",
+                extra={"id": log_id_for_uav(self)},
+            )
+            await self.remove_show()
+            await sleep(0.5)
+            await self.upload_show(cached_show)
+            return
+
+        self.driver.log.info(
+            "No cached show; reloading show file before start",
+            extra={"id": log_id_for_uav(self)},
+        )
+        await self.reload_show()
+        await sleep(1.0)
+
+    async def _clear_show_start_configuration_after_landing(
+        self, generation: int
+    ) -> None:
         """Clears show start settings after the drone has landed from a show."""
+        if generation != self._landing_clear_generation:
+            return
+
         try:
             await self.clear_show_start_configuration()
         except Exception:
@@ -2342,6 +2405,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         )
         if not success:
             raise RuntimeError("Failed to remove show file")
+        self._uploaded_show = None
 
     async def set_mode(
         self, mode: int | str, *, channel: str = Channel.PRIMARY
@@ -2786,6 +2850,17 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 rth_plan = api.encode_rth_plan(show)
                 yaw_setpoints = api.encode_yaw(show)
 
+        if rth_plan is None and "rthPlan" in show:
+            from flockwave.server.show.rth_plan import encode_rth_plan_from_show
+
+            rth_plan = encode_rth_plan_from_show(show)
+            if rth_plan is not None:
+                self.driver.log.info(
+                    f"Encoded RTH plan block ({len(rth_plan)} bytes)"
+                )
+            else:
+                self.driver.log.warning("Failed to encode rthPlan from show dict")
+
         if yaw_setpoints is None and "yawControl" in show:
             from flockwave.server.show.yaw_control import encode_yaw_control_from_show
 
@@ -2903,6 +2978,11 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         # else
         await self.reload_show()
         self.driver.log.info("Show reloaded successfully")
+        self._uploaded_show = deepcopy(dict(show))
+        self.driver.log.info(
+            "Cached uploaded show for next start",
+            extra={"id": log_id_for_uav(self)},
+        )
 
     async def wait_until_connected(self) -> None:
         """Waits until the UAV becomes connected (i.e. when we see the next

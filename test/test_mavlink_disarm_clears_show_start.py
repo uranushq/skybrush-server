@@ -76,13 +76,82 @@ async def test_motor_stop_signal_clears_show_start_configuration():
 
 def test_landed_transition_schedules_show_start_clear(uav: MAVLinkUAV):
     uav.driver.run_in_background = Mock()
+    uav._landing_clear_generation = 0
 
     uav._on_show_execution_stage_changed(DroneShowExecutionStage.PERFORMING)
     uav._on_show_execution_stage_changed(DroneShowExecutionStage.LANDED)
 
-    uav.driver.run_in_background.assert_called_once_with(
-        uav._clear_show_start_configuration_after_landing
-    )
+    uav.driver.run_in_background.assert_called_once()
+    scheduled = uav.driver.run_in_background.call_args.args[0]
+    assert scheduled.__name__ == "<lambda>"
+
+
+async def test_clear_show_start_configuration_after_landing(uav: MAVLinkUAV):
+    uav.clear_show_start_configuration = AsyncMock()
+    uav._landing_clear_generation = 1
+
+    await uav._clear_show_start_configuration_after_landing(1)
+
+    uav.clear_show_start_configuration.assert_awaited_once()
+
+
+async def test_stale_landing_clear_is_ignored_after_show_start_prepare(
+    uav: MAVLinkUAV,
+):
+    uav.clear_show_start_configuration = AsyncMock()
+    uav.set_mode = AsyncMock()
+    uav.reload_show = AsyncMock()
+    uav.driver.run_in_background = Mock()
+    uav._last_show_execution_stage = DroneShowExecutionStage.LANDED
+    uav._landing_clear_generation = 0
+
+    uav._on_show_execution_stage_changed(DroneShowExecutionStage.PERFORMING)
+    uav._on_show_execution_stage_changed(DroneShowExecutionStage.LANDED)
+
+    await uav.prepare_for_show_start()
+    await uav._clear_show_start_configuration_after_landing(1)
+
+    assert uav.clear_show_start_configuration.await_count == 1
+
+
+async def test_prepare_for_show_start_reloads_show_after_rtl(uav: MAVLinkUAV):
+    uav.clear_show_start_configuration = AsyncMock()
+    uav.set_mode = AsyncMock()
+    uav.reload_show = AsyncMock()
+    uav._last_show_execution_stage = DroneShowExecutionStage.RTL
+
+    await uav.prepare_for_show_start()
+
+    uav.clear_show_start_configuration.assert_awaited_once()
+    uav.set_mode.assert_awaited_once_with(127)
+    uav.reload_show.assert_awaited_once()
+
+
+async def test_prepare_for_show_start_reuploads_cached_show(uav: MAVLinkUAV):
+    uav.clear_show_start_configuration = AsyncMock()
+    uav.set_mode = AsyncMock()
+    uav.remove_show = AsyncMock()
+    uav.upload_show = AsyncMock()
+    uav.reload_show = AsyncMock()
+    cached = {"trajectory": {"version": 1, "points": []}}
+    uav._uploaded_show = cached
+
+    await uav.prepare_for_show_start()
+
+    uav.remove_show.assert_awaited_once()
+    uav.upload_show.assert_awaited_once_with(cached)
+    uav.reload_show.assert_not_awaited()
+
+
+async def test_prepare_for_show_start_reloads_show_when_landed(uav: MAVLinkUAV):
+    uav.clear_show_start_configuration = AsyncMock()
+    uav.set_mode = AsyncMock()
+    uav.reload_show = AsyncMock()
+    uav._last_show_execution_stage = DroneShowExecutionStage.LANDED
+
+    await uav.prepare_for_show_start()
+
+    uav.reload_show.assert_awaited_once()
 
 
 def test_landed_while_already_landed_does_not_clear_again(uav: MAVLinkUAV):
@@ -102,14 +171,6 @@ def test_landed_does_not_clear_without_scheduled_takeoff_support(uav: MAVLinkUAV
     uav._on_show_execution_stage_changed(DroneShowExecutionStage.LANDED)
 
     uav.driver.run_in_background.assert_not_called()
-
-
-async def test_clear_show_start_configuration_after_landing(uav: MAVLinkUAV):
-    uav.clear_show_start_configuration = AsyncMock()
-
-    await uav._clear_show_start_configuration_after_landing()
-
-    uav.clear_show_start_configuration.assert_awaited_once()
 
 
 async def test_arm_sends_single_command_without_retries(uav: MAVLinkUAV):

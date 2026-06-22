@@ -113,6 +113,9 @@ class MockMAVLinkUAV:
     async def set_scheduled_takeoff_time(self, seconds):
         self.scheduled_takeoff_time = seconds
 
+    async def prepare_for_show_start(self):
+        return None
+
     async def arm(self):
         self.armed = True
 

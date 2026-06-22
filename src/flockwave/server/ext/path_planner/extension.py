@@ -495,7 +495,6 @@ def _plan_formation_phases(
     current_positions = [tuple(float(v) for v in point) for point in initial]
     original_initials = list(current_positions)
     current_yaws = list(initial_yaws or [0.0] * num_drones)
-    original_yaws = list(current_yaws)
     combined_steps: list[StepRecord] = [
         StepRecord(
             step=0,
@@ -601,7 +600,7 @@ def _plan_formation_phases(
     final_targets = _phase_targets(phases[-1], num_drones)
     if return_to_initial:
         final_targets = original_initials
-        final_yaws = original_yaws
+        final_yaws = [0.0] * num_drones
         return_success = True
         if _positions_match(current_positions, final_targets):
             current_positions = list(final_targets)
@@ -648,11 +647,12 @@ def _plan_formation_phases(
             current_positions = [
                 tuple(result.steps[-1].positions[idx]) for idx in range(num_drones)
             ]
-            _append_in_place_yaw_change_step(
-                steps=combined_steps,
-                positions=current_positions,
-                yaws=final_yaws,
-            )
+            if not _yaw_lists_match(current_yaws, final_yaws):
+                _append_in_place_yaw_change_step(
+                    steps=combined_steps,
+                    positions=current_positions,
+                    yaws=final_yaws,
+                )
             current_yaws = list(final_yaws)
             return_success = result.success
             success = success and return_success
@@ -870,6 +870,7 @@ async def plan():
             )
 
     # --- run solver ---
+    return_to_initial = bool(body.get("return_to_initial", True)) if uses_phases else True
     initial_yaws: list[float] | None = None
     if uses_phases:
         try:
@@ -886,7 +887,7 @@ async def plan():
             step_size=step_size,
             duration_ms=duration_ms,
             seed=seed,
-            return_to_initial=bool(body.get("return_to_initial", True)),
+            return_to_initial=return_to_initial,
             min_z=initial_altitude,
             initial_yaws=initial_yaws,
         )
@@ -924,6 +925,7 @@ async def plan():
             coordinate_system=coordinate_system,
             amsl_reference=amsl_reference,
             max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+            include_rth_plan=return_to_initial,
         )
         output["skybrush_files"] = saved
         if log:
@@ -947,6 +949,7 @@ async def plan():
             coordinate_system=coordinate_system,
             amsl_reference=amsl_reference,
             max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+            include_rth_plan=return_to_initial,
         )
         output["upload"] = upload_results
 
@@ -1086,6 +1089,7 @@ async def _upload_to_connected_uavs(
     coordinate_system: Optional[dict] = None,
     amsl_reference: Optional[float] = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
+    include_rth_plan: bool = True,
 ) -> dict:
     """Upload per-drone show specs to connected UAVs.
 
@@ -1127,6 +1131,7 @@ async def _upload_to_connected_uavs(
         coordinate_system=coordinate_system,
         amsl_reference=amsl_reference,
         max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+        include_rth_plan=include_rth_plan,
     )
     num_drones = len(show_dicts)
 
