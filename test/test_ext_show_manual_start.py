@@ -1,5 +1,5 @@
 from logging import getLogger
-from time import time
+from unittest.mock import AsyncMock, Mock
 
 from flockwave.spec.errors import FlockwaveErrorCode
 
@@ -47,7 +47,7 @@ class MockShowStartDriver:
 
     def send_show_start_signal(self, uavs, *, authorization_scope=None, transport=None):
         self.calls.append((list(uavs), authorization_scope))
-        return {uav: None for uav in uavs}
+        return dict.fromkeys(uavs)
 
 
 class MockUAV(UAVBase):
@@ -84,37 +84,17 @@ async def test_show_start_uses_manual_hook_and_skips_disarmed_uavs():
     assert response.body["error"] == {"disarmed": "UAV is not armed"}
 
 
-async def test_mavlink_manual_show_start_sets_authorization_and_immediate_time():
+async def test_mavlink_manual_show_start_delegates_to_sequence(monkeypatch):
     driver = MAVLinkDriver()
-    uav = MockMAVLinkUAV()
+    uav = Mock()
+    perform = AsyncMock()
+    monkeypatch.setattr(
+        "flockwave.server.ext.mavlink.show_start.perform_manual_show_start",
+        perform,
+    )
 
-    before = int(time())
     await driver._send_show_start_signal_single(
         uav, authorization_scope=AuthorizationScope.REHEARSAL
     )
-    after = int(time()) + 1
 
-    assert uav.authorization_scope is AuthorizationScope.REHEARSAL
-    assert before <= uav.scheduled_takeoff_time <= after
-    assert not uav.armed
-    assert not uav.took_off
-
-
-class MockMAVLinkUAV:
-    def __init__(self):
-        self.armed = False
-        self.authorization_scope = None
-        self.scheduled_takeoff_time = None
-        self.took_off = False
-
-    async def set_authorization_scope(self, scope):
-        self.authorization_scope = scope
-
-    async def set_scheduled_takeoff_time(self, seconds):
-        self.scheduled_takeoff_time = seconds
-
-    async def arm(self):
-        self.armed = True
-
-    async def takeoff_to_relative_altitude(self, altitude, *, channel):
-        self.took_off = True
+    perform.assert_awaited_once_with(uav, AuthorizationScope.REHEARSAL, transport=None)

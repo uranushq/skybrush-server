@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from functools import partial
 from logging import Logger
 from math import inf, isfinite
-from time import monotonic, time
+from time import monotonic
 from typing import Any, Sequence
 
 from colour import Color
@@ -96,6 +96,7 @@ from .packets import (
     authorization_scope_to_int,
     create_led_control_packet,
     create_rc_override_packet,
+    create_start_time_configuration_packet,
 )
 from .rssi import RSSIMode, rtcm_counter_to_rssi
 from .types import MAVLinkMessage, PacketBroadcasterFn, PacketSenderFn, spec
@@ -495,9 +496,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             raise TooSlowError(f"No response received for command {command_id} in time")
 
         if result != MAVResult.ACCEPTED:
-            self.log.warning(
-                f"COMMAND_ACK for cmd_int {command_id}: result={result}"
-            )
+            self.log.warning(f"COMMAND_ACK for cmd_int {command_id}: result={result}")
 
         if result == MAVResult.UNSUPPORTED:
             raise NotSupportedError
@@ -615,9 +614,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             raise TooSlowError(f"No response received for command {command_id} in time")
 
         if result != MAVResult.ACCEPTED:
-            self.log.warning(
-                f"COMMAND_ACK for cmd_long {command_id}: result={result}"
-            )
+            self.log.warning(f"COMMAND_ACK for cmd_long {command_id}: result={result}")
 
         if result == MAVResult.UNSUPPORTED:
             raise NotSupportedError
@@ -925,9 +922,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         if start:
             await uav.arm(force=force, channel=channel)
         else:
-            await uav.disarm(
-                force=force, channel=channel, clear_show_start=True
-            )
+            await uav.disarm(force=force, channel=channel, clear_show_start=True)
 
     async def _send_reset_signal_broadcast(self, component, *, transport=None) -> None:
         channel = transport_options_to_channel(transport)
@@ -1012,13 +1007,12 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         authorization_scope: AuthorizationScope | None = None,
         transport=None,
     ) -> None:
+        from .show_start import perform_manual_show_start
+
         if authorization_scope is None:
             authorization_scope = AuthorizationScope.LIVE
-        if authorization_scope is AuthorizationScope.NONE:
-            raise RuntimeError("Show start is not authorized")
 
-        await uav.set_authorization_scope(authorization_scope)
-        await uav.set_scheduled_takeoff_time(int(time()) + 1)
+        await perform_manual_show_start(uav, authorization_scope, transport=transport)
 
     async def _send_takeoff_signal_single(
         self, uav: "MAVLinkUAV", *, scheduled: bool = False, transport=None
@@ -1394,6 +1388,54 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """Returns whether the UAV can handle uploads with the given target."""
         return self._autopilot.can_handle_firmware_update_target(target_id)
 
+    @property
+    def show_execution_stage(self) -> DroneShowExecutionStage:
+        """Returns the last reported drone show execution stage."""
+        if self._last_skybrush_status_info is None:
+            return DroneShowExecutionStage.UNKNOWN
+        return self._last_skybrush_status_info.stage
+
+    async def send_start_config(
+        self,
+        *,
+        authorization_scope: AuthorizationScope,
+        start_time: int | None = None,
+        should_update_takeoff_time: bool = True,
+        channel: str = Channel.SHOW_CONTROL,
+    ) -> None:
+        """Sends a START_CONFIG packet to configure show start time and auth."""
+        spec = create_start_time_configuration_packet(
+            authorization_scope=authorization_scope,
+            start_time=start_time,
+            should_update_takeoff_time=should_update_takeoff_time,
+        )
+        await self.driver.send_packet(spec, self, channel=channel)
+
+        self._scheduled_takeoff_authorization_scope = authorization_scope
+        if not should_update_takeoff_time:
+            return
+
+        if start_time is None or start_time < 0:
+            self._scheduled_takeoff_time = None
+            self._scheduled_takeoff_time_gps_time_of_week = None
+        else:
+            dt = datetime.fromtimestamp(int(start_time), tz=timezone.utc)
+            _, gps_time_of_week = datetime_to_gps_time_of_week(dt)
+            self._scheduled_takeoff_time = int(start_time)
+            self._scheduled_takeoff_time_gps_time_of_week = int(gps_time_of_week)
+
+    async def wait_for_show_execution_stage(
+        self,
+        expected: DroneShowExecutionStage,
+        *,
+        timeout: float = 15.0,
+        poll_interval: float = 0.2,
+    ) -> None:
+        """Waits until the drone reports the given show execution stage."""
+        with fail_after(timeout):
+            while self.show_execution_stage is not expected:
+                await sleep(poll_interval)
+
     async def clear_scheduled_takeoff_time(self) -> None:
         """Clears the scheduled takeoff time of the UAV."""
         await self.set_scheduled_takeoff_time(None)
@@ -1412,9 +1454,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         await self.set_authorization_scope(AuthorizationScope.NONE)
         await self.clear_scheduled_takeoff_time()
 
-    def _on_show_execution_stage_changed(
-        self, stage: DroneShowExecutionStage
-    ) -> None:
+    def _on_show_execution_stage_changed(self, stage: DroneShowExecutionStage) -> None:
         """Handles transitions in the drone show execution stage."""
         previous = self._last_show_execution_stage
         self._last_show_execution_stage = stage
@@ -2270,7 +2310,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """Asks the UAV to reload the current drone show file."""
         # param1 = 0 if we want to reload the show file
         success = await self.driver.send_command_long(
-            self, MAVCommand.USER_1, SkybrushUserCommand.RELOAD_SHOW,
+            self,
+            MAVCommand.USER_1,
+            SkybrushUserCommand.RELOAD_SHOW,
             timeout=10,
         )
         if not success:
@@ -2301,26 +2343,60 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         # FENCE_STATUS=162, POWER_STATUS=125
         log = self.driver.log
         diagnostics: list[tuple[int, str, tuple[str, ...]]] = [
-            (1,   "SYS_STATUS",         (
-                "onboard_control_sensors_present",
-                "onboard_control_sensors_enabled",
-                "onboard_control_sensors_health",
-                "voltage_battery", "current_battery", "battery_remaining",
-                "errors_count1", "errors_count2", "errors_count3", "errors_count4",
-            )),
-            (24,  "GPS_RAW_INT",        (
-                "fix_type", "satellites_visible", "eph", "epv", "lat", "lon", "alt",
-            )),
-            (125, "POWER_STATUS",       ("Vcc", "Vservo", "flags")),
-            (148, "AUTOPILOT_VERSION",  ("flight_sw_version", "capabilities")),
-            (162, "FENCE_STATUS",       (
-                "breach_status", "breach_count", "breach_type", "breach_time",
-            )),
-            (193, "EKF_STATUS_REPORT",  (
-                "flags", "velocity_variance", "pos_horiz_variance",
-                "pos_vert_variance", "compass_variance", "terrain_alt_variance",
-            )),
-            (242, "HOME_POSITION",      ("latitude", "longitude", "altitude")),
+            (
+                1,
+                "SYS_STATUS",
+                (
+                    "onboard_control_sensors_present",
+                    "onboard_control_sensors_enabled",
+                    "onboard_control_sensors_health",
+                    "voltage_battery",
+                    "current_battery",
+                    "battery_remaining",
+                    "errors_count1",
+                    "errors_count2",
+                    "errors_count3",
+                    "errors_count4",
+                ),
+            ),
+            (
+                24,
+                "GPS_RAW_INT",
+                (
+                    "fix_type",
+                    "satellites_visible",
+                    "eph",
+                    "epv",
+                    "lat",
+                    "lon",
+                    "alt",
+                ),
+            ),
+            (125, "POWER_STATUS", ("Vcc", "Vservo", "flags")),
+            (148, "AUTOPILOT_VERSION", ("flight_sw_version", "capabilities")),
+            (
+                162,
+                "FENCE_STATUS",
+                (
+                    "breach_status",
+                    "breach_count",
+                    "breach_type",
+                    "breach_time",
+                ),
+            ),
+            (
+                193,
+                "EKF_STATUS_REPORT",
+                (
+                    "flags",
+                    "velocity_variance",
+                    "pos_horiz_variance",
+                    "pos_vert_variance",
+                    "compass_variance",
+                    "terrain_alt_variance",
+                ),
+            ),
+            (242, "HOME_POSITION", ("latitude", "longitude", "altitude")),
         ]
         for msg_id, name, fields in diagnostics:
             msg = self.get_last_message(msg_id)
@@ -2887,9 +2963,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             await configure_show_mode_flight_mode_slots(self)
         ).items():
             if isinstance(result, str) and result.startswith("error:"):
-                self.driver.log.warning(
-                    f"Failed to set {param_name}=127: {result[7:]}"
-                )
+                self.driver.log.warning(f"Failed to set {param_name}=127: {result[7:]}")
             else:
                 self.driver.log.info(f"{param_name} set to 127 (drone show)")
 
@@ -3378,14 +3452,21 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             if self._last_skybrush_status_info
             else DroneShowExecutionStage.UNKNOWN
         )
+        flight_mode = self._status.mode
+        is_in_show_mode = flight_mode in ("show", "drone show")
 
-        # We do not use the LANDED error code yet because the current versions
-        # of the Skybrush firmware report "LANDED" for a long time after landing,
-        # which means that we would get an all-blue display in Live after a
-        # successful show.
+        # We use the LANDED error code when the drone is in show mode and has
+        # landed after a show, to let Live disable arming and prompt for another
+        # Show start. We intentionally avoid using it in other flight modes
+        # because older firmware versions report Landed for a long time after
+        # landing, which would confuse the UI after a successful show.
+        show_landed = is_in_show_mode and show_stage is DroneShowExecutionStage.LANDED
+        show_error = is_in_show_mode and show_stage is DroneShowExecutionStage.ERROR
 
         errors: dict[int, Any] = {
             FlockwaveErrorCode.SLEEPING.value: False,
+            FlockwaveErrorCode.LANDED.value: show_landed,
+            FlockwaveErrorCode.CONFIGURATION_ERROR.value: show_error,
             FlockwaveErrorCode.LANDING.value: show_stage
             is DroneShowExecutionStage.LANDING,
             FlockwaveErrorCode.TAKEOFF.value: show_stage

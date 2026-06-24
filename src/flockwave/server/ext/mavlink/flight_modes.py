@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from flockwave.server.ext.mavlink.driver import MAVLinkUAV
 
-# ArduPilot custom_mode value for Skybrush DRONE_SHOW.
+# ArduPilot custom_mode values used during manual show starts.
+LOITER_CUSTOM_MODE = 5
 SHOW_MODE_CUSTOM_MODE = 127
 
 # RC switch positions mapped to show mode during show upload.
