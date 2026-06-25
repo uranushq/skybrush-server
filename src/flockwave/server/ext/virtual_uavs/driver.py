@@ -585,6 +585,12 @@ class VirtualUAV(UAVBase):
             get_light_program_from_show_specification(show)
         )
 
+        home = show.get("home")
+        if home and len(home) == 3:
+            home_z = float(home[2])
+            if home_z > 0:
+                self.takeoff_altitude = home_z
+
         self.update_status(mode="mission" if self.has_trajectory else "stab")
 
     def handle_where_are_you(self, duration: float) -> None:
@@ -713,8 +719,13 @@ class VirtualUAV(UAVBase):
 
         # Do we have a target?
         if self._target_xyz is not None:
-            # We aim for the target in the XY plane only if we are airborne
-            if state is VirtualUAVState.AIRBORNE:
+            following_trajectory = self._is_past_trajectory_takeoff_hold()
+
+            # We aim for the target in the XY plane when airborne, or during a
+            # show takeoff once the pre-takeoff hold has elapsed.
+            if state is VirtualUAVState.AIRBORNE or (
+                state is VirtualUAVState.TAKEOFF and following_trajectory
+            ):
                 dx = self._target_xyz.x - self._position_xyz.x
                 dy = self._target_xyz.y - self._position_xyz.y
             else:
@@ -779,7 +790,12 @@ class VirtualUAV(UAVBase):
             # ourselves as landed.
             eps = 0.2
             if state is VirtualUAVState.TAKEOFF:
-                if self._position_xyz.z > max(eps, self.takeoff_altitude - eps):
+                if following_trajectory:
+                    # Show trajectories may cruise below the default takeoff
+                    # altitude; switch to airborne once we leave the ground.
+                    if self._position_xyz.z > eps:
+                        self.state = VirtualUAVState.AIRBORNE
+                elif self._position_xyz.z > max(eps, self.takeoff_altitude - eps):
                     self.state = VirtualUAVState.AIRBORNE
             elif state is VirtualUAVState.LANDING:
                 if dist_z < eps * 0.5:
@@ -959,6 +975,14 @@ class VirtualUAV(UAVBase):
         self._shutdown_reason = None
 
         self.autopilot_initializing = False
+
+    def _is_past_trajectory_takeoff_hold(self) -> bool:
+        """Returns whether the UAV is flying a show past its takeoff hold."""
+        if not self._trajectory_player or self._mission_started_at is None:
+            return False
+
+        t = self.elapsed_time_in_mission
+        return t is not None and not self._trajectory_player.is_before_takeoff(t)
 
     def _update_target_from_trajectory(self) -> None:
         """Updates the target of the UAV based on the time elapsed since takeoff
