@@ -341,6 +341,21 @@ class Autopilot(ABC):
         self.capabilities = capabilities
         return self
 
+    def get_return_to_home_navigation_parameters(
+        self, horizontal_speed: float, vertical_speed: float
+    ) -> list[tuple[str, float]]:
+        """Returns autopilot-specific waypoint navigation speed parameters.
+
+        Args:
+            horizontal_speed: desired horizontal speed during RTH in [m/s]
+            vertical_speed: desired vertical speed during RTH in [m/s]
+
+        Returns:
+            a list of (parameter name, value) pairs to set temporarily before
+            flying home
+        """
+        return []
+
     @property
     @abstractmethod
     def supports_local_frame(self) -> bool:

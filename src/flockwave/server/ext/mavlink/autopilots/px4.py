@@ -181,6 +181,15 @@ class PX4(Autopilot):
         prefix, sep, suffix = text.partition(":")
         return suffix.strip() if sep else text
 
+    def get_return_to_home_navigation_parameters(
+        self, horizontal_speed: float, vertical_speed: float
+    ) -> list[tuple[str, float]]:
+        return [
+            ("MPC_XY_CRUISE", horizontal_speed),
+            ("MPC_Z_VEL_MAX_UP", vertical_speed),
+            ("MPC_Z_VEL_MAX_DN", vertical_speed),
+        ]
+
     @property
     def supports_local_frame(self) -> bool:
         # https://github.com/PX4/PX4-Autopilot/issues/10246

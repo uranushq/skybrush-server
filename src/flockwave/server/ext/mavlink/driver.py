@@ -15,6 +15,7 @@ from typing import Any, Sequence
 
 from colour import Color
 from flockwave.concurrency import FutureCancelled, delayed
+from flockwave.gps.distances import haversine
 from flockwave.gps.time import datetime_to_gps_time_of_week, gps_time_of_week_to_utc
 from flockwave.gps.vectors import GPSCoordinate, VelocityNED
 from flockwave.spec.errors import FlockwaveErrorCode
@@ -118,6 +119,14 @@ to do so."""
 nan = float("nan")
 """"Not a number" constant, used in some MAVLink messages to indicate a default
 value."""
+
+# Return-to-home navigation limits when using fly-to-home instead of RTL.
+RTH_HORIZONTAL_SPEED = 0.5  # [m/s]
+RTH_VERTICAL_SPEED = 0.3  # [m/s]
+RTH_POSITION_TOLERANCE_XY = 2.0  # [m]
+RTH_POSITION_TOLERANCE_Z = 0.5  # [mAHL]
+RTH_NAVIGATION_TIMEOUT = 600.0  # [s]
+RTH_LANDING_TIMEOUT = 300.0  # [s]
 
 
 def transport_options_to_channel(options: TransportOptions | None) -> str:
@@ -995,12 +1004,16 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
     ) -> None:
         channel = transport_options_to_channel(transport)
 
-        success = await self.send_command_long(
-            uav, MAVCommand.NAV_RETURN_TO_LAUNCH, channel=channel
-        )
+        async def task() -> None:
+            try:
+                await uav.return_to_home(channel=channel)
+            except Exception:
+                self.log.exception(
+                    "Return to home failed",
+                    extra={"id": log_id_for_uav(uav)},
+                )
 
-        if not success:
-            raise RuntimeError("Return to home command failed")
+        self.run_in_background(task)
 
     async def _send_shutdown_signal_broadcast(self, *, transport=None) -> None:
         channel = transport_options_to_channel(transport)
@@ -1271,6 +1284,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self._position = GPSCoordinate()
         self._rssi_mode = RSSIMode.NONE
         self._velocity = VelocityNED()
+        self._returning_home = False
 
         self.notify_updated = None  # type: ignore
         self.send_log_message_to_gcs = nop
@@ -1598,6 +1612,134 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         else:
             # Implementation of fly_to() with a guided mode command
             await self._fly_to_in_guided_mode(target)
+
+    def get_home_coordinate(self) -> GPSCoordinate | None:
+        """Returns the home coordinate of the UAV from the last HOME_POSITION
+        message, or `None` if it is not known yet.
+        """
+        message = self.get_last_message(MAVMessageType.HOME_POSITION)
+        if message is None:
+            return None
+
+        return GPSCoordinate(
+            lat=message.latitude / 1e7,
+            lon=message.longitude / 1e7,
+            ahl=0,
+        )
+
+    async def return_to_home(self, *, channel: str = Channel.PRIMARY) -> None:
+        """Guides the UAV back to its home position at ground level, then lands.
+
+        This uses a slow fly-to-home command followed by an explicit land
+        command instead of the autopilot's built-in RTL mode.
+
+        Args:
+            channel: the communication channel to use
+
+        Raises:
+            RuntimeError: if the UAV is not airborne, if the home position is
+                not known, or if any step of the procedure fails
+        """
+        if self._returning_home:
+            return
+
+        position = self.status.position
+        if position.ahl is None or position.ahl < 0.5:
+            raise RuntimeError("UAV is not airborne, cannot start RTH")
+
+        home = self.get_home_coordinate()
+        if home is None:
+            self.driver.log.warning(
+                "HOME_POSITION is not known; falling back to RTL",
+                extra={"id": log_id_for_uav(self)},
+            )
+            success = await self.driver.send_command_long(
+                self, MAVCommand.NAV_RETURN_TO_LAUNCH, channel=channel
+            )
+            if not success:
+                raise RuntimeError("Return to home command failed")
+            return
+
+        self._returning_home = True
+        self.ensure_error(FlockwaveErrorCode.RETURN_TO_HOME)
+
+        try:
+            navigation_parameters = self._autopilot.get_return_to_home_navigation_parameters(
+                RTH_HORIZONTAL_SPEED, RTH_VERTICAL_SPEED
+            )
+
+            target = home.copy()
+            target.ahl = 0
+
+            if navigation_parameters:
+                async with self.temporarily_set_parameters(navigation_parameters):
+                    await self._fly_to_home_and_land(target, channel=channel)
+            else:
+                await self._fly_to_home_and_land(target, channel=channel)
+        finally:
+            self._returning_home = False
+            self.ensure_error(FlockwaveErrorCode.RETURN_TO_HOME, present=False)
+
+    async def _fly_to_home_and_land(
+        self, target: GPSCoordinate, *, channel: str
+    ) -> None:
+        """Flies to the home target in guided mode and lands when close enough."""
+        await self.set_mode("guided", channel=channel)
+        await self.fly_to(target)
+        await self._wait_until_near_position(
+            target,
+            tolerance_xy=RTH_POSITION_TOLERANCE_XY,
+            tolerance_z=RTH_POSITION_TOLERANCE_Z,
+            timeout=RTH_NAVIGATION_TIMEOUT,
+        )
+
+        if not await self.driver.send_command_long(
+            self, MAVCommand.NAV_LAND, channel=channel
+        ):
+            raise RuntimeError("Landing command failed")
+
+        await self._wait_until_on_ground(timeout=RTH_LANDING_TIMEOUT)
+
+    async def _wait_until_near_position(
+        self,
+        target: GPSCoordinate,
+        *,
+        tolerance_xy: float,
+        tolerance_z: float,
+        timeout: float,
+    ) -> None:
+        """Waits until the UAV is close enough to the given target."""
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            position = self.status.position
+            if position.lat is None or position.lon is None:
+                await sleep(0.5)
+                continue
+
+            distance_xy = haversine(position, target)
+            altitude = position.ahl if position.ahl is not None else inf
+            target_altitude = target.ahl if target.ahl is not None else 0.0
+
+            if (
+                distance_xy <= tolerance_xy
+                and abs(altitude - target_altitude) <= tolerance_z
+            ):
+                return
+
+            await sleep(0.5)
+
+        raise RuntimeError("Timed out while navigating to home position")
+
+    async def _wait_until_on_ground(self, *, timeout: float) -> None:
+        """Waits until the UAV appears to have landed."""
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            altitude = self.status.position.ahl
+            if altitude is not None and altitude < RTH_POSITION_TOLERANCE_Z:
+                return
+            await sleep(0.5)
+
+        raise RuntimeError("Timed out while waiting for landing to complete")
 
     async def _fly_to_in_guided_mode(self, target: GPSCoordinate) -> None:
         """Implementation of `fly_to()` using a MAVLink
@@ -3507,7 +3649,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             # Use the special RTH error code if the drone is in RTH or smart RTH mode
             # and its mode index is larger than the standby mode (typically:
             # active, critical, emergency, poweroff, termination)
-            FlockwaveErrorCode.RETURN_TO_HOME.value: is_returning_home
+            FlockwaveErrorCode.RETURN_TO_HOME.value: (
+                is_returning_home or self._returning_home
+            )
             and heartbeat.system_status > MAVState.STANDBY.value,
         }
 

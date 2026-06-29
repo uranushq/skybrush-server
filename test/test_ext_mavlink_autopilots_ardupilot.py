@@ -57,6 +57,15 @@ def test_encode_parameters_to_packed_format() -> None:
     )
 
 
+def test_ardupilot_return_to_home_navigation_parameters() -> None:
+    autopilot = ArduPilot()
+    assert autopilot.get_return_to_home_navigation_parameters(0.5, 0.3) == [
+        ("WPNAV_SPEED", 50.0),
+        ("WPNAV_SPEED_UP", 30.0),
+        ("WPNAV_SPEED_DN", 30.0),
+    ]
+
+
 def test_ardupilot_get_flight_mode_numbers_includes_standard_modes() -> None:
     autopilot = ArduPilot()
     assert autopilot.get_flight_mode_numbers("stab") == (

@@ -176,6 +176,7 @@ class MAVMessageType(IntEnum):
     AUTOPILOT_VERSION = 148
     MAG_CAL_PROGRESS = 191  # ArduPilot-specific
     MAG_CAL_REPORT = 192
+    HOME_POSITION = 242
 
 
 class MAVMissionResult(IntEnum):

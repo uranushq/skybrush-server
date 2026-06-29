@@ -581,6 +581,15 @@ class ArduPilot(Autopilot):
                 int(configuration.return_to_home_speed * 100),  # [m/s] -> [cm/s]
             )
 
+    def get_return_to_home_navigation_parameters(
+        self, horizontal_speed: float, vertical_speed: float
+    ) -> list[tuple[str, float]]:
+        return [
+            ("WPNAV_SPEED", horizontal_speed * 100),  # [m/s] -> [cm/s]
+            ("WPNAV_SPEED_UP", vertical_speed * 100),
+            ("WPNAV_SPEED_DN", vertical_speed * 100),
+        ]
+
     def decode_param_from_wire_representation(
         self, value: int | float, type: MAVParamType
     ) -> float:
