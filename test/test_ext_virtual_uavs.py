@@ -70,3 +70,25 @@ def test_virtual_uav_follows_low_altitude_show_without_xy_catchup_burst():
     assert uav._position_xyz.z < 2.8
     assert uav._position_xyz.x < -0.3
     assert max_speed < 2.5
+
+
+def test_virtual_uav_return_to_home_uses_reduced_speed():
+    driver = VirtualUAVDriver()
+    uav = driver.create_uav("test", GPSCoordinate(lat=0, lon=0))
+    uav.state = VirtualUAVState.AIRBORNE
+    uav._position_xyz.x = 10
+    uav._position_xyz.z = 5
+
+    driver._send_return_to_home_signal_single(uav)
+
+    max_speed_xy = 0.0
+    max_speed_z = 0.0
+    for _ in range(30):
+        uav.step(0.1)
+        max_speed_xy = max(
+            max_speed_xy, hypot(uav._velocity_xyz.x, uav._velocity_xyz.y)
+        )
+        max_speed_z = max(max_speed_z, abs(uav._velocity_xyz.z))
+
+    assert max_speed_xy <= uav.rth_velocity_xy + 0.01
+    assert max_speed_z <= uav.rth_velocity_z + 0.01

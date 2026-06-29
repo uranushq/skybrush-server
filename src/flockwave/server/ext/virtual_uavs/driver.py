@@ -153,6 +153,18 @@ class VirtualUAV(UAVBase):
     the surface of the Earth), in m/s.
     """
 
+    rth_velocity_xy: float
+    """The maximum horizontal velocity while returning to home, in m/s."""
+
+    rth_velocity_z: float
+    """The maximum vertical velocity while returning to home, in m/s."""
+
+    rth_acceleration_xy: float
+    """The maximum horizontal acceleration while returning to home, in m/s/s."""
+
+    rth_acceleration_z: float
+    """The maximum vertical acceleration while returning to home, in m/s/s."""
+
     takeoff_altitude: float
 
     use_battery_percentage: bool
@@ -196,12 +208,17 @@ class VirtualUAV(UAVBase):
 
         self._request_shutdown = None
         self._shutdown_reason = None
+        self._returning_home = False
 
         self.boots_armed = False
         self.max_acceleration_xy = 4
         self.max_acceleration_z = 1
         self.max_velocity_z = 2
         self.max_velocity_xy = 10
+        self.rth_velocity_xy = 0.5
+        self.rth_velocity_z = 0.3
+        self.rth_acceleration_xy = 0.15
+        self.rth_acceleration_z = 0.1
         self.radiation_ext = None
         self.state = VirtualUAVState.LANDED
         self.takeoff_altitude = 3
@@ -464,6 +481,7 @@ class VirtualUAV(UAVBase):
         self.ensure_error(FlockwaveErrorCode.RETURN_TO_HOME, present=False)
 
         if value is None:
+            self._returning_home = False
             self._target_xyz = None
         else:
             # Calculate the real altitude component of the target
@@ -610,6 +628,7 @@ class VirtualUAV(UAVBase):
             return
 
         self.stop_trajectory()
+        self._returning_home = False
 
         self._target_xyz = self._position_xyz.copy()
         self.state = VirtualUAVState.AIRBORNE
@@ -622,6 +641,7 @@ class VirtualUAV(UAVBase):
         if self._target_xyz is None:
             self._target_xyz = self._position_xyz.copy()
         self._target_xyz.z = 0
+        self._returning_home = False
         self.state = VirtualUAVState.LANDING
 
     def set_led_color(self, color: Color | None) -> None:
@@ -747,10 +767,21 @@ class VirtualUAV(UAVBase):
 
             dist_z = abs(dz)
 
+            if self._returning_home:
+                max_velocity_xy = self.rth_velocity_xy
+                max_velocity_z = self.rth_velocity_z
+                max_acceleration_xy = self.rth_acceleration_xy
+                max_acceleration_z = self.rth_acceleration_z
+            else:
+                max_velocity_xy = self.max_velocity_xy
+                max_velocity_z = self.max_velocity_z
+                max_acceleration_xy = self.max_acceleration_xy
+                max_acceleration_z = self.max_acceleration_z
+
             reachable_velocity_xy = min(
                 hypot(self._velocity_xyz.x, self._velocity_xyz.y)
-                + self.max_acceleration_xy * dt,
-                self.max_velocity_xy,
+                + max_acceleration_xy * dt,
+                max_velocity_xy,
             )
             displacement_xy = min(dist_xy, dt * reachable_velocity_xy)
 
@@ -760,8 +791,8 @@ class VirtualUAV(UAVBase):
             if dz < 0:
                 # Descending
                 reachable_velocity_z = max(
-                    self._velocity_xyz.z - self.max_acceleration_z * dt,
-                    -self.max_velocity_z,
+                    self._velocity_xyz.z - max_acceleration_z * dt,
+                    -max_velocity_z,
                 )
                 displacement_z = max(
                     dz, dt * reachable_velocity_z, -self._position_xyz.z
@@ -771,8 +802,8 @@ class VirtualUAV(UAVBase):
             else:
                 # Ascending
                 reachable_velocity_z = min(
-                    self._velocity_xyz.z + self.max_acceleration_z * dt,
-                    self.max_velocity_z,
+                    self._velocity_xyz.z + max_acceleration_z * dt,
+                    max_velocity_z,
                 )
                 displacement_z = min(dz, dt * reachable_velocity_z)
 
@@ -805,6 +836,9 @@ class VirtualUAV(UAVBase):
             elif state is VirtualUAVState.AIRBORNE:
                 # If we have reached the target, we can clear it
                 if dist_xy < eps and dist_z < eps:
+                    if self._position_xyz.z < eps:
+                        self.state = VirtualUAVState.LANDED
+                        self._mission_started_at = None
                     self.target = None
 
         # Calculate our coordinates in flat Earth
@@ -904,10 +938,9 @@ class VirtualUAV(UAVBase):
 
         Also makes the UAV "forget" its current trajectory.
         """
-        if self._trajectory_player:
-            self._trajectory = None
-            self._trajectory_player = None
-            self._trajectory_transformation = None
+        self._trajectory = None
+        self._trajectory_player = None
+        self._trajectory_transformation = None
 
     def takeoff(self) -> None:
         """Starts a simulated take-off with the virtual UAV."""
@@ -1316,10 +1349,12 @@ class VirtualUAVDriver(UAVDriver[VirtualUAV]):
         self, uav: VirtualUAV, *, transport=None
     ) -> None:
         if uav.state == VirtualUAVState.AIRBORNE:
-            target = uav.home.copy()
-            target.ahl = uav.status.position.ahl
-
             uav.stop_trajectory()
+            uav._mission_started_at = None
+            uav._returning_home = True
+
+            target = uav.home.copy()
+            target.ahl = 0
             uav.target = target
 
             uav.ensure_error(FlockwaveErrorCode.RETURN_TO_HOME)
