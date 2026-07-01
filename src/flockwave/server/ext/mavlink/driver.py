@@ -993,12 +993,6 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             # No per-component resets are implemented on this UAV yet
             raise RuntimeError(f"Resetting {component!r} is not supported")
 
-    async def _send_return_to_home_signal_broadcast(self, *, transport=None) -> None:
-        channel = transport_options_to_channel(transport)
-        await self.broadcast_command_long_with_retries(
-            MAVCommand.NAV_RETURN_TO_LAUNCH, channel=channel
-        )
-
     async def _send_return_to_home_signal_single(
         self, uav: "MAVLinkUAV", *, transport=None
     ) -> None:
@@ -1650,15 +1644,18 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         home = self.get_home_coordinate()
         if home is None:
             self.driver.log.warning(
-                "HOME_POSITION is not known; falling back to RTL",
+                "HOME_POSITION is not known; landing at current position",
                 extra={"id": log_id_for_uav(self)},
             )
-            success = await self.driver.send_command_long(
-                self, MAVCommand.NAV_RETURN_TO_LAUNCH, channel=channel
+            home = GPSCoordinate(
+                lat=position.lat,
+                lon=position.lon,
+                ahl=0,
             )
-            if not success:
-                raise RuntimeError("Return to home command failed")
-            return
+            if home.lat is None or home.lon is None:
+                raise RuntimeError(
+                    "Home position and current GPS position are both unknown"
+                )
 
         self._returning_home = True
         self.ensure_error(FlockwaveErrorCode.RETURN_TO_HOME)
@@ -1683,8 +1680,27 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     async def _fly_to_home_and_land(
         self, target: GPSCoordinate, *, channel: str
     ) -> None:
-        """Flies to the home target in guided mode and lands when close enough."""
+        """Flies to the home target in guided mode and lands when close enough.
+
+        Navigation is performed in two phases to avoid climbing to RTL_ALT
+        first: move horizontally at the current altitude, then descend over
+        home and land.
+        """
         await self.set_mode("guided", channel=channel)
+
+        current_ahl = self.status.position.ahl
+        if current_ahl is not None and current_ahl > RTH_POSITION_TOLERANCE_Z:
+            horizontal_target = target.copy()
+            horizontal_target.ahl = current_ahl
+            await self.fly_to(horizontal_target)
+            await self._wait_until_near_position(
+                horizontal_target,
+                tolerance_xy=RTH_POSITION_TOLERANCE_XY,
+                tolerance_z=RTH_POSITION_TOLERANCE_Z,
+                timeout=RTH_NAVIGATION_TIMEOUT,
+                check_altitude=False,
+            )
+
         await self.fly_to(target)
         await self._wait_until_near_position(
             target,
@@ -1707,6 +1723,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         tolerance_xy: float,
         tolerance_z: float,
         timeout: float,
+        check_altitude: bool = True,
     ) -> None:
         """Waits until the UAV is close enough to the given target."""
         deadline = monotonic() + timeout
@@ -1717,16 +1734,18 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 continue
 
             distance_xy = haversine(position, target)
-            altitude = position.ahl if position.ahl is not None else inf
-            target_altitude = target.ahl if target.ahl is not None else 0.0
+            if distance_xy > tolerance_xy:
+                await sleep(0.5)
+                continue
 
-            if (
-                distance_xy <= tolerance_xy
-                and abs(altitude - target_altitude) <= tolerance_z
-            ):
-                return
+            if check_altitude:
+                altitude = position.ahl if position.ahl is not None else inf
+                target_altitude = target.ahl if target.ahl is not None else 0.0
+                if abs(altitude - target_altitude) > tolerance_z:
+                    await sleep(0.5)
+                    continue
 
-            await sleep(0.5)
+            return
 
         raise RuntimeError("Timed out while navigating to home position")
 
