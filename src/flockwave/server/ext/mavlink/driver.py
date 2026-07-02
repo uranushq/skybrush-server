@@ -408,6 +408,39 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             self.log.error(str(ex), extra={"id": log_id_for_uav(uav)})
             raise
 
+    async def handle_command___geofence_upload(
+        self,
+        uav: "MAVLinkUAV",
+        *,
+        version: int = 1,
+        coordinateSystem: Any = None,
+        geofence: dict[str, Any],
+    ) -> None:
+        """Handles a geofence-only upload request for the given UAV.
+
+        Parameters:
+            version: version number of the geofence upload payload
+            coordinateSystem: coordinate system of the geofence specification;
+                either ``"geodetic"`` or a show coordinate system object
+            geofence: the geofence specification to upload
+        """
+        del version  # reserved for future use
+
+        try:
+            configuration = get_geofence_configuration_from_show_specification(
+                {
+                    "coordinateSystem": coordinateSystem,
+                    "geofence": geofence,
+                }
+            )
+            await uav.configure_geofence(configuration)
+        except TooSlowError as ex:
+            self.log.error(str(ex), extra={"id": log_id_for_uav(uav)})
+            raise
+        except Exception as ex:
+            self.log.error(str(ex), extra={"id": log_id_for_uav(uav)})
+            raise
+
     async def send_command_int(
         self,
         target: "MAVLinkUAV",
@@ -495,9 +528,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             raise TooSlowError(f"No response received for command {command_id} in time")
 
         if result != MAVResult.ACCEPTED:
-            self.log.warning(
-                f"COMMAND_ACK for cmd_int {command_id}: result={result}"
-            )
+            self.log.warning(f"COMMAND_ACK for cmd_int {command_id}: result={result}")
 
         if result == MAVResult.UNSUPPORTED:
             raise NotSupportedError
@@ -615,9 +646,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             raise TooSlowError(f"No response received for command {command_id} in time")
 
         if result != MAVResult.ACCEPTED:
-            self.log.warning(
-                f"COMMAND_ACK for cmd_long {command_id}: result={result}"
-            )
+            self.log.warning(f"COMMAND_ACK for cmd_long {command_id}: result={result}")
 
         if result == MAVResult.UNSUPPORTED:
             raise NotSupportedError
@@ -925,9 +954,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         if start:
             await uav.arm(force=force, channel=channel)
         else:
-            await uav.disarm(
-                force=force, channel=channel, clear_show_start=True
-            )
+            await uav.disarm(force=force, channel=channel, clear_show_start=True)
 
     async def _send_reset_signal_broadcast(self, component, *, transport=None) -> None:
         channel = transport_options_to_channel(transport)
@@ -1412,9 +1439,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         await self.set_authorization_scope(AuthorizationScope.NONE)
         await self.clear_scheduled_takeoff_time()
 
-    def _on_show_execution_stage_changed(
-        self, stage: DroneShowExecutionStage
-    ) -> None:
+    def _on_show_execution_stage_changed(self, stage: DroneShowExecutionStage) -> None:
         """Handles transitions in the drone show execution stage."""
         previous = self._last_show_execution_stage
         self._last_show_execution_stage = stage
@@ -2270,7 +2295,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """Asks the UAV to reload the current drone show file."""
         # param1 = 0 if we want to reload the show file
         success = await self.driver.send_command_long(
-            self, MAVCommand.USER_1, SkybrushUserCommand.RELOAD_SHOW,
+            self,
+            MAVCommand.USER_1,
+            SkybrushUserCommand.RELOAD_SHOW,
             timeout=10,
         )
         if not success:
@@ -2301,26 +2328,60 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         # FENCE_STATUS=162, POWER_STATUS=125
         log = self.driver.log
         diagnostics: list[tuple[int, str, tuple[str, ...]]] = [
-            (1,   "SYS_STATUS",         (
-                "onboard_control_sensors_present",
-                "onboard_control_sensors_enabled",
-                "onboard_control_sensors_health",
-                "voltage_battery", "current_battery", "battery_remaining",
-                "errors_count1", "errors_count2", "errors_count3", "errors_count4",
-            )),
-            (24,  "GPS_RAW_INT",        (
-                "fix_type", "satellites_visible", "eph", "epv", "lat", "lon", "alt",
-            )),
-            (125, "POWER_STATUS",       ("Vcc", "Vservo", "flags")),
-            (148, "AUTOPILOT_VERSION",  ("flight_sw_version", "capabilities")),
-            (162, "FENCE_STATUS",       (
-                "breach_status", "breach_count", "breach_type", "breach_time",
-            )),
-            (193, "EKF_STATUS_REPORT",  (
-                "flags", "velocity_variance", "pos_horiz_variance",
-                "pos_vert_variance", "compass_variance", "terrain_alt_variance",
-            )),
-            (242, "HOME_POSITION",      ("latitude", "longitude", "altitude")),
+            (
+                1,
+                "SYS_STATUS",
+                (
+                    "onboard_control_sensors_present",
+                    "onboard_control_sensors_enabled",
+                    "onboard_control_sensors_health",
+                    "voltage_battery",
+                    "current_battery",
+                    "battery_remaining",
+                    "errors_count1",
+                    "errors_count2",
+                    "errors_count3",
+                    "errors_count4",
+                ),
+            ),
+            (
+                24,
+                "GPS_RAW_INT",
+                (
+                    "fix_type",
+                    "satellites_visible",
+                    "eph",
+                    "epv",
+                    "lat",
+                    "lon",
+                    "alt",
+                ),
+            ),
+            (125, "POWER_STATUS", ("Vcc", "Vservo", "flags")),
+            (148, "AUTOPILOT_VERSION", ("flight_sw_version", "capabilities")),
+            (
+                162,
+                "FENCE_STATUS",
+                (
+                    "breach_status",
+                    "breach_count",
+                    "breach_type",
+                    "breach_time",
+                ),
+            ),
+            (
+                193,
+                "EKF_STATUS_REPORT",
+                (
+                    "flags",
+                    "velocity_variance",
+                    "pos_horiz_variance",
+                    "pos_vert_variance",
+                    "compass_variance",
+                    "terrain_alt_variance",
+                ),
+            ),
+            (242, "HOME_POSITION", ("latitude", "longitude", "altitude")),
         ]
         for msg_id, name, fields in diagnostics:
             msg = self.get_last_message(msg_id)
@@ -2887,9 +2948,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             await configure_show_mode_flight_mode_slots(self)
         ).items():
             if isinstance(result, str) and result.startswith("error:"):
-                self.driver.log.warning(
-                    f"Failed to set {param_name}=127: {result[7:]}"
-                )
+                self.driver.log.warning(f"Failed to set {param_name}=127: {result[7:]}")
             else:
                 self.driver.log.info(f"{param_name} set to 127 (drone show)")
 

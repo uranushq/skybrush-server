@@ -13,8 +13,6 @@ POST ``/redownload/<ip>``    proxy a board's ``POST /redownload``
       "startIn": 5.0,        // seconds from now -> start_time_us
       "fpsNum": 30, "fpsDen": 1,
       "frameCount": 300,
-      "showId": 1,
-      "fileId": 99,
       "seq": 1,
       "repeat": 5,
       "interval": 0.05,      // < 0.1 enforced
