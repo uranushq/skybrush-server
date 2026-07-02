@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
 from logging import Logger
-from math import inf, isfinite
+from math import inf, isfinite, radians
 from time import monotonic, time
 from typing import Any, Sequence
 
@@ -127,6 +127,8 @@ RTH_POSITION_TOLERANCE_XY = 2.0  # [m]
 RTH_POSITION_TOLERANCE_Z = 0.5  # [mAHL]
 RTH_NAVIGATION_TIMEOUT = 600.0  # [s]
 RTH_LANDING_TIMEOUT = 300.0  # [s]
+RTH_YAW = 0.0  # [deg]
+RTH_HEADING_TOLERANCE = 10.0  # [deg]
 
 
 def transport_options_to_channel(options: TransportOptions | None) -> str:
@@ -1596,16 +1598,21 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         message = create_led_control_packet()
         await self.driver.send_packet(message, self, channel=channel)
 
-    async def fly_to(self, target: GPSCoordinate) -> None:
+    async def fly_to(self, target: GPSCoordinate, *, yaw: float | None = None) -> None:
         """Sends a command to the UAV to reposition it to the given coordinate,
         where the altitude may be specified in AMSL or AHL.
+
+        Args:
+            target: the target coordinate to fly to
+            yaw: optional target heading in degrees. When omitted, the current
+                heading is kept.
         """
         if self._autopilot.supports_repositioning:
             # Implementation of fly_to() with the MAVLink DO_REPOSITION command
-            await self._fly_to_with_repositioning(target)
+            await self._fly_to_with_repositioning(target, yaw=yaw)
         else:
             # Implementation of fly_to() with a guided mode command
-            await self._fly_to_in_guided_mode(target)
+            await self._fly_to_in_guided_mode(target, yaw=yaw)
 
     def get_home_coordinate(self) -> GPSCoordinate | None:
         """Returns the home coordinate of the UAV from the last HOME_POSITION
@@ -1692,21 +1699,23 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         if current_ahl is not None and current_ahl > RTH_POSITION_TOLERANCE_Z:
             horizontal_target = target.copy()
             horizontal_target.ahl = current_ahl
-            await self.fly_to(horizontal_target)
+            await self.fly_to(horizontal_target, yaw=RTH_YAW)
             await self._wait_until_near_position(
                 horizontal_target,
                 tolerance_xy=RTH_POSITION_TOLERANCE_XY,
                 tolerance_z=RTH_POSITION_TOLERANCE_Z,
                 timeout=RTH_NAVIGATION_TIMEOUT,
                 check_altitude=False,
+                target_heading=RTH_YAW,
             )
 
-        await self.fly_to(target)
+        await self.fly_to(target, yaw=RTH_YAW)
         await self._wait_until_near_position(
             target,
             tolerance_xy=RTH_POSITION_TOLERANCE_XY,
             tolerance_z=RTH_POSITION_TOLERANCE_Z,
             timeout=RTH_NAVIGATION_TIMEOUT,
+            target_heading=RTH_YAW,
         )
 
         if not await self.driver.send_command_long(
@@ -1716,6 +1725,11 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
 
         await self._wait_until_on_ground(timeout=RTH_LANDING_TIMEOUT)
 
+    @staticmethod
+    def _heading_error(heading: float, target_heading: float) -> float:
+        """Returns the absolute angular error between two headings in degrees."""
+        return abs((heading - target_heading + 180) % 360 - 180)
+
     async def _wait_until_near_position(
         self,
         target: GPSCoordinate,
@@ -1724,6 +1738,8 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         tolerance_z: float,
         timeout: float,
         check_altitude: bool = True,
+        target_heading: float | None = None,
+        tolerance_heading: float = RTH_HEADING_TOLERANCE,
     ) -> None:
         """Waits until the UAV is close enough to the given target."""
         deadline = monotonic() + timeout
@@ -1745,6 +1761,12 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                     await sleep(0.5)
                     continue
 
+            if target_heading is not None:
+                heading = self.status.heading
+                if self._heading_error(heading, target_heading) > tolerance_heading:
+                    await sleep(0.5)
+                    continue
+
             return
 
         raise RuntimeError("Timed out while navigating to home position")
@@ -1760,7 +1782,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
 
         raise RuntimeError("Timed out while waiting for landing to complete")
 
-    async def _fly_to_in_guided_mode(self, target: GPSCoordinate) -> None:
+    async def _fly_to_in_guided_mode(
+        self, target: GPSCoordinate, *, yaw: float | None = None
+    ) -> None:
         """Implementation of `fly_to()` using a MAVLink
         SET_POSITION_TARGET_GLOBAL_INT guided mode message.
         """
@@ -1771,9 +1795,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             | PositionTargetTypemask.AX_IGNORE
             | PositionTargetTypemask.AY_IGNORE
             | PositionTargetTypemask.AZ_IGNORE
-            | PositionTargetTypemask.YAW_IGNORE
             | PositionTargetTypemask.YAW_RATE_IGNORE
         )
+        if yaw is None:
+            type_mask |= PositionTargetTypemask.YAW_IGNORE
 
         if target.amsl is None:
             frame = MAVFrame.GLOBAL_RELATIVE_ALT_INT
@@ -1807,7 +1832,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             afy=0,
             afz=0,
             # yaw
-            yaw=0,
+            yaw=radians(yaw) if yaw is not None else 0,
             yaw_rate=0,
         )
 
@@ -1831,7 +1856,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             # Maybe it's okay anyway, see comment above
             pass
 
-    async def _fly_to_with_repositioning(self, target: GPSCoordinate) -> None:
+    async def _fly_to_with_repositioning(
+        self, target: GPSCoordinate, *, yaw: float | None = None
+    ) -> None:
         """Implementation of `fly_to()` using a MAVLink DO_REPOSITION command
         with proper confirmation.
         """
@@ -1853,7 +1880,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             param1=-1,  # speed (default)
             param2=0,  # flags
             param3=0,  # reserved
-            param4=nan,  # yaw mode
+            param4=yaw if yaw is not None else nan,
             x=lat,  # latitude
             y=lon,  # longitude
             z=altitude,  # altitude
