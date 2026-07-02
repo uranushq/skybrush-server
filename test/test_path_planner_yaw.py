@@ -349,10 +349,15 @@ def test_yaw_setpoints_match_trajectory_player_timeline() -> None:
     player = TrajectoryPlayer(TrajectorySpecification(show["trajectory"]))
     setpoints = show["yawControl"]["setpoints"]
 
+    # Sample finely (not on integer seconds): velocity smoothing eases the final
+    # approach, so the drone reaches the pose gradually within the last second.
+    # The keyframe boundary times are preserved, so yaw and position still line
+    # up there; a coarse integer scan would mislabel the arrival instant.
+    fine_times = [round(0.05 * i, 3) for i in range(0, 800)]
     arrival_t = next(
         t
-        for t in range(0, 40)
-        if player.position_at(float(t))[1] >= 4.9 and player.position_at(float(t))[2] < 0.1
+        for t in fine_times
+        if player.position_at(t)[1] >= 4.9 and player.position_at(t)[2] < 0.1
     )
     first_ramp_t = min(t for t, yaw in setpoints if yaw < -1.0)
     assert first_ramp_t >= float(arrival_t) - 0.05

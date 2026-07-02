@@ -27,6 +27,20 @@ from .solver import SolverResult
 # Conservative default for small quadrotors (e.g. Crazyflie) during in-place turns.
 DEFAULT_MAX_YAW_RATE_DEG_S = 90.0
 
+# Default velocity-smoothing strength applied to every generated path. See
+# ``_apply_velocity_smoothing`` for the exact meaning. This is the value used
+# when the path-planner extension is loaded without an explicit configuration
+# override; the server config UI can adjust it globally.
+DEFAULT_VELOCITY_SMOOTHING = 1.0
+
+# Angle (degrees) between the incoming and outgoing direction above which a
+# waypoint is treated as a direction-change "corner". At a corner the geometry
+# is a straight line on both sides, so any non-zero speed forces an
+# instantaneous change of the velocity *vector* (a lateral jerk); we therefore
+# ramp the speed down there. Below this threshold the waypoint is treated as a
+# near-collinear pass-through and cruise speed is preserved.
+CORNER_ANGLE_THRESHOLD_DEG = 5.0
+
 
 # ---------------------------------------------------------------------------
 # Public helpers
@@ -39,6 +53,7 @@ def solver_result_to_trajectory_dicts(
     takeoff_time: float = 0.0,
     takeoff_speed: float = 1.5,
     landing_speed: float = 1.0,
+    velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
 ) -> List[dict]:
     """Convert a *SolverResult* into a list of Skybrush trajectory dicts.
 
@@ -65,6 +80,15 @@ def solver_result_to_trajectory_dicts(
         takeoff_time: seconds to wait on the ground before takeoff
         takeoff_speed: vertical speed during takeoff in m/s
         landing_speed: vertical speed during landing in m/s
+        velocity_smoothing: strength of the speed-ramp smoothing in ``[0, 1]``.
+            0 disables it (constant-velocity linear segments, the historical
+            behaviour); any value > 0 replaces the linear segments with cubic
+            Bézier segments whose control points lie *on* the straight line
+            between waypoints, so the path is unchanged but the speed ramps up
+            from / down to zero at the trajectory start, end and every hold.
+            Larger values additionally slow the drone down at direction-change
+            corners (1 = full stop at each corner). See
+            :func:`_apply_velocity_smoothing`.
     """
     num_drones = len(result.drones)
     duration_sec = duration_ms / 1000.0
@@ -144,11 +168,15 @@ def solver_result_to_trajectory_dicts(
         # single keyframe (the encoder will produce a constant segment).
         optimised = _collapse_stationary(points)
 
+        # Give the speed a gradient (ease-in / ease-out) so the drone does not
+        # jump from 0 to cruise speed instantly at every waypoint.
+        smoothed = _apply_velocity_smoothing(optimised, velocity_smoothing)
+
         trajectories.append(
             {
                 "version": 1,
                 "takeoffTime": takeoff_time,
-                "points": optimised,
+                "points": smoothed,
             }
         )
 
@@ -356,6 +384,59 @@ def build_yaw_control_dict(
     }
 
 
+def _default_coordinate_system() -> dict:
+    """Fallback local NWU coordinate system used when none is supplied."""
+    return {"type": "nwu", "origin": [0, 0], "orientation": 0}
+
+
+def _assemble_show_dict(
+    trajectory: dict,
+    home: list,
+    coordinate_system: dict,
+    amsl_reference: Optional[float],
+) -> dict:
+    """Wrap a trajectory dict into a full show-specification dict.
+
+    Adds the minimal light program, a permissive default geofence, the home
+    position, the coordinate system and (optionally) the AMSL reference — i.e.
+    everything except the yaw control block, which is caller-specific.
+    """
+    import base64
+
+    # Minimal light program: a single END (0x00) byte
+    minimal_light = base64.b64encode(b"\x00").decode("ascii")
+
+    # Permissive default geofence so the firmware does not reject the show on
+    # reload because of missing fence info. The values are wide enough not to
+    # interfere with typical small flights.
+    geofence = {
+        "version": 1,
+        "enabled": True,
+        "maxAltitude": 100.0,
+        "maxDistance": 500.0,
+        "minAltitude": -5.0,
+        "action": "land",
+        "polygons": [],
+        "rallyPoints": [],
+    }
+
+    show_dict = {
+        "trajectory": trajectory,
+        "lights": {"version": 1, "data": minimal_light},
+        "home": home,
+        "coordinateSystem": coordinate_system,
+        "geofence": geofence,
+    }
+    # Setting an AMSL reference makes the firmware interpret the trajectory Z
+    # coordinates as offsets from this absolute altitude (in meters) rather
+    # than treating them as relative to home. This corresponds to the "AMSL"
+    # altitude reference in the Live UI.
+    if amsl_reference is not None:
+        show_dict["amslReference"] = float(amsl_reference)
+
+    return show_dict
+
+
 def build_show_dicts(
     result: SolverResult,
     duration_ms: int = 300,
@@ -363,6 +444,7 @@ def build_show_dicts(
     coordinate_system: Optional[dict] = None,
     amsl_reference: Optional[float] = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
+    velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
 ) -> List[dict]:
     """Build a list of full *show specification* dicts (one per drone).
 
@@ -382,12 +464,12 @@ def build_show_dicts(
             Defaults to a WGS-84 origin at ``[0, 0]`` with 0° orientation
             when *None*.
     """
-    import base64
-
     if coordinate_system is None:
-        coordinate_system = {"type": "nwu", "origin": [0, 0], "orientation": 0}
+        coordinate_system = _default_coordinate_system()
 
-    traj_dicts = solver_result_to_trajectory_dicts(result, duration_ms, takeoff_time)
+    traj_dicts = solver_result_to_trajectory_dicts(
+        result, duration_ms, takeoff_time, velocity_smoothing=velocity_smoothing
+    )
     shows: List[dict] = []
 
     for idx, (drone, traj) in enumerate(zip(result.drones, traj_dicts)):
@@ -397,36 +479,7 @@ def build_show_dicts(
             round(drone.initial[2], 4),
         ]
 
-        # Minimal light program: a single END (0x00) byte
-        minimal_light = base64.b64encode(b"\x00").decode("ascii")
-
-        # Permissive default geofence so the firmware does not reject the
-        # show on reload because of missing fence info. The values are wide
-        # enough not to interfere with typical small flights.
-        geofence = {
-            "version": 1,
-            "enabled": True,
-            "maxAltitude": 100.0,
-            "maxDistance": 500.0,
-            "minAltitude": -5.0,
-            "action": "land",
-            "polygons": [],
-            "rallyPoints": [],
-        }
-
-        show_dict = {
-            "trajectory": traj,
-            "lights": {"version": 1, "data": minimal_light},
-            "home": home,
-            "coordinateSystem": coordinate_system,
-            "geofence": geofence,
-        }
-        # Setting an AMSL reference makes the firmware interpret the
-        # trajectory Z coordinates as offsets from this absolute altitude
-        # (in meters) rather than treating them as relative to home. This
-        # corresponds to the "AMSL" altitude reference in the Live UI.
-        if amsl_reference is not None:
-            show_dict["amslReference"] = float(amsl_reference)
+        show_dict = _assemble_show_dict(traj, home, coordinate_system, amsl_reference)
 
         yaw_control = build_yaw_control_dict(
             result,
@@ -443,6 +496,83 @@ def build_show_dicts(
     return shows
 
 
+def _delivery_drone_to_trajectory_dict(
+    drone: dict,
+    takeoff_time: float,
+    velocity_smoothing: float,
+) -> dict:
+    """Convert one pre-built delivery drone (``{initial_position, path}``) into a
+    Skybrush trajectory dict.
+
+    The delivery payload carries a per-drone waypoint list where each point has
+    its own ``durationMs`` (time to travel from the previous point to this one)
+    and an optional ``holdMs`` (extra time to hover at the point). Unlike the
+    solver output there is no global step timeline, so timing is accumulated
+    point-by-point here. Stationary runs are collapsed and the same velocity
+    smoothing as the generated paths is applied so hand-edited paths also ramp
+    their speed up/down instead of jerking between waypoints.
+    """
+    init = drone.get("initial_position") or [0.0, 0.0, 0.0]
+    start = [round(float(init[0]), 4), round(float(init[1]), 4), round(float(init[2]), 4)]
+
+    points: List[list] = [[0.0, start, []]]
+    t = 0.0
+    for raw in drone.get("path", []):
+        dur = float(raw.get("durationMs", 0)) / 1000.0
+        t = round(t + dur, 3)
+        pos = [
+            round(float(raw.get("x", 0.0)), 4),
+            round(float(raw.get("y", 0.0)), 4),
+            round(float(raw.get("z", 0.0)), 4),
+        ]
+        # Keep time strictly increasing: a zero/negative durationMs would make
+        # two keyframes share a timestamp, which the trajectory parser rejects.
+        if t <= points[-1][0]:
+            t = round(points[-1][0] + 0.001, 3)
+        points.append([t, pos, []])
+
+        hold = float(raw.get("holdMs", 0)) / 1000.0
+        if hold > 0:
+            t = round(t + hold, 3)
+            points.append([t, list(pos), []])
+
+    optimised = _collapse_stationary(points)
+    smoothed = _apply_velocity_smoothing(optimised, velocity_smoothing)
+
+    return {"version": 1, "takeoffTime": takeoff_time, "points": smoothed}
+
+
+def build_delivery_show_dicts(
+    drones: List[dict],
+    *,
+    takeoff_time: float = 0.0,
+    coordinate_system: Optional[dict] = None,
+    amsl_reference: Optional[float] = None,
+    velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
+) -> List[dict]:
+    """Build per-drone show dicts from a pre-built delivery ``drones`` payload.
+
+    Mirrors :func:`build_show_dicts` but takes ready-made per-drone paths (as
+    sent by the 3D view's "path delivery") instead of a solver result. No yaw
+    control block is emitted (the delivery payload carries no yaw).
+    """
+    if coordinate_system is None:
+        coordinate_system = _default_coordinate_system()
+
+    shows: List[dict] = []
+    for drone in drones:
+        traj = _delivery_drone_to_trajectory_dict(
+            drone, takeoff_time, velocity_smoothing
+        )
+        init = drone.get("initial_position") or [0.0, 0.0, 0.0]
+        home = [round(float(init[0]), 4), round(float(init[1]), 4), round(float(init[2]), 4)]
+        shows.append(
+            _assemble_show_dict(traj, home, coordinate_system, amsl_reference)
+        )
+
+    return shows
+
+
 async def save_skyb_files(
     result: SolverResult,
     output_dir: str | Path,
@@ -451,6 +581,7 @@ async def save_skyb_files(
     coordinate_system: Optional[dict] = None,
     amsl_reference: Optional[float] = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
+    velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
 ) -> Dict[str, str]:
     """Generate ``.skyb`` files for every drone and save them to *output_dir*.
 
@@ -476,8 +607,11 @@ async def save_skyb_files(
         coordinate_system=coordinate_system,
         amsl_reference=amsl_reference,
         max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+        velocity_smoothing=velocity_smoothing,
     )
-    traj_dicts = solver_result_to_trajectory_dicts(result, duration_ms, takeoff_time)
+    traj_dicts = solver_result_to_trajectory_dicts(
+        result, duration_ms, takeoff_time, velocity_smoothing=velocity_smoothing
+    )
     skyb_paths: Dict[str, str] = {}
 
     for idx, (show_dict, traj_dict) in enumerate(zip(show_dicts, traj_dicts)):
@@ -524,6 +658,161 @@ async def save_skyb_files(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _merge_collinear_runs(
+    points: List[list], angle_threshold_deg: float = CORNER_ANGLE_THRESHOLD_DEG
+) -> List[list]:
+    """Merge consecutive same-direction (collinear) moving segments into one.
+
+    When A, B, C are collinear and travelled in the same direction, the middle
+    keyframe B is dropped so that A→C becomes a *single* straight segment. The
+    kept keyframes keep their original timestamps, so the merged run still spans
+    the full A→C duration.
+
+    This lets the velocity smoothing ease *once* over the whole straight run
+    (ramp up at the run's start, ramp down at its end) instead of once per short
+    sub-segment. Corners (direction change > ``angle_threshold_deg``), holds
+    (zero-length segments) and the trajectory ends always break a run.
+    """
+    n = len(points)
+    if n < 3:
+        return points
+
+    def unit(a, b):
+        d = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+        length = math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+        if length <= 1e-9:
+            return None
+        return (d[0] / length, d[1] / length, d[2] / length)
+
+    cos_threshold = math.cos(math.radians(angle_threshold_deg))
+
+    result: List[list] = [points[0]]
+    for i in range(1, n):
+        if len(result) >= 2:
+            u1 = unit(result[-2][1], result[-1][1])
+            u2 = unit(result[-1][1], points[i][1])
+            if u1 is not None and u2 is not None:
+                dot = u1[0] * u2[0] + u1[1] * u2[1] + u1[2] * u2[2]
+                if dot >= cos_threshold:
+                    # collinear & same direction -> drop the middle keyframe,
+                    # extending the current run to points[i].
+                    result[-1] = points[i]
+                    continue
+        result.append(points[i])
+
+    return result
+
+
+def _apply_velocity_smoothing(
+    points: List[list], smoothing: float
+) -> List[list]:
+    """Give the trajectory a smooth speed profile without changing its path.
+
+    The input ``points`` is the list of ``[t, [x, y, z], control]`` keyframes
+    produced by :func:`solver_result_to_trajectory_dicts` (after
+    :func:`_collapse_stationary`), where every ``control`` list is empty, i.e.
+    every segment is linear and therefore travelled at *constant* speed. Plotted
+    as a velocity-vs-time graph that is a step function: speed jumps from 0 to
+    cruise the instant a segment starts and back to 0 the instant it ends, which
+    is an (near-)infinite acceleration — the "inertia" the drone feels.
+
+    This replaces each moving segment with a **cubic Bézier** whose two interior
+    control points lie *on the straight line* between the segment endpoints.
+    Because the control points are collinear with the endpoints, the geometric
+    path is byte-for-byte the same straight line as before; only the speed along
+    it changes. For a cubic Bézier ``P0 P1 P2 P3`` of duration ``T`` the speed
+    at the endpoints is ``3·|P1-P0|/T`` and ``3·|P3-P2|/T``, so positioning the
+    control points sets the entry/exit speed of each waypoint.
+
+    Per-waypoint target speed (at the shared keyframe between two segments):
+
+    * trajectory start / end, and any waypoint next to a hold (a zero-length
+      segment): **0** — the drone is genuinely at rest there, so the speed ramps
+      smoothly down to and up from zero (this is what removes the sudden
+      departure / arrival jerk).
+    * direction-change **corner** (angle > ``CORNER_ANGLE_THRESHOLD_DEG``):
+      ``(1 - smoothing) · cruise`` — with a straight path a corner taken at
+      non-zero speed still snaps the velocity *vector*, so higher ``smoothing``
+      slows it down more (``smoothing == 1`` → full stop at the corner).
+    * near-collinear pass-through: cruise speed is preserved, so the drone flies
+      straight through without slowing down.
+
+    ``smoothing`` is clamped to ``[0, 1]``; ``0`` returns the input unchanged
+    (the historical constant-velocity behaviour).
+
+    Consecutive collinear segments are first merged into a single straight run
+    (see :func:`_merge_collinear_runs`) so the ease-in/ease-out spans the whole
+    run rather than each short sub-segment.
+    """
+    if smoothing <= 0.0 or len(points) < 2:
+        return points
+    smoothing = min(1.0, smoothing)
+
+    # Merge collinear runs so A→B→C (same direction) becomes one A→C segment;
+    # the ease then ramps up once at the run start and down once at its end.
+    points = _merge_collinear_runs(points)
+    n = len(points)
+
+    # Per-segment geometry. Segment k (for k in 1..n-1) ends at keyframe k and
+    # carries its control points on keyframe k (Skybrush trajectory convention).
+    seg_dir: List[Optional[List[float]]] = [None] * n
+    seg_len: List[float] = [0.0] * n
+    seg_cruise: List[float] = [0.0] * n
+    for k in range(1, n):
+        a = points[k - 1][1]
+        b = points[k][1]
+        d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]]
+        length = math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+        dt = points[k][0] - points[k - 1][0]
+        seg_len[k] = length
+        if length > 1e-9 and dt > 1e-9:
+            seg_dir[k] = [d[0] / length, d[1] / length, d[2] / length]
+            seg_cruise[k] = length / dt
+        # else: zero-length hold or zero-duration -> leave as a constant segment
+
+    # Target speed at each keyframe (see docstring).
+    speed_at: List[float] = [0.0] * n
+    for i in range(n):
+        prev_dir = seg_dir[i] if i >= 1 else None
+        next_dir = seg_dir[i + 1] if i + 1 < n else None
+        if prev_dir is None or next_dir is None:
+            speed_at[i] = 0.0  # start / end / next to a hold -> at rest
+            continue
+        dot = prev_dir[0] * next_dir[0] + prev_dir[1] * next_dir[1] + prev_dir[2] * next_dir[2]
+        dot = max(-1.0, min(1.0, dot))
+        angle_deg = math.degrees(math.acos(dot))
+        pass_through = min(seg_cruise[i], seg_cruise[i + 1])
+        if angle_deg > CORNER_ANGLE_THRESHOLD_DEG:
+            speed_at[i] = (1.0 - smoothing) * pass_through  # corner
+        else:
+            speed_at[i] = pass_through  # straight-through, keep cruising
+
+    out: List[list] = [list(p) for p in points]
+    for k in range(1, n):
+        u = seg_dir[k]
+        if u is None:
+            out[k][2] = []  # keep holds / degenerate segments constant
+            continue
+        a = points[k - 1][1]
+        length = seg_len[k]
+        dt = points[k][0] - points[k - 1][0]
+        # Distance of each control point from the segment start, along the line.
+        # speed_at[endpoint] is bounded by this segment's own cruise (it is a
+        # min() that includes seg_cruise[k]), so 0 <= d1 <= L/3 <= 2L/3 <= d2 <= L
+        # and the motion stays monotonic (no overshoot / reversal).
+        d1 = speed_at[k - 1] * dt / 3.0
+        d2 = length - speed_at[k] * dt / 3.0
+        d1 = max(0.0, min(d1, length))
+        d2 = max(0.0, min(d2, length))
+        if d2 < d1:
+            d1 = d2 = 0.5 * (d1 + d2)
+        p1 = [round(a[j] + u[j] * d1, 4) for j in range(3)]
+        p2 = [round(a[j] + u[j] * d2, 4) for j in range(3)]
+        out[k][2] = [p1, p2]
+
+    return out
 
 
 def _collapse_stationary(points: List[list]) -> List[list]:

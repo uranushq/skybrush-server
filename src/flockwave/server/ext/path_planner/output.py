@@ -27,7 +27,12 @@ from json import dumps
 from typing import Any, List, Optional
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from .converter import DEFAULT_MAX_YAW_RATE_DEG_S, build_show_dicts
+from .converter import (
+    DEFAULT_MAX_YAW_RATE_DEG_S,
+    DEFAULT_VELOCITY_SMOOTHING,
+    _apply_velocity_smoothing,
+    build_show_dicts,
+)
 from .solver import SolverResult
 
 DEFAULT_DURATION_MS = 300
@@ -71,7 +76,9 @@ def build_output(result: SolverResult, duration_ms: int = DEFAULT_DURATION_MS) -
 
 
 def build_show_specifications(
-    result: SolverResult, duration_ms: int = DEFAULT_DURATION_MS
+    result: SolverResult,
+    duration_ms: int = DEFAULT_DURATION_MS,
+    velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
 ) -> list[dict[str, Any]]:
     """Build per-drone show upload payloads compatible with ``__show_upload``."""
     dt = duration_ms / 1000.0
@@ -87,6 +94,9 @@ def build_show_specifications(
             t = round(t + dt, 3)
             x, y, z = step_rec.positions[drone.drone_id]
             points.append([t, [x, y, z], []])
+
+        # Ease the speed up/down instead of jumping to cruise at each waypoint.
+        points = _apply_velocity_smoothing(points, velocity_smoothing)
 
         shows.append(
             {
@@ -120,6 +130,7 @@ def build_skyc_bytes(
     coordinate_system: Optional[dict] = None,
     amsl_reference: Optional[float] = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
+    velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
 ) -> bytes:
     """Build a ``.skyc`` ZIP for Skybrush Viewer.
 
@@ -134,7 +145,17 @@ def build_skyc_bytes(
         coordinate_system=coordinate_system,
         amsl_reference=amsl_reference,
         max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+        velocity_smoothing=velocity_smoothing,
     )
+    return skyc_bytes_from_show_dicts(show_dicts)
+
+
+def skyc_bytes_from_show_dicts(show_dicts: list[dict[str, Any]]) -> bytes:
+    """Pack a list of per-drone show dicts into a ``.skyc`` ZIP for Viewer.
+
+    Shared by :func:`build_skyc_bytes` (solver output) and the pre-built path
+    delivery flow, so both produce identical archive structure.
+    """
     cues = {"version": 1, "items": [{"time": 0.0, "name": "start"}]}
 
     drones_swarm: list[dict[str, Any]] = []

@@ -54,11 +54,18 @@ from flockwave.server.utils import overridden
 
 from .converter import (
     DEFAULT_MAX_YAW_RATE_DEG_S,
+    DEFAULT_VELOCITY_SMOOTHING,
+    build_delivery_show_dicts,
     build_show_dicts,
     save_skyb_files,
 )
 from .drone import Drone
-from .output import build_output, build_show_specifications, build_skyc_bytes
+from .output import (
+    build_output,
+    build_show_specifications,
+    build_skyc_bytes,
+    skyc_bytes_from_show_dicts,
+)
 from .collision_volume import describe_collision_envelope, volumes_overlap
 from .solver import PathSolver, SolverResult, StepRecord
 from .validators import (
@@ -78,6 +85,11 @@ blueprint = Blueprint("path_planner", __name__)
 # Available only while the extension is loaded.
 app: Optional["SkybrushServer"] = None
 log: Optional[Logger] = None
+
+# Global default velocity-smoothing strength (0..1) applied to *every* planned
+# path. Set from the extension configuration in `run()` so it can be adjusted
+# from the server config UI; used as the default in `plan()`.
+velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING
 
 
 def _is_vec3(value) -> bool:
@@ -689,6 +701,135 @@ def _plan_formation_phases(
     )
 
 
+# ── Path delivery (pre-built per-drone paths) ────────────────────────────
+
+
+def _validate_delivery_drones(drones):
+    """Validate the ``drones`` payload of a path-delivery request."""
+    if not isinstance(drones, list) or len(drones) == 0:
+        return jsonify({"error": "'drones' must be a non-empty array"}), 400
+
+    for i, d in enumerate(drones):
+        if not isinstance(d, dict):
+            return jsonify({"error": f"'drones[{i}]' must be an object"}), 400
+        if not _is_vec3(d.get("initial_position")):
+            return (
+                jsonify(
+                    {"error": f"'drones[{i}].initial_position' must be [x, y, z]"}
+                ),
+                400,
+            )
+        path = d.get("path")
+        if not isinstance(path, list) or len(path) == 0:
+            return (
+                jsonify({"error": f"'drones[{i}].path' must be a non-empty array"}),
+                400,
+            )
+        for j, p in enumerate(path):
+            if not isinstance(p, dict) or not all(
+                isinstance(p.get(k), (int, float)) for k in ("x", "y", "z")
+            ):
+                return (
+                    jsonify(
+                        {
+                            "error": (
+                                f"'drones[{i}].path[{j}]' must have numeric x, y, z"
+                            )
+                        }
+                    ),
+                    400,
+                )
+    return None
+
+
+async def _handle_path_delivery(body: dict):
+    """Turn a pre-built per-drone ``drones`` payload into a show.
+
+    Unlike ``/plan``'s solver mode, the paths are already decided by the caller
+    (the 3D view's "path delivery"); we only re-time them, apply the global
+    velocity smoothing and package the result as ``.skyc`` (and optionally
+    upload it), reusing the same machinery as the generated shows.
+    """
+    drones = body.get("drones")
+    err = _validate_delivery_drones(drones)
+    if err is not None:
+        return err
+
+    smoothing = float(body.get("velocity_smoothing", velocity_smoothing))
+    if not (0.0 <= smoothing <= 1.0):
+        return jsonify({"error": "'velocity_smoothing' must be between 0 and 1"}), 400
+
+    # Ground-wait before the show; enforce the same minimum as generation so the
+    # firmware does not reject a zero/short takeoff time.
+    takeoff_time = float(body.get("takeoff_time", 0.0))
+    if takeoff_time < 5.0:
+        takeoff_time = 5.0
+
+    coordinate_system = body.get("coordinate_system") or None
+    amsl_reference = body.get("amsl_reference")
+    if coordinate_system is None:
+        coordinate_system = _derive_coordinate_system_from_first_uav()
+    if amsl_reference is None:
+        amsl_reference = _derive_amsl_reference_from_first_uav()
+
+    # Normalize initial_position to a plain [x, y, z] list (dict form accepted).
+    normalized: list[dict] = []
+    for d in drones:
+        ip = d["initial_position"]
+        if isinstance(ip, dict):
+            ip = [ip["x"], ip["y"], ip["z"]]
+        normalized.append(
+            {
+                "id": d.get("id"),
+                "initial_position": [float(ip[0]), float(ip[1]), float(ip[2])],
+                "path": d["path"],
+            }
+        )
+
+    show_dicts = build_delivery_show_dicts(
+        normalized,
+        takeoff_time=takeoff_time,
+        coordinate_system=coordinate_system,
+        amsl_reference=amsl_reference,
+        velocity_smoothing=smoothing,
+    )
+
+    output: dict = {
+        "success": True,
+        "mode": "path_delivery",
+        "num_drones": len(show_dicts),
+    }
+
+    # Delivery does not upload by default (the UI's action is a .skyc download);
+    # honour an explicit auto_upload if the caller asks for it.
+    if bool(body.get("auto_upload", False)):
+        output["upload"] = await _upload_show_dicts(show_dicts)
+
+    output_type = str(body.get("output", "skyc")).lower()
+    if output_type not in ("path", "show", "skyc"):
+        return (
+            jsonify({"error": "'output' must be one of 'path', 'show', 'skyc'"}),
+            400,
+        )
+
+    download = bool(body.get("download", output_type == "skyc"))
+    if output_type == "skyc" and download:
+        response = Response(
+            skyc_bytes_from_show_dicts(show_dicts),
+            mimetype="application/zip",
+        )
+        response.headers["Content-Disposition"] = (
+            'attachment; filename="path-planner.skyc"'
+        )
+        return response
+
+    if output_type in ("show", "skyc"):
+        output["format"] = "show-upload-v1"
+        output["shows"] = show_dicts
+
+    return jsonify(output)
+
+
 # ── REST endpoint ────────────────────────────────────────────────────────
 
 
@@ -698,6 +839,12 @@ async def plan():
     body = await request.get_json(silent=True)
     if body is None:
         return jsonify({"error": "Request body must be valid JSON"}), 400
+
+    # Path *delivery* mode: the caller supplies ready-made per-drone paths
+    # (the 3D view's "path delivery") instead of initial/target/phases to solve.
+    # Handled separately so the two payload shapes don't get cross-validated.
+    if body.get("drones") is not None:
+        return await _handle_path_delivery(body)
 
     # --- validate required fields ---
     initial = body.get("initial")
@@ -750,6 +897,10 @@ async def plan():
     max_yaw_rate_deg_s: float = float(
         body.get("max_yaw_rate_deg_s", DEFAULT_MAX_YAW_RATE_DEG_S)
     )
+    # Velocity-smoothing strength. Defaults to the extension-wide value set from
+    # the config UI (`velocity_smoothing` global); a request may override it for
+    # a single plan, but the intended control surface is the global default.
+    smoothing: float = float(body.get("velocity_smoothing", velocity_smoothing))
 
     if step_size <= 0:
         return jsonify({"error": "'step_size' must be > 0"}), 400
@@ -757,6 +908,8 @@ async def plan():
         return jsonify({"error": "'duration_ms' must be > 0"}), 400
     if max_yaw_rate_deg_s <= 0:
         return jsonify({"error": "'max_yaw_rate_deg_s' must be > 0"}), 400
+    if not (0.0 <= smoothing <= 1.0):
+        return jsonify({"error": "'velocity_smoothing' must be between 0 and 1"}), 400
     initial_altitude: float = float(
         body.get("initial_altitude", body.get("takeoff_altitude", 2.5))
     )
@@ -924,6 +1077,7 @@ async def plan():
             coordinate_system=coordinate_system,
             amsl_reference=amsl_reference,
             max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+            velocity_smoothing=smoothing,
         )
         output["skybrush_files"] = saved
         if log:
@@ -947,6 +1101,7 @@ async def plan():
             coordinate_system=coordinate_system,
             amsl_reference=amsl_reference,
             max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+            velocity_smoothing=smoothing,
         )
         output["upload"] = upload_results
 
@@ -954,7 +1109,9 @@ async def plan():
     default_output_type = "skyc" if uses_phases else "path"
     output_type = str(body.get("output", default_output_type)).lower()
     if output_type in ("show", "skyc"):
-        output["shows"] = build_show_specifications(result, duration_ms)
+        output["shows"] = build_show_specifications(
+            result, duration_ms, velocity_smoothing=smoothing
+        )
         output["format"] = "show-upload-v1"
         should_download = bool(body.get("download", output_type == "skyc"))
         if should_download:
@@ -967,6 +1124,7 @@ async def plan():
                         coordinate_system=coordinate_system,
                         amsl_reference=amsl_reference,
                         max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+                        velocity_smoothing=smoothing,
                     ),
                     mimetype="application/zip",
                 )
@@ -1086,6 +1244,7 @@ async def _upload_to_connected_uavs(
     coordinate_system: Optional[dict] = None,
     amsl_reference: Optional[float] = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
+    velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
 ) -> dict:
     """Upload per-drone show specs to connected UAVs.
 
@@ -1095,17 +1254,9 @@ async def _upload_to_connected_uavs(
 
     Returns a summary dict describing what happened for each UAV.
     """
-    from flockwave.server.model.uav import UAV, is_uav
-
     global app, log
     if app is None:
         return {"error": "Server app not available"}
-
-    # Gather connected UAV IDs, sorted so assignment is deterministic
-    uav_ids = sorted(app.object_registry.ids_by_type(UAV))
-
-    if not uav_ids:
-        return {"error": "No UAVs connected", "uploaded": 0, "details": {}}
 
     # If the caller did not specify a coordinate system, derive its origin
     # from the current GPS position of the first connected UAV. Without a
@@ -1127,9 +1278,28 @@ async def _upload_to_connected_uavs(
         coordinate_system=coordinate_system,
         amsl_reference=amsl_reference,
         max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+        velocity_smoothing=velocity_smoothing,
     )
-    num_drones = len(show_dicts)
+    return await _upload_show_dicts(show_dicts)
 
+
+async def _upload_show_dicts(show_dicts: list) -> dict:
+    """Upload ready-made per-drone show dicts to the connected UAVs in order.
+
+    Shared by solver-based planning and pre-built path delivery.
+    """
+    from flockwave.server.model.uav import UAV, is_uav
+
+    global app, log
+    if app is None:
+        return {"error": "Server app not available"}
+
+    # Gather connected UAV IDs, sorted so assignment is deterministic
+    uav_ids = sorted(app.object_registry.ids_by_type(UAV))
+    if not uav_ids:
+        return {"error": "No UAVs connected", "uploaded": 0, "details": {}}
+
+    num_drones = len(show_dicts)
     if len(uav_ids) < num_drones:
         if log:
             log.warning(
@@ -1181,10 +1351,24 @@ class PathPlannerExtension(Extension):
         route = configuration.get("route", "/api/v1/path-planner")
         http_server = app.import_api("http_server")
 
+        # Global default velocity smoothing, adjustable from the config UI and
+        # applied to every planned path (clamped defensively to [0, 1]).
+        smoothing = float(
+            configuration.get("velocity_smoothing", DEFAULT_VELOCITY_SMOOTHING)
+        )
+        smoothing = max(0.0, min(1.0, smoothing))
+
         with ExitStack() as stack:
-            stack.enter_context(overridden(globals(), app=app, log=logger))
+            stack.enter_context(
+                overridden(
+                    globals(), app=app, log=logger, velocity_smoothing=smoothing
+                )
+            )
             stack.enter_context(http_server.mounted(blueprint, path=route))
-            logger.info(f"Path-planner API mounted at {route}/plan")
+            logger.info(
+                f"Path-planner API mounted at {route}/plan "
+                f"(velocity_smoothing={smoothing})"
+            )
             await sleep_forever()
 
 
@@ -1202,6 +1386,22 @@ schema = {
                 "within the HTTP namespace of the server"
             ),
             "default": "/api/v1/path-planner",
+        },
+        "velocity_smoothing": {
+            "type": "number",
+            "title": "Velocity smoothing",
+            "description": (
+                "How much to ease the speed up/down between waypoints, from 0 "
+                "to 1. 0 keeps the old constant-velocity motion (abrupt start "
+                "and stop at every waypoint). Any value above 0 ramps the speed "
+                "smoothly to/from zero at the start, end and every hold; larger "
+                "values also slow the drone down more at direction-change "
+                "corners (1 = come to a full stop at each corner). Applies to "
+                "every generated path."
+            ),
+            "minimum": 0,
+            "maximum": 1,
+            "default": DEFAULT_VELOCITY_SMOOTHING,
         },
     }
 }
