@@ -19,3 +19,6 @@ tmp/
 __pycache__/
 skybrush.cfg
 ai
+
+# Claude Code local settings (contains SMTP secrets)
+.claude/settings.local.json
