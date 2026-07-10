@@ -4,77 +4,84 @@ Endpoint
 --------
 POST ``/api/v1/path-planner/plan``
 
-Request body (JSON) — same shape as the algorithm's ``input.json``::
+Formation-phase flow (``phases`` present)::
 
-    {
-      "initial": [[x, y, z], ...],
-      "target":  [[x, y, z], ...],
-      "step_size":    1.0,        // optional, default 1.0
-      "duration_ms":  300,        // optional, per-step ms, default 300
-      "seed":         42          // optional, for reproducibility
-    }
+    ground (per-drone [x, y, z_ground])
+      │  vertical takeoff
+      ▼
+    staging hover  (z_ground + staging_altitude, default 5 m)
+      │  solver: collision-avoided move
+      ▼
+    staging grid   (grid_spacing apart, default 2 m — the algorithm's start)
+      │  solver: phase 1, phase 2, ... (+ per-phase holds and yaw changes)
+      ▼
+    return to staging hover  (when return_to_initial, default true)
+      │  vertical landing
+      ▼
+    ground
 
-Response body (JSON)::
+Safety contract (fail-loudly)
+-----------------------------
+Planning failures never produce partial output: if any solver segment fails,
+if a trajectory violates the velocity/yaw-rate limits, or if the final
+spatio-temporal verification gate finds an envelope overlap, the request is
+answered with an error response and **nothing is saved or uploaded**.
 
-    {
-      "success": true,
-      "total_steps": 27,
-      "drones": [
-        {
-          "id": "drone-1",
-          "name": "Drone 1",
-          "battery": 100,
-          "status": "Flying",
-          "pos": [x, y, z],
-          "path": [
-            {"x": ..., "y": ..., "z": ..., "durationMs": 300},
-            ...
-          ]
-        },
-        ...
-      ]
-    }
+All CPU-heavy work (solving, show building, verification) runs in a worker
+thread so the server event loop keeps serving MAVLink traffic while a plan
+is computed.
 """
 
 from __future__ import annotations
 
+import re
 from contextlib import ExitStack
 from copy import deepcopy
 from json import dumps
 from logging import Logger
-from math import ceil
+from math import ceil, sqrt
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 from quart import Blueprint, Response, jsonify, request
-from trio import sleep_forever
+from trio import sleep_forever, to_thread
 
 from flockwave.server.ext.base import Extension
 from flockwave.server.utils import overridden
 
 from .converter import (
+    DEFAULT_DURATION_MS,
     DEFAULT_MAX_YAW_RATE_DEG_S,
     DEFAULT_VELOCITY_SMOOTHING,
+    TrajectoryLimitError,
     build_delivery_show_dicts,
     build_show_dicts,
+    lerp_yaw_deg,
     save_skyb_files,
+    yaw_delta_deg,
 )
 from .drone import Drone
 from .output import (
     build_output,
     build_show_specifications,
-    build_skyc_bytes,
     skyc_bytes_from_show_dicts,
 )
-from .collision_volume import describe_collision_envelope, volumes_overlap
+from .collision_volume import (
+    PLANNED_XY_CLEARANCE,
+    PLANNING_MARGIN,
+    describe_collision_envelope,
+    envelope_overlap,
+)
 from .solver import PathSolver, SolverResult, StepRecord
 from .validators import (
     SEVERITY_ERROR,
     ValidationContext,
     collect_required_params,
     fetch_required_params,
+    resolve_min_alt,
     run_validators,
 )
+from .verify import verify_show_dicts
 
 if TYPE_CHECKING:
     from flockwave.server.app import SkybrushServer
@@ -90,6 +97,30 @@ log: Optional[Logger] = None
 # path. Set from the extension configuration in `run()` so it can be adjusted
 # from the server config UI; used as the default in `plan()`.
 velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING
+
+# Base directory for generated files; requests may only choose subdirectories
+# of this. Empty string means "parent of the server's working directory".
+output_base_dir: str = ""
+
+# Skybrush firmware tends to silently reject very short shows or shows with a
+# zero takeoff time; every mode enforces this same minimum ground wait.
+MIN_TAKEOFF_TIME = 5.0
+
+# Staging defaults: hover this high above each drone's ground position, then
+# form a grid with this spacing before the requested formation phases start.
+DEFAULT_STAGING_ALTITUDE = 5.0
+DEFAULT_GRID_SPACING = 2.0
+
+
+class PlanningError(Exception):
+    """A solver segment could not produce a collision-free plan."""
+
+    def __init__(self, message: str, details: Optional[dict] = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
+
+
+# ── request parsing helpers ──────────────────────────────────────────────
 
 
 def _is_vec3(value) -> bool:
@@ -365,48 +396,6 @@ def _phase_target_yaws(phase: dict, num_drones: int) -> list[float]:
     return [float(yaw) for yaw in yaws if yaw is not None]
 
 
-def _append_in_place_yaw_change_step(
-    *,
-    steps: list[StepRecord],
-    positions: list[tuple[float, float, float]],
-    yaws: list[float],
-) -> None:
-    """Append one extra step that changes only yaw at the same position."""
-    steps.append(
-        StepRecord(
-            step=steps[-1].step + 1,
-            positions={idx: list(pos) for idx, pos in enumerate(positions)},
-            collisions=[],
-            reverted_drones=[],
-            verified=True,
-            yaws={idx: yaws[idx] for idx in range(len(positions))},
-        )
-    )
-
-
-def _yaw_lists_match(current_yaws: list[float], target_yaws: list[float]) -> bool:
-    """Return whether two per-drone yaw arrays are effectively equal."""
-    return all(abs(current - target) < 1e-9 for current, target in zip(current_yaws, target_yaws))
-
-
-def _reset_yaw_to_neutral_before_move(
-    *,
-    steps: list[StepRecord],
-    positions: list[tuple[float, float, float]],
-    current_yaws: list[float],
-) -> list[float]:
-    """Reset per-drone yaw to 0 in place before starting a translation."""
-    neutral_yaws = [0.0] * len(positions)
-    if _yaw_lists_match(current_yaws, neutral_yaws):
-        return current_yaws
-    _append_in_place_yaw_change_step(
-        steps=steps,
-        positions=positions,
-        yaws=neutral_yaws,
-    )
-    return neutral_yaws
-
-
 def _phase_targets(phase: dict, num_drones: int) -> list[tuple[float, float, float]]:
     targets: list[tuple[float, float, float] | None] = [None] * num_drones
     for point_index, point in enumerate(phase["points"]):
@@ -425,8 +414,8 @@ def _phase_targets(phase: dict, num_drones: int) -> list[tuple[float, float, flo
 
 
 def _positions_match(
-    positions: list[tuple[float, float, float]],
-    targets: list[tuple[float, float, float]],
+    positions: Sequence[Sequence[float]],
+    targets: Sequence[Sequence[float]],
 ) -> bool:
     return all(
         abs(pos[axis] - target[axis]) < 1e-9
@@ -435,16 +424,28 @@ def _positions_match(
     )
 
 
-def _find_collision_envelope_pairs(
+def _yaw_lists_match(current_yaws: list[float], target_yaws: list[float]) -> bool:
+    """Return whether two per-drone yaw arrays are effectively equal."""
+    return all(
+        abs(yaw_delta_deg(current, target)) < 1e-9
+        for current, target in zip(current_yaws, target_yaws)
+    )
+
+
+# ── spacing validation ───────────────────────────────────────────────────
+
+
+def _find_clearance_violations(
     label: str,
-    points: list[tuple[float, float, float]] | list[list[float]],
+    points: Sequence[Sequence[float]],
 ) -> list[dict]:
+    """Pairs of points closer than the planner's inflated envelope allows."""
     pairs: list[dict] = []
     for i in range(len(points)):
         for j in range(i + 1, len(points)):
             a = points[i]
             b = points[j]
-            if volumes_overlap(a, b):
+            if envelope_overlap(a, b, margin=PLANNING_MARGIN):
                 pairs.append(
                     {
                         "label": label,
@@ -460,22 +461,7 @@ def _find_collision_envelope_pairs(
     return pairs
 
 
-def _validate_phase_spacing(
-    *,
-    initial: list[list[float]],
-    phases: list[dict],
-):
-    violations = _find_collision_envelope_pairs("initial", initial)
-    for phase_index, phase in enumerate(phases):
-        targets = _phase_targets(phase, len(initial))
-        label = str(phase.get("name") or f"phase-{phase_index + 1}")
-        violations.extend(
-            _find_collision_envelope_pairs(f"phases[{phase_index}]:{label}", targets)
-        )
-
-    if not violations:
-        return None
-
+def _spacing_error_response(violations: list[dict]):
     return (
         jsonify(
             {
@@ -483,6 +469,7 @@ def _validate_phase_spacing(
                 "code": "FORMATION_SPACING_TOO_CLOSE",
                 "details": {
                     "collision_envelope": describe_collision_envelope(),
+                    "required_xy_clearance": PLANNED_XY_CLEARANCE,
                     "violations": violations,
                 },
             }
@@ -491,9 +478,235 @@ def _validate_phase_spacing(
     )
 
 
+def _validate_point_group_spacing(groups: list[tuple[str, Sequence]]):
+    """422 response when any labelled point set violates the clearance."""
+    violations: list[dict] = []
+    for label, points in groups:
+        violations.extend(_find_clearance_violations(label, points))
+    if violations:
+        return _spacing_error_response(violations)
+    return None
+
+
+def _altitude_floor_error(groups: list[tuple[str, Sequence]], min_z: float):
+    """422 response when any planned waypoint sits below the altitude floor.
+
+    The solver clamps its motion to ``min_z``; a target below the floor can
+    never be reached and would otherwise surface as a confusing deadlock.
+    """
+    EPS = 1e-3
+    violations: list[dict] = []
+    for label, points in groups:
+        for i, pt in enumerate(points):
+            z = float(pt[2])
+            if z + EPS < min_z:
+                violations.append({"label": label, "index": i, "z": z})
+    if not violations:
+        return None
+    return (
+        jsonify(
+            {
+                "error": (
+                    f"One or more waypoints are below the altitude floor of "
+                    f"{min_z} m used for planning"
+                ),
+                "code": "BELOW_ALTITUDE_FLOOR",
+                "details": {"min_z": min_z, "violations": violations},
+            }
+        ),
+        422,
+    )
+
+
+# ── staging grid ─────────────────────────────────────────────────────────
+
+
+def _staging_grid_slots(
+    hover_positions: Sequence[Sequence[float]], spacing: float
+) -> list[tuple[float, float, float]]:
+    """Grid slot positions centered on the fleet's hover centroid.
+
+    ``ceil(sqrt(n))`` columns, row-major, all at the highest hover altitude
+    so drones over uneven ground meet on one flat plane.
+    """
+    n = len(hover_positions)
+    cx = sum(p[0] for p in hover_positions) / n
+    cy = sum(p[1] for p in hover_positions) / n
+    altitude = max(p[2] for p in hover_positions)
+
+    cols = ceil(sqrt(n))
+    rows = ceil(n / cols)
+    slots: list[tuple[float, float, float]] = []
+    for r in range(rows):
+        for c in range(cols):
+            if len(slots) >= n:
+                break
+            slots.append(
+                (
+                    round(cx + (c - (cols - 1) / 2.0) * spacing, 4),
+                    round(cy + (r - (rows - 1) / 2.0) * spacing, 4),
+                    round(altitude, 4),
+                )
+            )
+    return slots
+
+
+def _assign_grid_slots(
+    positions: Sequence[Sequence[float]],
+    slots: Sequence[tuple[float, float, float]],
+) -> list[tuple[float, float, float]]:
+    """Assign each drone the closest free grid slot (greedy global matching).
+
+    Deterministic: candidate pairs are sorted by distance with the drone and
+    slot indices as tie-breakers, which keeps transition paths short and
+    mostly crossing-free.
+    """
+    n = len(positions)
+    candidates = sorted(
+        (
+            (
+                (positions[i][0] - slots[j][0]) ** 2
+                + (positions[i][1] - slots[j][1]) ** 2
+                + (positions[i][2] - slots[j][2]) ** 2,
+                i,
+                j,
+            )
+            for i in range(n)
+            for j in range(n)
+        )
+    )
+    drone_to_slot: dict[int, int] = {}
+    used_slots: set[int] = set()
+    for _dist, i, j in candidates:
+        if i in drone_to_slot or j in used_slots:
+            continue
+        drone_to_slot[i] = j
+        used_slots.add(j)
+        if len(drone_to_slot) == n:
+            break
+    return [slots[drone_to_slot[i]] for i in range(n)]
+
+
+# ── formation planning (runs in a worker thread) ─────────────────────────
+
+
+def _segment_seed(seed: Optional[int], index: int) -> Optional[int]:
+    """Distinct-but-reproducible seed per solver segment."""
+    return None if seed is None else seed + index
+
+
+def _yaw_steps_needed(
+    current_yaws: list[float],
+    target_yaws: list[float],
+    duration_sec: float,
+    max_yaw_rate_deg_s: float,
+) -> int:
+    max_delta = max(
+        (
+            abs(yaw_delta_deg(current, target))
+            for current, target in zip(current_yaws, target_yaws)
+        ),
+        default=0.0,
+    )
+    if max_delta < 1e-9:
+        return 0
+    return max(1, ceil((max_delta / max_yaw_rate_deg_s) / duration_sec))
+
+
+def _append_yaw_transition(
+    steps: list[StepRecord],
+    positions: Sequence[Sequence[float]],
+    current_yaws: list[float],
+    target_yaws: list[float],
+    *,
+    duration_sec: float,
+    max_yaw_rate_deg_s: float,
+    min_steps: int = 0,
+) -> list[float]:
+    """Append in-place steps rotating to *target_yaws* within the rate limit.
+
+    Enough steps are inserted for the largest yaw change to stay below
+    ``max_yaw_rate_deg_s`` (so the converter's ramp always fits its budget);
+    ``min_steps`` extends the tail as a hold at the target yaw. Returns the
+    new per-drone yaw list.
+    """
+    yaw_steps = _yaw_steps_needed(
+        current_yaws, target_yaws, duration_sec, max_yaw_rate_deg_s
+    )
+    total_steps = max(yaw_steps, min_steps)
+    for k in range(1, total_steps + 1):
+        fraction = 1.0 if yaw_steps == 0 else min(1.0, k / yaw_steps)
+        yaws = [
+            lerp_yaw_deg(current, target, fraction)
+            for current, target in zip(current_yaws, target_yaws)
+        ]
+        steps.append(
+            StepRecord(
+                step=steps[-1].step + 1,
+                positions={idx: list(pos) for idx, pos in enumerate(positions)},
+                collisions=[],
+                reverted_drones=[],
+                verified=True,
+                yaws={idx: yaws[idx] for idx in range(len(positions))},
+            )
+        )
+    return list(target_yaws) if total_steps > 0 else list(current_yaws)
+
+
+def _extend_with_solver_run(
+    combined_steps: list[StepRecord],
+    current_positions: list[tuple[float, float, float]],
+    targets: Sequence[tuple[float, float, float]],
+    *,
+    step_size: float,
+    seed: Optional[int],
+    min_z: float,
+    current_yaws: list[float],
+    label: str,
+) -> list[tuple[float, float, float]]:
+    """Run one solver segment and append its steps to the combined timeline.
+
+    Raises :class:`PlanningError` when the segment cannot be solved — the
+    caller never sees a partial path.
+    """
+    num_drones = len(current_positions)
+    solver = PathSolver(
+        initials=current_positions,
+        targets=list(targets),
+        step_size=step_size,
+        seed=seed,
+        min_z=min_z,
+    )
+    result = solver.solve()
+    if not result.success:
+        raise PlanningError(
+            f"planning failed in segment '{label}': {result.failure_reason}",
+            details={
+                "segment": label,
+                "reason": result.failure_reason,
+                "stuck_drones": [f"drone-{i + 1}" for i in result.stuck_drones],
+                "steps_completed": result.total_steps,
+            },
+        )
+
+    step_offset = combined_steps[-1].step
+    for record in result.steps[1:]:
+        combined_steps.append(
+            StepRecord(
+                step=step_offset + record.step,
+                positions=deepcopy(record.positions),
+                collisions=list(record.collisions),
+                reverted_drones=list(record.reverted_drones),
+                verified=record.verified,
+                yaws={idx: current_yaws[idx] for idx in range(num_drones)},
+            )
+        )
+    return [tuple(result.steps[-1].positions[idx]) for idx in range(num_drones)]
+
+
 def _plan_formation_phases(
     *,
-    initial: list,
+    start_positions: list,
     phases: list[dict],
     step_size: float,
     duration_ms: int,
@@ -501,13 +714,29 @@ def _plan_formation_phases(
     return_to_initial: bool = True,
     min_z: float = 0.0,
     initial_yaws: list[float] | None = None,
+    max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
+    staging_targets: Optional[list[tuple[float, float, float]]] = None,
 ) -> tuple[SolverResult, list[dict]]:
-    """Plan synced formation phases with collision avoidance between phases."""
-    num_drones = len(initial)
-    current_positions = [tuple(float(v) for v in point) for point in initial]
+    """Plan synced formation phases with collision avoidance between phases.
+
+    ``start_positions`` are the hover positions right after takeoff. When
+    ``staging_targets`` is given, a staging segment moves the fleet into the
+    grid before the first phase, and ``return_to_initial`` brings it back to
+    the hover positions at the end (so landing descends onto the original
+    ground spots).
+
+    Raises :class:`PlanningError` on any unsolvable segment.
+    """
+    num_drones = len(start_positions)
+    duration_sec = duration_ms / 1000.0
+    current_positions = [
+        tuple(float(v) for v in point) for point in start_positions
+    ]
     original_initials = list(current_positions)
     current_yaws = list(initial_yaws or [0.0] * num_drones)
     original_yaws = list(current_yaws)
+    neutral_yaws = [0.0] * num_drones
+
     combined_steps: list[StepRecord] = [
         StepRecord(
             step=0,
@@ -519,171 +748,112 @@ def _plan_formation_phases(
         )
     ]
     phase_summaries: list[dict] = []
-    success = True
+    segment_counter = 0
 
-    for phase_index, phase in enumerate(phases):
-        targets = _phase_targets(phase, num_drones)
-        target_yaws = _phase_target_yaws(phase, num_drones)
-        phase_success = True
-        if _positions_match(current_positions, targets):
-            current_positions = list(targets)
-        else:
-            solver = PathSolver(
-                initials=current_positions,
-                targets=targets,
-                step_size=step_size,
-                seed=seed,
-                min_z=min_z,
-            )
-            result = solver.solve()
-            step_offset = combined_steps[-1].step
-            move_steps = result.steps[1:]
-
-            for record in move_steps:
-                combined_steps.append(
-                    StepRecord(
-                        step=step_offset + record.step,
-                        positions=deepcopy(record.positions),
-                        collisions=list(record.collisions),
-                        reverted_drones=list(record.reverted_drones),
-                        verified=record.verified,
-                        yaws={idx: current_yaws[idx] for idx in range(num_drones)},
-                    )
-                )
-
-            current_positions = [
-                tuple(result.steps[-1].positions[idx]) for idx in range(num_drones)
-            ]
-            phase_success = result.success
-            success = success and phase_success
-
-        arrival_step = combined_steps[-1].step
-        hold_ms = int(phase.get("holdMs", 0))
-        hold_steps = ceil(hold_ms / duration_ms) if hold_ms > 0 else 0
-        needs_yaw_change = not _yaw_lists_match(current_yaws, target_yaws)
-
-        if hold_steps > 0:
-            hold_yaws = {idx: target_yaws[idx] for idx in range(num_drones)}
-            for _ in range(hold_steps):
-                combined_steps.append(
-                    StepRecord(
-                        step=combined_steps[-1].step + 1,
-                        positions={
-                            idx: list(pos) for idx, pos in enumerate(current_positions)
-                        },
-                        collisions=[],
-                        reverted_drones=[],
-                        verified=True,
-                        yaws=dict(hold_yaws),
-                    )
-                )
-            current_yaws = list(target_yaws)
-        elif needs_yaw_change:
-            _append_in_place_yaw_change_step(
-                steps=combined_steps,
-                positions=current_positions,
-                yaws=target_yaws,
-            )
-            current_yaws = list(target_yaws)
-
-        hold_end_step = combined_steps[-1].step
-        will_move_after_phase = phase_index < len(phases) - 1 or (
-            phase_index == len(phases) - 1 and return_to_initial
-        )
-        if will_move_after_phase:
-            current_yaws = _reset_yaw_to_neutral_before_move(
-                steps=combined_steps,
-                positions=current_positions,
-                current_yaws=current_yaws,
-            )
-
+    def summarize(name: str, arrival_step: int, hold_ms: int, hold_steps: int) -> None:
         phase_summaries.append(
             {
-                "name": phase.get("name", f"phase-{phase_index + 1}"),
+                "name": name,
                 "arrivalStep": arrival_step,
                 "arrivalTimeMs": arrival_step * duration_ms,
                 "holdMs": hold_ms,
                 "holdSteps": hold_steps,
-                "endStep": hold_end_step,
-                "endTimeMs": hold_end_step * duration_ms,
-                "success": phase_success,
-            }
-        )
-
-    final_targets = _phase_targets(phases[-1], num_drones)
-    if return_to_initial:
-        final_targets = original_initials
-        final_yaws = original_yaws
-        return_success = True
-        if _positions_match(current_positions, final_targets):
-            current_positions = list(final_targets)
-            if _yaw_lists_match(current_yaws, final_yaws):
-                combined_steps[-1] = StepRecord(
-                    step=combined_steps[-1].step,
-                    positions=combined_steps[-1].positions,
-                    collisions=combined_steps[-1].collisions,
-                    reverted_drones=combined_steps[-1].reverted_drones,
-                    verified=combined_steps[-1].verified,
-                    yaws={idx: final_yaws[idx] for idx in range(num_drones)},
-                )
-            else:
-                _append_in_place_yaw_change_step(
-                    steps=combined_steps,
-                    positions=current_positions,
-                    yaws=final_yaws,
-                )
-            current_yaws = list(final_yaws)
-        else:
-            solver = PathSolver(
-                initials=current_positions,
-                targets=final_targets,
-                step_size=step_size,
-                seed=seed,
-                min_z=min_z,
-            )
-            result = solver.solve()
-            step_offset = combined_steps[-1].step
-            move_steps = result.steps[1:]
-
-            for record in move_steps:
-                combined_steps.append(
-                    StepRecord(
-                        step=step_offset + record.step,
-                        positions=deepcopy(record.positions),
-                        collisions=list(record.collisions),
-                        reverted_drones=list(record.reverted_drones),
-                        verified=record.verified,
-                        yaws={idx: current_yaws[idx] for idx in range(num_drones)},
-                    )
-                )
-
-            current_positions = [
-                tuple(result.steps[-1].positions[idx]) for idx in range(num_drones)
-            ]
-            _append_in_place_yaw_change_step(
-                steps=combined_steps,
-                positions=current_positions,
-                yaws=final_yaws,
-            )
-            current_yaws = list(final_yaws)
-            return_success = result.success
-            success = success and return_success
-
-        phase_summaries.append(
-            {
-                "name": "return-to-initial",
-                "arrivalStep": combined_steps[-1].step,
-                "arrivalTimeMs": combined_steps[-1].step * duration_ms,
-                "holdMs": 0,
-                "holdSteps": 0,
                 "endStep": combined_steps[-1].step,
                 "endTimeMs": combined_steps[-1].step * duration_ms,
-                "success": return_success,
+                "success": True,
             }
         )
 
+    def run_segment(targets, label: str) -> None:
+        nonlocal current_positions, segment_counter
+        if _positions_match(current_positions, targets):
+            current_positions = [tuple(t) for t in targets]
+            return
+        current_positions = _extend_with_solver_run(
+            combined_steps,
+            current_positions,
+            targets,
+            step_size=step_size,
+            seed=_segment_seed(seed, segment_counter),
+            min_z=min_z,
+            current_yaws=current_yaws,
+            label=label,
+        )
+        segment_counter += 1
+
+    # ── staging: move from the hover line-up into the grid ──────────────
+    if staging_targets is not None:
+        run_segment(staging_targets, "staging-grid")
+        summarize("staging-grid", combined_steps[-1].step, 0, 0)
+
+    # ── requested formation phases ───────────────────────────────────────
+    for phase_index, phase in enumerate(phases):
+        name = str(phase.get("name", f"phase-{phase_index + 1}"))
+        targets = _phase_targets(phase, num_drones)
+        target_yaws = _phase_target_yaws(phase, num_drones)
+
+        run_segment(targets, name)
+        arrival_step = combined_steps[-1].step
+
+        hold_ms = int(phase.get("holdMs", 0))
+        hold_steps = ceil(hold_ms / duration_ms) if hold_ms > 0 else 0
+        current_yaws = _append_yaw_transition(
+            combined_steps,
+            current_positions,
+            current_yaws,
+            target_yaws,
+            duration_sec=duration_sec,
+            max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+            min_steps=hold_steps,
+        )
+
+        # Reset yaw to neutral before the next translation (if any actually
+        # moves the fleet), so all cruising happens at a known heading.
+        if phase_index < len(phases) - 1:
+            next_targets = _phase_targets(phases[phase_index + 1], num_drones)
+            moves_next = not _positions_match(current_positions, next_targets)
+        else:
+            moves_next = return_to_initial and not _positions_match(
+                current_positions, original_initials
+            )
+        if moves_next and not _yaw_lists_match(current_yaws, neutral_yaws):
+            current_yaws = _append_yaw_transition(
+                combined_steps,
+                current_positions,
+                current_yaws,
+                neutral_yaws,
+                duration_sec=duration_sec,
+                max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+            )
+
+        summarize(name, arrival_step, hold_ms, hold_steps)
+
+    # ── return to the staging hover positions ────────────────────────────
+    final_targets = (
+        original_initials
+        if return_to_initial
+        else [tuple(t) for t in _phase_targets(phases[-1], num_drones)]
+    )
+    if return_to_initial:
+        run_segment(original_initials, "return-to-start")
+        arrival_step = combined_steps[-1].step
+        if not _yaw_lists_match(current_yaws, original_yaws):
+            current_yaws = _append_yaw_transition(
+                combined_steps,
+                current_positions,
+                current_yaws,
+                original_yaws,
+                duration_sec=duration_sec,
+                max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+            )
+        summarize("return-to-start", arrival_step, 0, 0)
+
     drones = [
-        Drone(drone_id=idx, initial=original_initials[idx], target=final_targets[idx])
+        Drone(
+            drone_id=idx,
+            initial=tuple(original_initials[idx]),
+            target=tuple(final_targets[idx]),
+        )
         for idx in range(num_drones)
     ]
     for idx, drone in enumerate(drones):
@@ -695,10 +865,126 @@ def _plan_formation_phases(
             steps=combined_steps,
             total_steps=combined_steps[-1].step,
             drones=drones,
-            success=success,
+            success=True,
         ),
         phase_summaries,
     )
+
+
+# ── shared request helpers ───────────────────────────────────────────────
+
+
+async def _fetch_uav_params_for_validation(validation_payload: dict) -> dict:
+    """Fetch validator-declared firmware params from the first UAV."""
+    uav_params: dict = {}
+    param_names = collect_required_params()
+    if param_names and app is not None:
+        try:
+            from flockwave.server.model.uav import UAV
+
+            uav_ids = sorted(app.object_registry.ids_by_type(UAV))
+            if uav_ids:
+                first_uav = app.object_registry.find_by_id(uav_ids[0])
+                uav_params = await fetch_required_params(
+                    first_uav, param_names, log=log
+                )
+                validation_payload["param_source_uav"] = uav_ids[0]
+        except Exception as exc:
+            if log:
+                log.warning(f"Could not fetch UAV parameters for validation: {exc}")
+            validation_payload["param_fetch_error"] = str(exc)
+    return uav_params
+
+
+def _resolve_output_dir(requested: Optional[str]):
+    """Resolve the output directory, refusing paths outside the base dir.
+
+    Returns ``(path, None)`` or ``(None, error_response)``.
+    """
+    base = Path(output_base_dir) if output_base_dir else Path.cwd().parent
+    if requested is None or requested == "":
+        return base, None
+    candidate = Path(requested)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return None, (
+            jsonify(
+                {
+                    "error": (
+                        "'output_dir' must be a relative subdirectory (no "
+                        "absolute paths or '..'); files are stored under the "
+                        "server's configured output directory"
+                    )
+                }
+            ),
+            400,
+        )
+    return base / candidate, None
+
+
+def _verification_failure_response(violations: list[dict], validation_payload: dict):
+    return (
+        jsonify(
+            {
+                "error": (
+                    "Trajectory verification failed: drones violate the "
+                    "collision envelope in the generated show"
+                ),
+                "code": "VERIFICATION_FAILED",
+                "details": {"violations": violations},
+                "validation": validation_payload,
+            }
+        ),
+        422,
+    )
+
+
+def _planning_failure_response(exc: PlanningError, validation_payload: dict):
+    return (
+        jsonify(
+            {
+                "error": str(exc),
+                "code": "PLANNING_FAILED",
+                "details": exc.details,
+                "validation": validation_payload,
+            }
+        ),
+        422,
+    )
+
+
+def _limit_failure_response(exc: Exception, validation_payload: dict):
+    return (
+        jsonify(
+            {
+                "error": str(exc),
+                "code": "TRAJECTORY_LIMIT_EXCEEDED",
+                "validation": validation_payload,
+            }
+        ),
+        422,
+    )
+
+
+def _build_and_verify_shows(build_fn, smoothing: float):
+    """Build show dicts and run the final verification gate (sync, threaded).
+
+    ``build_fn(smoothing)`` must return the show dicts. When the smoothed
+    show fails verification the build is retried without smoothing; if even
+    that fails, the violations are returned so the caller can abort.
+
+    Returns ``(show_dicts, violations, applied_smoothing)``.
+    """
+    show_dicts = build_fn(smoothing)
+    violations = verify_show_dicts(show_dicts)
+    if not violations:
+        return show_dicts, [], smoothing
+    if smoothing > 0.0:
+        fallback_dicts = build_fn(0.0)
+        fallback_violations = verify_show_dicts(fallback_dicts)
+        if not fallback_violations:
+            return fallback_dicts, [], 0.0
+        return fallback_dicts, fallback_violations, 0.0
+    return show_dicts, violations, smoothing
 
 
 # ── Path delivery (pre-built per-drone paths) ────────────────────────────
@@ -745,10 +1031,11 @@ def _validate_delivery_drones(drones):
 async def _handle_path_delivery(body: dict):
     """Turn a pre-built per-drone ``drones`` payload into a show.
 
-    Unlike ``/plan``'s solver mode, the paths are already decided by the caller
-    (the 3D view's "path delivery"); we only re-time them, apply the global
-    velocity smoothing and package the result as ``.skyc`` (and optionally
-    upload it), reusing the same machinery as the generated shows.
+    The paths are already decided by the caller (the 3D view's "path
+    delivery"); this re-times them, applies velocity smoothing, wraps them
+    with takeoff/landing segments and packages the result — but only after
+    they pass the same validators and the same spatio-temporal verification
+    gate as generated shows.
     """
     drones = body.get("drones")
     err = _validate_delivery_drones(drones)
@@ -759,18 +1046,10 @@ async def _handle_path_delivery(body: dict):
     if not (0.0 <= smoothing <= 1.0):
         return jsonify({"error": "'velocity_smoothing' must be between 0 and 1"}), 400
 
-    # Ground-wait before the show; enforce the same minimum as generation so the
-    # firmware does not reject a zero/short takeoff time.
     takeoff_time = float(body.get("takeoff_time", 0.0))
-    if takeoff_time < 5.0:
-        takeoff_time = 5.0
-
-    coordinate_system = body.get("coordinate_system") or None
-    amsl_reference = body.get("amsl_reference")
-    if coordinate_system is None:
-        coordinate_system = _derive_coordinate_system_from_first_uav()
-    if amsl_reference is None:
-        amsl_reference = _derive_amsl_reference_from_first_uav()
+    takeoff_time_adjusted = takeoff_time < MIN_TAKEOFF_TIME
+    if takeoff_time_adjusted:
+        takeoff_time = MIN_TAKEOFF_TIME
 
     # Normalize initial_position to a plain [x, y, z] list (dict form accepted).
     normalized: list[dict] = []
@@ -782,28 +1061,93 @@ async def _handle_path_delivery(body: dict):
             {
                 "id": d.get("id"),
                 "initial_position": [float(ip[0]), float(ip[1]), float(ip[2])],
+                "ground_z": float(d.get("ground_z", 0.0)),
                 "path": d["path"],
             }
         )
 
-    show_dicts = build_delivery_show_dicts(
-        normalized,
-        takeoff_time=takeoff_time,
-        coordinate_system=coordinate_system,
-        amsl_reference=amsl_reference,
-        velocity_smoothing=smoothing,
-    )
+    # Pre-flight validators (same pipeline as generated plans); the min-alt
+    # validator scans drones[].path via the request body. Airborne initial
+    # positions participate as "initial".
+    skip_validation = bool(body.get("skip_validation", False))
+    validation_payload: dict = {"skipped": skip_validation, "issues": []}
+    if not skip_validation:
+        uav_params = await _fetch_uav_params_for_validation(validation_payload)
+        ctx = ValidationContext(
+            initial=[
+                d["initial_position"]
+                for d in normalized
+                if d["initial_position"][2] > d["ground_z"]
+            ],
+            target=[],
+            step_size=0.0,
+            duration_ms=0,
+            takeoff_time=takeoff_time,
+            uav_params=uav_params,
+            body=body,
+        )
+        issues = run_validators(ctx)
+        validation_payload["issues"] = [i.to_dict() for i in issues]
+        validation_payload["params"] = dict(uav_params)
+        blocking = [i for i in issues if i.severity == SEVERITY_ERROR]
+        if blocking:
+            return (
+                jsonify(
+                    {
+                        "error": "Path validation failed",
+                        "code": "VALIDATION_FAILED",
+                        "validation": validation_payload,
+                    }
+                ),
+                422,
+            )
+
+    coordinate_system = body.get("coordinate_system") or None
+    amsl_reference = body.get("amsl_reference")
+    if coordinate_system is None:
+        coordinate_system = _derive_coordinate_system_from_first_uav()
+    if amsl_reference is None:
+        amsl_reference = _derive_amsl_reference_from_first_uav()
+
+    def build(smoothing_value: float):
+        return build_delivery_show_dicts(
+            normalized,
+            takeoff_time=takeoff_time,
+            coordinate_system=coordinate_system,
+            amsl_reference=amsl_reference,
+            velocity_smoothing=smoothing_value,
+            geofence=body.get("geofence"),
+        )
+
+    try:
+        show_dicts, violations, applied_smoothing = await to_thread.run_sync(
+            lambda: _build_and_verify_shows(build, smoothing)
+        )
+    except TrajectoryLimitError as exc:
+        return _limit_failure_response(exc, validation_payload)
+
+    if violations:
+        return _verification_failure_response(violations, validation_payload)
 
     output: dict = {
         "success": True,
         "mode": "path_delivery",
         "num_drones": len(show_dicts),
+        "validation": validation_payload,
+        "verification": {"checked": True, "violations": 0},
+        "smoothing": {"requested": smoothing, "applied": applied_smoothing},
     }
+    if takeoff_time_adjusted:
+        output["adjustments"] = {"takeoff_time": takeoff_time}
 
-    # Delivery does not upload by default (the UI's action is a .skyc download);
-    # honour an explicit auto_upload if the caller asks for it.
+    # Delivery does not upload by default (the UI's action is a .skyc
+    # download); honour an explicit auto_upload once verification has passed.
     if bool(body.get("auto_upload", False)):
-        output["upload"] = await _upload_show_dicts(show_dicts)
+        output["upload"] = await _upload_show_dicts(
+            show_dicts,
+            explicit_uav_ids=body.get("uav_ids"),
+            origin_available=coordinate_system is not None,
+        )
 
     output_type = str(body.get("output", "skyc")).lower()
     if output_type not in ("path", "show", "skyc"):
@@ -841,8 +1185,7 @@ async def plan():
         return jsonify({"error": "Request body must be valid JSON"}), 400
 
     # Path *delivery* mode: the caller supplies ready-made per-drone paths
-    # (the 3D view's "path delivery") instead of initial/target/phases to solve.
-    # Handled separately so the two payload shapes don't get cross-validated.
+    # (the 3D view's "path delivery") instead of initial/target/phases.
     if body.get("drones") is not None:
         return await _handle_path_delivery(body)
 
@@ -889,17 +1232,11 @@ async def plan():
 
     # --- optional parameters ---
     step_size: float = float(body.get("step_size", 1.0))
-    # Time per solver step (i.e. for one `step_size` worth of horizontal
-    # motion). 5000 ms keeps horizontal speed below the ArduPilot DRONE_SHOW
-    # firmware acceptance limits and avoids reload rejection on small shows.
-    duration_ms: int = int(body.get("duration_ms", 5000))
+    duration_ms: int = int(body.get("duration_ms", DEFAULT_DURATION_MS))
     seed: Optional[int] = body.get("seed")
     max_yaw_rate_deg_s: float = float(
         body.get("max_yaw_rate_deg_s", DEFAULT_MAX_YAW_RATE_DEG_S)
     )
-    # Velocity-smoothing strength. Defaults to the extension-wide value set from
-    # the config UI (`velocity_smoothing` global); a request may override it for
-    # a single plan, but the intended control surface is the global default.
     smoothing: float = float(body.get("velocity_smoothing", velocity_smoothing))
 
     if step_size <= 0:
@@ -910,94 +1247,97 @@ async def plan():
         return jsonify({"error": "'max_yaw_rate_deg_s' must be > 0"}), 400
     if not (0.0 <= smoothing <= 1.0):
         return jsonify({"error": "'velocity_smoothing' must be between 0 and 1"}), 400
-    initial_altitude: float = float(
-        body.get("initial_altitude", body.get("takeoff_altitude", 2.5))
-    )
-    if uses_phases and initial_altitude <= 0:
-        return jsonify({"error": "'initial_altitude' must be > 0"}), 400
-    planning_initial = (
-        [[point[0], point[1], max(point[2], initial_altitude)] for point in initial]
-        if uses_phases
-        else initial
-    )
-    if uses_phases:
-        spacing_error = _validate_phase_spacing(
-            initial=planning_initial,
-            phases=phases,
+
+    # Staging parameters: hover altitude above each drone's ground position
+    # and the grid spacing. ``initial_altitude`` is accepted as a legacy
+    # alias for the staging altitude.
+    staging_grid: bool = bool(body.get("staging_grid", uses_phases))
+    staging_altitude: float = float(
+        body.get(
+            "staging_altitude",
+            body.get("initial_altitude", body.get("takeoff_altitude", DEFAULT_STAGING_ALTITUDE)),
         )
-        if spacing_error is not None:
-            return spacing_error
+    )
+    grid_spacing: float = float(body.get("grid_spacing", DEFAULT_GRID_SPACING))
+    if uses_phases and staging_altitude <= 0:
+        return jsonify({"error": "'staging_altitude' must be > 0"}), 400
+    if staging_grid and not uses_phases:
+        return (
+            jsonify(
+                {
+                    "error": (
+                        "'staging_grid' is only supported together with "
+                        "'phases'; point-to-point requests treat 'initial' "
+                        "as in-air positions"
+                    )
+                }
+            ),
+            400,
+        )
+    if grid_spacing < PLANNED_XY_CLEARANCE:
+        return (
+            jsonify(
+                {
+                    "error": (
+                        f"'grid_spacing' of {grid_spacing} m is below the "
+                        f"required clearance of {PLANNED_XY_CLEARANCE:.2f} m"
+                    )
+                }
+            ),
+            400,
+        )
 
-    # --- optional: output directory & takeoff_time ---
+    # --- takeoff time & output directory ---
     takeoff_time: float = float(body.get("takeoff_time", 0.0))
-
-    # Skybrush firmware tends to silently reject very short shows or shows
-    # with a zero takeoff time. Force a sensible minimum so the drone has
-    # a ground-wait segment in front of the trajectory.
-    MIN_TAKEOFF_TIME = 5.0
-    if takeoff_time < MIN_TAKEOFF_TIME:
+    takeoff_time_adjusted = takeoff_time < MIN_TAKEOFF_TIME
+    if takeoff_time_adjusted:
         takeoff_time = MIN_TAKEOFF_TIME
 
-    # Default output dir: parent of the CWD where the server was launched.
-    # e.g. if launched from skybrush-server/, output goes to its parent (DCS/).
-    default_output = str(Path.cwd().parent)
-    output_dir: str = body.get("output_dir", default_output)
+    output_dir, output_dir_error = _resolve_output_dir(body.get("output_dir"))
+    if output_dir_error is not None:
+        return output_dir_error
 
-    # Whether to auto-upload the generated show to connected UAVs
     auto_upload: bool = body.get("auto_upload", True)
 
-    # Optional coordinate system for the show (required for real drones).
-    # Default: local NWU at lon=0, lat=0
     coordinate_system: Optional[dict] = body.get("coordinate_system", None)
-
-    # Optional AMSL reference (in meters). When set, the firmware
-    # interprets the trajectory Z as offsets from this absolute altitude
-    # instead of as relative-to-home. The Skybrush Live "Outdoor
-    # Environment" editor sets the same field as ``amslReference``.
     amsl_reference: Optional[float] = body.get("amsl_reference", None)
-
-    # Resolve the coordinate system *now* (before the solver runs) so that
-    # both the on-disk ``.skyb`` files and the per-drone MAVFTP upload use
-    # the same origin. Without this the saved files would have origin
-    # (0, 0) while the drone receives a real GPS origin — i.e. the saved
-    # file could not be replayed against the same drone afterwards.
+    # Resolve the coordinate system *now* so that the on-disk files and the
+    # MAVFTP upload share the same origin.
     if coordinate_system is None:
         coordinate_system = _derive_coordinate_system_from_first_uav()
-
-    # Same trick for the AMSL reference: derive it from the first UAV so
-    # the show is uploaded with a real ``amslReference`` rather than the
-    # firmware sentinel ``SHOW_ORIGIN_AMSL = -32768000`` (= "no AMSL").
     if amsl_reference is None:
         amsl_reference = _derive_amsl_reference_from_first_uav()
 
+    # --- staging geometry -------------------------------------------------
+    if uses_phases:
+        ground_positions = [list(point) for point in initial]
+        hover_positions = [
+            [point[0], point[1], point[2] + staging_altitude]
+            for point in ground_positions
+        ]
+        if staging_grid:
+            grid_slots = _staging_grid_slots(hover_positions, grid_spacing)
+            staging_targets = _assign_grid_slots(hover_positions, grid_slots)
+        else:
+            grid_slots = []
+            staging_targets = None
+        planning_start = hover_positions
+    else:
+        ground_positions = None
+        hover_positions = []
+        grid_slots = []
+        staging_targets = None
+        planning_start = initial
+
     # --- pre-flight validation -------------------------------------------
-    # Validators inspect the request payload together with parameters
-    # fetched from the first connected UAV. Any "error"-severity issue
-    # blocks the request with HTTP 422; warnings are returned but do not
-    # block. Set ``"skip_validation": true`` in the body to bypass.
     skip_validation: bool = bool(body.get("skip_validation", False))
     validation_payload: dict = {"skipped": skip_validation, "issues": []}
+    uav_params: dict = {}
     if not skip_validation:
-        uav_params: dict = {}
-        param_names = collect_required_params()
-        if param_names and app is not None:
-            try:
-                from flockwave.server.model.uav import UAV
-
-                uav_ids = sorted(app.object_registry.ids_by_type(UAV))
-                if uav_ids:
-                    first_uav = app.object_registry.find_by_id(uav_ids[0])
-                    uav_params = await fetch_required_params(
-                        first_uav, param_names, log=log
-                    )
-                    validation_payload["param_source_uav"] = uav_ids[0]
-            except Exception as exc:
-                if log:
-                    log.warning(f"Could not fetch UAV parameters for validation: {exc}")
-                validation_payload["param_fetch_error"] = str(exc)
+        uav_params = await _fetch_uav_params_for_validation(validation_payload)
 
         ctx = ValidationContext(
-            initial=planning_initial,
+            initial=planning_start,
             target=target,
             step_size=step_size,
             duration_ms=duration_ms,
@@ -1022,7 +1362,52 @@ async def plan():
                 422,
             )
 
-    # --- run solver ---
+    # Altitude floor for the solver: the firmware's minimum show altitude
+    # (or its fallback). Detours and every planned waypoint stay above it.
+    min_z, min_z_source = resolve_min_alt(uav_params)
+    validation_payload["altitude_floor"] = {"min_z": min_z, "source": min_z_source}
+    if uses_phases and staging_altitude + 1e-9 < min_z:
+        return (
+            jsonify(
+                {
+                    "error": (
+                        f"'staging_altitude' of {staging_altitude} m is below "
+                        f"the minimum flight altitude of {min_z} m"
+                    ),
+                    "code": "BELOW_ALTITUDE_FLOOR",
+                    "validation": validation_payload,
+                }
+            ),
+            422,
+        )
+
+    # --- spacing & altitude feasibility (both modes) ----------------------
+    spacing_groups: list[tuple[str, Sequence]] = []
+    floor_groups: list[tuple[str, Sequence]] = []
+    if uses_phases:
+        spacing_groups.append(("staging-hover", hover_positions))
+        floor_groups.append(("staging-hover", hover_positions))
+        if staging_targets is not None:
+            spacing_groups.append(("staging-grid", staging_targets))
+        for phase_index, phase in enumerate(phases):
+            targets = _phase_targets(phase, len(initial))
+            label = f"phases[{phase_index}]:{phase.get('name') or f'phase-{phase_index + 1}'}"
+            spacing_groups.append((label, targets))
+            floor_groups.append((label, targets))
+    else:
+        spacing_groups.append(("initial", initial))
+        spacing_groups.append(("target", target))
+        floor_groups.append(("initial", initial))
+        floor_groups.append(("target", target))
+
+    spacing_error = _validate_point_group_spacing(spacing_groups)
+    if spacing_error is not None:
+        return spacing_error
+    floor_error = _altitude_floor_error(floor_groups, min_z)
+    if floor_error is not None:
+        return floor_error
+
+    # --- yaw setup ---------------------------------------------------------
     initial_yaws: list[float] | None = None
     if uses_phases:
         try:
@@ -1032,100 +1417,134 @@ async def plan():
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
 
-    if uses_phases:
-        result, phase_summaries = _plan_formation_phases(
-            initial=planning_initial,
-            phases=phases,
-            step_size=step_size,
-            duration_ms=duration_ms,
-            seed=seed,
-            return_to_initial=bool(body.get("return_to_initial", True)),
-            min_z=initial_altitude,
-            initial_yaws=initial_yaws,
-        )
-    else:
-        initials = [tuple(p) for p in initial]
-        targets = [tuple(p) for p in target]
-
+    # --- run the solver in a worker thread ---------------------------------
+    def run_planning():
+        if uses_phases:
+            return _plan_formation_phases(
+                start_positions=planning_start,
+                phases=phases,
+                step_size=step_size,
+                duration_ms=duration_ms,
+                seed=seed,
+                return_to_initial=bool(body.get("return_to_initial", True)),
+                min_z=min_z,
+                initial_yaws=initial_yaws,
+                max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+                staging_targets=staging_targets,
+            )
         solver = PathSolver(
-            initials=initials,
-            targets=targets,
+            initials=[tuple(p) for p in initial],
+            targets=[tuple(p) for p in target],
             step_size=step_size,
             seed=seed,
+            min_z=min_z,
         )
         result = solver.solve()
-        phase_summaries = []
+        if not result.success:
+            raise PlanningError(
+                f"planning failed: {result.failure_reason}",
+                details={
+                    "reason": result.failure_reason,
+                    "stuck_drones": [
+                        f"drone-{i + 1}" for i in result.stuck_drones
+                    ],
+                    "steps_completed": result.total_steps,
+                },
+            )
+        return result, []
 
-    # --- build response ---
-    output = build_output(result, duration_ms)
-    output["success"] = result.success
-    output["total_steps"] = result.total_steps
-    output["validation"] = validation_payload
-    if uses_phases:
-        output["mode"] = "formation_phases"
-        output["phases"] = phase_summaries
-        output["ground_initial"] = initial
-        output["initial_altitude"] = initial_altitude
-
-    # --- generate & save Skybrush .skyb files ---
     try:
-        saved = await save_skyb_files(
+        result, phase_summaries = await to_thread.run_sync(run_planning)
+    except PlanningError as exc:
+        if log:
+            log.warning(f"Path planning failed: {exc}")
+        return _planning_failure_response(exc, validation_payload)
+
+    # --- build the shows once, verify, and only then save/upload -----------
+    def build(smoothing_value: float):
+        return build_show_dicts(
             result,
-            output_dir=output_dir,
-            duration_ms=duration_ms,
-            takeoff_time=takeoff_time,
+            duration_ms,
+            takeoff_time,
             coordinate_system=coordinate_system,
             amsl_reference=amsl_reference,
             max_yaw_rate_deg_s=max_yaw_rate_deg_s,
-            velocity_smoothing=smoothing,
+            velocity_smoothing=smoothing_value,
+            ground_positions=ground_positions,
+            geofence=body.get("geofence"),
         )
+
+    try:
+        show_dicts, violations, applied_smoothing = await to_thread.run_sync(
+            lambda: _build_and_verify_shows(build, smoothing)
+        )
+    except TrajectoryLimitError as exc:
+        if log:
+            log.warning(f"Trajectory limit exceeded: {exc}")
+        return _limit_failure_response(exc, validation_payload)
+
+    if violations:
+        if log:
+            log.error(
+                f"Verification gate rejected the generated show "
+                f"({len(violations)} violation(s))"
+            )
+        return _verification_failure_response(violations, validation_payload)
+
+    # --- response scaffolding ----------------------------------------------
+    output = build_output(result, duration_ms)
+    output["success"] = True
+    output["total_steps"] = result.total_steps
+    output["validation"] = validation_payload
+    output["verification"] = {"checked": True, "violations": 0}
+    output["smoothing"] = {"requested": smoothing, "applied": applied_smoothing}
+    if takeoff_time_adjusted:
+        output["adjustments"] = {"takeoff_time": takeoff_time}
+    if uses_phases:
+        output["mode"] = "formation_phases"
+        output["phases"] = phase_summaries
+        output["ground_initial"] = ground_positions
+        output["staging"] = {
+            "enabled": staging_targets is not None,
+            "altitude": staging_altitude,
+            "grid_spacing": grid_spacing,
+            "hover_positions": hover_positions,
+            "grid_slots": [list(slot) for slot in (staging_targets or [])],
+        }
+
+    # --- save Skybrush files (post-verification only) -----------------------
+    try:
+        saved = await save_skyb_files(show_dicts, output_dir=output_dir)
         output["skybrush_files"] = saved
         if log:
             log.info(
                 f"Saved {sum(1 for k in saved if not k.startswith('_'))} "
                 f".skyb file(s) and show.json under {output_dir}"
             )
-            for drone_id, path in saved.items():
-                log.info(f"  {drone_id}: {path}")
     except Exception as exc:
         output["skybrush_files_error"] = str(exc)
         if log:
             log.error(f"Failed to save .skyb files to {output_dir}: {exc}")
 
-    # --- auto-upload show to connected UAVs ---
-    if auto_upload and result.success:
-        upload_results = await _upload_to_connected_uavs(
-            result,
-            duration_ms=duration_ms,
-            takeoff_time=takeoff_time,
-            coordinate_system=coordinate_system,
-            amsl_reference=amsl_reference,
-            max_yaw_rate_deg_s=max_yaw_rate_deg_s,
-            velocity_smoothing=smoothing,
+    # --- auto-upload to connected UAVs (post-verification only) -------------
+    if auto_upload:
+        output["upload"] = await _upload_show_dicts(
+            show_dicts,
+            explicit_uav_ids=body.get("uav_ids"),
+            origin_available=coordinate_system is not None,
         )
-        output["upload"] = upload_results
 
-    # --- optional: return compiled .skyc or show JSON as download ---
+    # --- optional: return compiled .skyc or show JSON as download -----------
     default_output_type = "skyc" if uses_phases else "path"
     output_type = str(body.get("output", default_output_type)).lower()
     if output_type in ("show", "skyc"):
-        output["shows"] = build_show_specifications(
-            result, duration_ms, velocity_smoothing=smoothing
-        )
+        output["shows"] = build_show_specifications(show_dicts)
         output["format"] = "show-upload-v1"
         should_download = bool(body.get("download", output_type == "skyc"))
         if should_download:
             if output_type == "skyc":
                 response = Response(
-                    build_skyc_bytes(
-                        result,
-                        duration_ms,
-                        takeoff_time=takeoff_time,
-                        coordinate_system=coordinate_system,
-                        amsl_reference=amsl_reference,
-                        max_yaw_rate_deg_s=max_yaw_rate_deg_s,
-                        velocity_smoothing=smoothing,
-                    ),
+                    skyc_bytes_from_show_dicts(show_dicts),
                     mimetype="application/zip",
                 )
                 filename = "path-planner.skyc"
@@ -1148,7 +1567,7 @@ async def plan():
     return jsonify(output)
 
 
-# ── Upload helper ────────────────────────────────────────────────────────
+# ── Upload helpers ───────────────────────────────────────────────────────
 
 
 def _derive_coordinate_system_from_first_uav() -> Optional[dict]:
@@ -1163,7 +1582,7 @@ def _derive_coordinate_system_from_first_uav() -> Optional[dict]:
     if app is None:
         return None
 
-    uav_ids = sorted(app.object_registry.ids_by_type(UAV))
+    uav_ids = sorted(app.object_registry.ids_by_type(UAV), key=_natural_sort_key)
     if not uav_ids:
         return None
 
@@ -1175,8 +1594,8 @@ def _derive_coordinate_system_from_first_uav() -> Optional[dict]:
         if log:
             log.warning(
                 f"Could not derive show origin from {uav_ids[0]} "
-                "(no GPS fix yet); saved files and uploads will use "
-                "origin (0, 0)."
+                "(no GPS fix yet); saved files will use origin (0, 0) and "
+                "uploads will be refused."
             )
         return None
 
@@ -1200,7 +1619,7 @@ def _derive_amsl_reference_from_first_uav() -> Optional[float]:
     if app is None:
         return None
 
-    uav_ids = sorted(app.object_registry.ids_by_type(UAV))
+    uav_ids = sorted(app.object_registry.ids_by_type(UAV), key=_natural_sort_key)
     if not uav_ids:
         return None
 
@@ -1236,57 +1655,27 @@ def _derive_amsl_reference_from_first_uav() -> Optional[float]:
     return amsl_value
 
 
-async def _upload_to_connected_uavs(
-    result,
+def _natural_sort_key(value: str):
+    """Sort key treating digit runs numerically, so uav-2 < uav-10."""
+    return [
+        int(token) if token.isdigit() else token
+        for token in re.split(r"(\d+)", value)
+    ]
+
+
+async def _upload_show_dicts(
+    show_dicts: list,
     *,
-    duration_ms: int = 300,
-    takeoff_time: float = 0.0,
-    coordinate_system: Optional[dict] = None,
-    amsl_reference: Optional[float] = None,
-    max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
-    velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
+    explicit_uav_ids: Optional[list] = None,
+    origin_available: bool = True,
 ) -> dict:
-    """Upload per-drone show specs to connected UAVs.
+    """Upload ready-made per-drone show dicts to connected UAVs.
 
-    Looks up all UAVs currently registered in the server's object registry,
-    sorts them by ID, and uploads a show specification to each one
-    (in order, matching drone-1 → first UAV, drone-2 → second UAV, …).
-
-    Returns a summary dict describing what happened for each UAV.
-    """
-    global app, log
-    if app is None:
-        return {"error": "Server app not available"}
-
-    # If the caller did not specify a coordinate system, derive its origin
-    # from the current GPS position of the first connected UAV. Without a
-    # real origin, the firmware will reject the show because the resulting
-    # waypoints land thousands of km away from the drone.
-    if coordinate_system is None:
-        coordinate_system = _derive_coordinate_system_from_first_uav()
-
-    # Same for the AMSL reference: without it the firmware uses the
-    # sentinel "no AMSL" value and the takeoff altitude check fails.
-    if amsl_reference is None:
-        amsl_reference = _derive_amsl_reference_from_first_uav()
-
-    # Build per-drone show dicts (same format Skybrush Live would send)
-    show_dicts = build_show_dicts(
-        result,
-        duration_ms=duration_ms,
-        takeoff_time=takeoff_time,
-        coordinate_system=coordinate_system,
-        amsl_reference=amsl_reference,
-        max_yaw_rate_deg_s=max_yaw_rate_deg_s,
-        velocity_smoothing=velocity_smoothing,
-    )
-    return await _upload_show_dicts(show_dicts)
-
-
-async def _upload_show_dicts(show_dicts: list) -> dict:
-    """Upload ready-made per-drone show dicts to the connected UAVs in order.
-
-    Shared by solver-based planning and pre-built path delivery.
+    Mapping: ``drone-k`` goes to the k-th entry of ``explicit_uav_ids`` when
+    the request provides one, otherwise to the k-th connected UAV in
+    *natural* ID order (uav-2 before uav-10). Uploads are refused entirely
+    when no real show origin is available — a (0, 0) origin would place the
+    waypoints on the far side of the planet.
     """
     from flockwave.server.model.uav import UAV, is_uav
 
@@ -1294,8 +1683,26 @@ async def _upload_show_dicts(show_dicts: list) -> dict:
     if app is None:
         return {"error": "Server app not available"}
 
-    # Gather connected UAV IDs, sorted so assignment is deterministic
-    uav_ids = sorted(app.object_registry.ids_by_type(UAV))
+    if not origin_available:
+        return {
+            "error": (
+                "upload refused: no coordinate system origin available "
+                "(no UAV GPS fix and no 'coordinate_system' in the request)"
+            ),
+            "uploaded": 0,
+            "details": {},
+        }
+
+    if explicit_uav_ids is not None:
+        if not isinstance(explicit_uav_ids, list) or not all(
+            isinstance(uid, str) for uid in explicit_uav_ids
+        ):
+            return {"error": "'uav_ids' must be an array of UAV id strings"}
+        uav_ids = list(explicit_uav_ids)
+    else:
+        uav_ids = sorted(
+            app.object_registry.ids_by_type(UAV), key=_natural_sort_key
+        )
     if not uav_ids:
         return {"error": "No UAVs connected", "uploaded": 0, "details": {}}
 
@@ -1303,8 +1710,8 @@ async def _upload_show_dicts(show_dicts: list) -> dict:
     if len(uav_ids) < num_drones:
         if log:
             log.warning(
-                f"Only {len(uav_ids)} UAV(s) connected but path was planned "
-                f"for {num_drones} drones — uploading to available UAVs only"
+                f"Only {len(uav_ids)} UAV(s) available but the show has "
+                f"{num_drones} drones — uploading to available UAVs only"
             )
 
     details: dict = {}
@@ -1358,10 +1765,16 @@ class PathPlannerExtension(Extension):
         )
         smoothing = max(0.0, min(1.0, smoothing))
 
+        base_dir = str(configuration.get("output_dir", ""))
+
         with ExitStack() as stack:
             stack.enter_context(
                 overridden(
-                    globals(), app=app, log=logger, velocity_smoothing=smoothing
+                    globals(),
+                    app=app,
+                    log=logger,
+                    velocity_smoothing=smoothing,
+                    output_base_dir=base_dir,
                 )
             )
             stack.enter_context(http_server.mounted(blueprint, path=route))
@@ -1392,16 +1805,26 @@ schema = {
             "title": "Velocity smoothing",
             "description": (
                 "How much to ease the speed up/down between waypoints, from 0 "
-                "to 1. 0 keeps the old constant-velocity motion (abrupt start "
-                "and stop at every waypoint). Any value above 0 ramps the speed "
-                "smoothly to/from zero at the start, end and every hold; larger "
-                "values also slow the drone down more at direction-change "
-                "corners (1 = come to a full stop at each corner). Applies to "
-                "every generated path."
+                "to 1. 0 keeps constant-velocity motion (abrupt start and stop "
+                "at every waypoint). Any value above 0 ramps the speed "
+                "smoothly to/from zero at the start, end and every hold; "
+                "larger values also slow the drone down more at "
+                "direction-change corners (1 = come to a full stop at each "
+                "corner). Applies to every generated path."
             ),
             "minimum": 0,
             "maximum": 1,
             "default": DEFAULT_VELOCITY_SMOOTHING,
+        },
+        "output_dir": {
+            "type": "string",
+            "title": "Output directory",
+            "description": (
+                "Base directory where generated .skyb/show.json files are "
+                "stored. Requests may only select subdirectories of this. "
+                "Empty means the parent of the server's working directory."
+            ),
+            "default": "",
         },
     }
 }

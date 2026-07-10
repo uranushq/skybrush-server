@@ -1,13 +1,37 @@
 """Per-drone collision volumes for path planning.
 
-Each drone is modelled as:
+Physical model
+--------------
+Each drone is modelled as a **body AABB** plus four **motor-wake AABBs**
+(one tilted cylindrical wake per motor, conservatively approximated by an
+axis-aligned box). This detailed model is what gets reported in API error
+payloads via :func:`describe_collision_envelope`.
 
-- **Body AABB** — axis-aligned box centered on the drone reference point.
-- **Wake AABBs** — four tilted cylindrical wakes (one per motor), each
-  conservatively approximated by an axis-aligned bounding box.
+Checking envelope
+-----------------
+All collision *checks* use a single, **yaw-invariant bounding envelope**
+derived from the detailed model: a box whose horizontal half-side is the
+horizontal circumradius of every component corner and whose vertical extent
+covers every component. Because the horizontal cross-section is a square that
+circumscribes the model under any rotation, the check result does not depend
+on the commanded yaw of either drone — important now that shows carry yaw
+setpoints.
 
-Collision is detected when **any** body/wake component of one drone overlaps
-**any** component of another.
+Planning margin
+---------------
+The solver checks the envelope inflated by :data:`PLANNING_MARGIN` on every
+side. Velocity smoothing (see ``converter``) re-times each drone along its
+own path with a bounded schedule deviation of at most ~9.7% of one solver
+step; the margin absorbs that deviation (with a lot of slack), so clearances
+proven at plan time still hold for the smoothed trajectories. The final
+verification gate (see ``verify``) re-checks the smoothed trajectories with
+``margin=0`` as a defense in depth.
+
+The swept-motion check (:func:`envelope_overlap_swept`) is **exact** for two
+drones moving linearly and simultaneously: per axis, the relative offset is
+linear in time, so the time interval during which each axis overlaps is
+solved in closed form and the three intervals are intersected. There is no
+sampling and therefore no tunneling.
 """
 
 from __future__ import annotations
@@ -33,6 +57,11 @@ WAKE_ANGLE_DEG = 30.0
 WAKE_LENGTH = 0.5
 WAKE_RADIUS = 0.08
 
+# Margin (meters, per side of each drone's envelope) used for all plan-time
+# collision checks. Must stay well above the velocity-smoothing schedule
+# deviation bound (~0.097 * step_size per drone).
+PLANNING_MARGIN = 0.25
+
 # Legacy names used by the REST API / formation validator
 COLLISION_X = BODY_SIZE_X
 COLLISION_Y = BODY_SIZE_Y
@@ -45,14 +74,6 @@ _HALF_BODY_Y = BODY_SIZE_Y * 0.5
 _HALF_BODY_Z = BODY_SIZE_Z * 0.5
 
 _WAKE_THETA = math.radians(WAKE_ANGLE_DEG)
-
-
-def _axis_overlap(
-    lo_a: float, hi_a: float, lo_b: float, hi_b: float, *, inclusive: bool = False
-) -> bool:
-    if inclusive:
-        return lo_a <= hi_b and lo_b <= hi_a
-    return lo_a < hi_b and lo_b < hi_a
 
 
 def _body_aabb_relative() -> AABB:
@@ -115,48 +136,97 @@ def _combined_aabb_relative(components: tuple[AABB, ...]) -> AABB:
     )
 
 
-def _aabb_overlap(
-    a_min: Sequence[float],
-    a_max: Sequence[float],
-    b_min: Sequence[float],
-    b_max: Sequence[float],
-) -> bool:
-    return (
-        _axis_overlap(a_min[0], a_max[0], b_min[0], b_max[0])
-        and _axis_overlap(a_min[1], a_max[1], b_min[1], b_max[1])
-        and _axis_overlap(a_min[2], a_max[2], b_min[2], b_max[2])
-    )
-
-
-def _world_aabb(center: Sequence[float], rel: AABB) -> AABB:
-    rel_min, rel_max = rel
-    return (
-        (
-            center[0] + rel_min[0],
-            center[1] + rel_min[1],
-            center[2] + rel_min[2],
-        ),
-        (
-            center[0] + rel_max[0],
-            center[1] + rel_max[1],
-            center[2] + rel_max[2],
-        ),
-    )
+def _horizontal_circumradius(components: tuple[AABB, ...]) -> float:
+    """Largest horizontal distance from the reference point to any corner."""
+    radius = 0.0
+    for rel_min, rel_max in components:
+        x = max(abs(rel_min[0]), abs(rel_max[0]))
+        y = max(abs(rel_min[1]), abs(rel_max[1]))
+        radius = max(radius, math.hypot(x, y))
+    return radius
 
 
 _COMPONENT_AABBS = _component_aabbs_relative()
 _COMBINED_MIN_REL, _COMBINED_MAX_REL = _combined_aabb_relative(_COMPONENT_AABBS)
 
+# Yaw-invariant bounding envelope (see module docstring).
+ENVELOPE_XY_HALF = _horizontal_circumradius(_COMPONENT_AABBS)
+ENVELOPE_Z_MIN = _COMBINED_MIN_REL[2]
+ENVELOPE_Z_MAX = _COMBINED_MAX_REL[2]
+ENVELOPE_Z_HEIGHT = ENVELOPE_Z_MAX - ENVELOPE_Z_MIN
+
+# Center-to-center clearance guaranteed between any two drones whose
+# (margin-inflated) envelopes do not overlap. Axis-wise, hence also a lower
+# bound on the Euclidean distance.
+GUARANTEED_XY_CLEARANCE = 2.0 * ENVELOPE_XY_HALF
+PLANNED_XY_CLEARANCE = 2.0 * (ENVELOPE_XY_HALF + PLANNING_MARGIN)
+
+# Conservative "minimum distance" figure for show validation blocks
+# (e.g. the .skyc validation settings), floored to a 0.1 m grid.
+MIN_DISTANCE_FOR_VALIDATION = math.floor(GUARANTEED_XY_CLEARANCE * 10.0) / 10.0
+
+
+def envelope_overlap(
+    a: Sequence[float], b: Sequence[float], *, margin: float = 0.0
+) -> bool:
+    """Yaw-invariant envelope overlap check for two drones at *a* and *b*.
+
+    ``margin`` inflates each drone's envelope on every side; pass
+    :data:`PLANNING_MARGIN` for plan-time checks and 0 for final verification.
+    """
+    if abs(a[0] - b[0]) >= 2.0 * (ENVELOPE_XY_HALF + margin):
+        return False
+    if abs(a[1] - b[1]) >= 2.0 * (ENVELOPE_XY_HALF + margin):
+        return False
+    return abs(a[2] - b[2]) < ENVELOPE_Z_HEIGHT + 2.0 * margin
+
+
+def _axis_overlap_interval(
+    c: float, d: float, half_width: float
+) -> tuple[float, float]:
+    """Time interval within [0, 1] where ``|c + t*d| < half_width``."""
+    if abs(d) < 1e-12:
+        return (0.0, 1.0) if abs(c) < half_width else (1.0, 0.0)
+    t_enter = (-half_width - c) / d
+    t_exit = (half_width - c) / d
+    lo, hi = (t_enter, t_exit) if t_enter <= t_exit else (t_exit, t_enter)
+    return max(lo, 0.0), min(hi, 1.0)
+
+
+def envelope_overlap_swept(
+    a0: Sequence[float],
+    a1: Sequence[float],
+    b0: Sequence[float],
+    b1: Sequence[float],
+    *,
+    margin: float = 0.0,
+) -> bool:
+    """Exact overlap check while both drones move linearly from t=0 to t=1.
+
+    The relative offset on each axis is linear in time, so the overlap window
+    per axis is solved in closed form; a collision exists iff the three
+    windows intersect. No sampling, no tunneling.
+    """
+    lo = 0.0
+    hi = 1.0
+    for axis, half_width in (
+        (0, 2.0 * (ENVELOPE_XY_HALF + margin)),
+        (1, 2.0 * (ENVELOPE_XY_HALF + margin)),
+        (2, ENVELOPE_Z_HEIGHT + 2.0 * margin),
+    ):
+        c = a0[axis] - b0[axis]
+        d = (a1[axis] - a0[axis]) - (b1[axis] - b0[axis])
+        axis_lo, axis_hi = _axis_overlap_interval(c, d, half_width)
+        lo = max(lo, axis_lo)
+        hi = min(hi, axis_hi)
+        if lo >= hi:
+            return False
+    return True
+
 
 def volumes_overlap(a: Sequence[float], b: Sequence[float]) -> bool:
-    """Returns whether any body/wake component of two drones overlaps."""
-    for a_rel in _COMPONENT_AABBS:
-        a_min, a_max = _world_aabb(a, a_rel)
-        for b_rel in _COMPONENT_AABBS:
-            b_min, b_max = _world_aabb(b, b_rel)
-            if _aabb_overlap(a_min, a_max, b_min, b_max):
-                return True
-    return False
+    """Legacy alias: yaw-invariant envelope check with no margin."""
+    return envelope_overlap(a, b)
 
 
 def volumes_overlap_at_times(
@@ -167,18 +237,8 @@ def volumes_overlap_at_times(
     *,
     samples: int = 5,
 ) -> bool:
-    """Conservative check for overlap while both drones move linearly."""
-    if volumes_overlap(a0, b0) or volumes_overlap(a1, b1):
-        return True
-    if samples < 2:
-        return False
-    for i in range(1, samples - 1):
-        t = i / (samples - 1)
-        a = [a0[k] + t * (a1[k] - a0[k]) for k in range(3)]
-        b = [b0[k] + t * (b1[k] - b0[k]) for k in range(3)]
-        if volumes_overlap(a, b):
-            return True
-    return False
+    """Legacy alias: exact swept check (the *samples* argument is ignored)."""
+    return envelope_overlap_swept(a0, a1, b0, b1)
 
 
 def describe_collision_envelope() -> dict[str, float | dict[str, float] | list]:
@@ -213,6 +273,14 @@ def describe_collision_envelope() -> dict[str, float | dict[str, float] | list]:
                 "y": _COMBINED_MAX_REL[1],
                 "z": _COMBINED_MAX_REL[2],
             },
+        },
+        "bounding_envelope": {
+            "xy_half": ENVELOPE_XY_HALF,
+            "z_min": ENVELOPE_Z_MIN,
+            "z_max": ENVELOPE_Z_MAX,
+            "planning_margin": PLANNING_MARGIN,
+            "guaranteed_xy_clearance": GUARANTEED_XY_CLEARANCE,
+            "planned_xy_clearance": PLANNED_XY_CLEARANCE,
         },
         # Kept for backward compatibility with older clients
         "x": COLLISION_X,

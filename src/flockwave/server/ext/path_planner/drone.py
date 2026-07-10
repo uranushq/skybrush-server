@@ -8,6 +8,8 @@ from typing import List, Tuple
 
 Vec3 = Tuple[float, float, float]
 
+_ARRIVAL_EPS = 1e-9
+
 
 @dataclass
 class Drone:
@@ -22,6 +24,7 @@ class Drone:
 
     def __post_init__(self) -> None:
         self.position = list(self.initial)
+        self.arrived = self.remaining_distance() < _ARRIVAL_EPS
 
     # ── helpers ──────────────────────────────────────────────────────────
 
@@ -35,13 +38,13 @@ class Drone:
     # ── movement ─────────────────────────────────────────────────────────
 
     def compute_step_vector(self, step_size: float = 1.0) -> List[float]:
+        """Direction of the next greedy step. Pure — does not mutate state."""
         dx = self.target[0] - self.position[0]
         dy = self.target[1] - self.position[1]
         dz = self.target[2] - self.position[2]
         dist = math.sqrt(dx * dx + dy * dy + dz * dz)
 
-        if dist < 1e-9:
-            self.arrived = True
+        if dist < _ARRIVAL_EPS:
             return [0.0, 0.0, 0.0]
 
         move = min(step_size, dist)
@@ -49,10 +52,11 @@ class Drone:
         return [dx * ratio, dy * ratio, dz * ratio]
 
     def peek_next_position(self, step_size: float = 1.0) -> List[float]:
+        """Position after the next greedy step. Pure — does not mutate state."""
         vec = self.compute_step_vector(step_size)
         return [self.position[i] + vec[i] for i in range(3)]
 
     def apply_move(self, new_pos: List[float]) -> None:
         self.position = list(new_pos)
-        if self.remaining_distance() < 1e-9:
+        if self.remaining_distance() < _ARRIVAL_EPS:
             self.arrived = True

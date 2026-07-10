@@ -5,8 +5,18 @@ Accepts initial and target positions for multiple drones, runs a greedy
 path-planning algorithm, and returns per-drone waypoint paths.
 """
 
-from .extension import construct, description, schema
-
 dependencies = ("http_server",)
 
 __all__ = ("construct", "dependencies", "description", "schema")
+
+
+def __getattr__(name):
+    # Lazy so the algorithm modules (solver, converter, verify, ...) stay
+    # importable without the server runtime deps (quart, trio) — e.g. from
+    # unit tests or offline tooling. The extension manager still finds
+    # construct/description/schema through this hook.
+    if name in ("construct", "description", "schema"):
+        from . import extension
+
+        return getattr(extension, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -32,8 +32,38 @@ __all__ = (
     "VALIDATORS",
     "register_validator",
     "fetch_required_params",
+    "resolve_min_alt",
     "run_validators",
 )
+
+#: Firmware parameter names that may carry the minimum show altitude, in
+#: order of preference, and the fallback used when none is readable.
+DEFAULT_MIN_FLIGHT_ALT_PARAMS: Tuple[str, ...] = (
+    "SHOW_TAKEOFF_ALT_M",
+    "SHOW_MIN_ALT_M",
+)
+DEFAULT_FALLBACK_MIN_ALT = 2.5
+
+
+def resolve_min_alt(
+    params: Mapping[str, float],
+    param_names: Sequence[str] = DEFAULT_MIN_FLIGHT_ALT_PARAMS,
+    fallback: float = DEFAULT_FALLBACK_MIN_ALT,
+) -> Tuple[float, Optional[str]]:
+    """Resolve the effective minimum flight altitude from firmware params.
+
+    Returns ``(min_alt, source_param_name)``; the source is ``None`` when the
+    fallback was used. Shared by :class:`MinFlightAltitudeValidator` and by
+    the extension, which feeds the same value to the solver as its altitude
+    floor (``min_z``) so validation and planning always agree.
+    """
+    for name in param_names:
+        if name in params:
+            try:
+                return float(params[name]), name
+            except (TypeError, ValueError):
+                continue
+    return float(fallback), None
 
 
 # ---------------------------------------------------------------------------
@@ -134,11 +164,8 @@ class MinFlightAltitudeValidator(PathValidator):
 
     def __init__(
         self,
-        param_names: Sequence[str] = (
-            "SHOW_TAKEOFF_ALT_M",
-            "SHOW_MIN_ALT_M",
-        ),
-        fallback_min_alt: float = 2.5,
+        param_names: Sequence[str] = DEFAULT_MIN_FLIGHT_ALT_PARAMS,
+        fallback_min_alt: float = DEFAULT_FALLBACK_MIN_ALT,
     ) -> None:
         self.param_names = tuple(param_names)
         self.fallback_min_alt = float(fallback_min_alt)
@@ -150,13 +177,7 @@ class MinFlightAltitudeValidator(PathValidator):
     def _resolve_min_alt(
         self, params: Mapping[str, float]
     ) -> Tuple[float, Optional[str]]:
-        for name in self.param_names:
-            if name in params:
-                try:
-                    return float(params[name]), name
-                except (TypeError, ValueError):
-                    continue
-        return self.fallback_min_alt, None
+        return resolve_min_alt(params, self.param_names, self.fallback_min_alt)
 
     def validate(self, ctx: ValidationContext) -> Iterable[ValidationIssue]:
         min_alt, source = self._resolve_min_alt(ctx.uav_params)
@@ -174,6 +195,17 @@ class MinFlightAltitudeValidator(PathValidator):
                 if isinstance(phase, Mapping) and isinstance(phase.get("points"), list):
                     point_groups.append(
                         (f"phases[{phase_index}].points", phase["points"])
+                    )
+
+        # Path-delivery payloads carry per-drone waypoint lists instead of
+        # initial/target/phases; their cruise waypoints must respect the
+        # minimum altitude too.
+        drones = ctx.body.get("drones")
+        if isinstance(drones, list):
+            for drone_index, drone in enumerate(drones):
+                if isinstance(drone, Mapping) and isinstance(drone.get("path"), list):
+                    point_groups.append(
+                        (f"drones[{drone_index}].path", drone["path"])
                     )
 
         violations: List[dict] = []

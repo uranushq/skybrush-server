@@ -7,39 +7,54 @@ Output format
     {
       "id": "drone-1",
       "name": "Drone 1",
-      "battery": 100,
-      "status": "Flying",
       "pos": [x, y, z],
       "path": [
-        {"x": ..., "y": ..., "z": ..., "durationMs": 300},
+        {"x": ..., "y": ..., "z": ..., "durationMs": 1000},
         ...
       ]
     },
     ...
   ]
 }
+
+All show-shaped payloads (the ``shows`` response field, the ``.skyc``
+archive, the ``.skyb`` files and the MAVFTP upload) come from the **same**
+per-drone show dicts built once by ``converter.build_show_dicts`` — there is
+no second trajectory builder that could drift out of sync.
 """
 
 from __future__ import annotations
 
+import math
 from io import BytesIO
 from json import dumps
-from typing import Any, List, Optional
+from typing import Any, List
 from zipfile import ZIP_DEFLATED, ZipFile
 
+from .collision_volume import MIN_DISTANCE_FOR_VALIDATION
 from .converter import (
-    DEFAULT_MAX_YAW_RATE_DEG_S,
-    DEFAULT_VELOCITY_SMOOTHING,
-    _apply_velocity_smoothing,
-    build_show_dicts,
+    DEFAULT_DURATION_MS,
+    MAX_VELOCITY_XY,
+    MAX_VELOCITY_Z,
 )
 from .solver import SolverResult
 
-DEFAULT_DURATION_MS = 300
+__all__ = (
+    "build_output",
+    "build_show_specifications",
+    "skyc_bytes_from_show_dicts",
+)
 
 
-def build_output(result: SolverResult, duration_ms: int = DEFAULT_DURATION_MS) -> dict:
-    """Convert a SolverResult into the JSON-serialisable output dict."""
+def build_output(
+    result: SolverResult, duration_ms: int = DEFAULT_DURATION_MS
+) -> dict:
+    """Convert a SolverResult into the JSON-serialisable output dict.
+
+    Consecutive steps at the same position are collapsed into a single
+    entry with an accumulated ``durationMs`` so long holds don't bloat the
+    payload with identical waypoints.
+    """
     drones_out: List[dict] = []
 
     for drone in result.drones:
@@ -49,20 +64,25 @@ def build_output(result: SolverResult, duration_ms: int = DEFAULT_DURATION_MS) -
             if step_rec.step == 0:
                 continue
             step_pos = step_rec.positions[drone.drone_id]
-            path.append(
-                {
-                    "x": round(step_pos[0], 4),
-                    "y": round(step_pos[1], 4),
-                    "z": round(step_pos[2], 4),
-                    "durationMs": duration_ms,
-                }
-            )
+            entry = {
+                "x": round(step_pos[0], 4),
+                "y": round(step_pos[1], 4),
+                "z": round(step_pos[2], 4),
+                "durationMs": duration_ms,
+            }
+            if (
+                path
+                and path[-1]["x"] == entry["x"]
+                and path[-1]["y"] == entry["y"]
+                and path[-1]["z"] == entry["z"]
+            ):
+                path[-1]["durationMs"] += duration_ms
+            else:
+                path.append(entry)
 
         drone_entry = {
             "id": f"drone-{drone.drone_id + 1}",
             "name": f"Drone {drone.drone_id + 1}",
-            "battery": 100,
-            "status": "Flying",
             "pos": [
                 round(drone.initial[0], 4),
                 round(drone.initial[1], 4),
@@ -76,85 +96,44 @@ def build_output(result: SolverResult, duration_ms: int = DEFAULT_DURATION_MS) -
 
 
 def build_show_specifications(
-    result: SolverResult,
-    duration_ms: int = DEFAULT_DURATION_MS,
-    velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
+    show_dicts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Build per-drone show upload payloads compatible with ``__show_upload``."""
-    dt = duration_ms / 1000.0
-    shows: list[dict[str, Any]] = []
+    """Wrap ready-made per-drone show dicts as ``__show_upload`` payloads.
 
-    for drone in result.drones:
-        points: list[list[Any]] = [[0.0, [*drone.initial], []]]
-        t = 0.0
-
-        for step_rec in result.steps:
-            if step_rec.step == 0:
-                continue
-            t = round(t + dt, 3)
-            x, y, z = step_rec.positions[drone.drone_id]
-            points.append([t, [x, y, z], []])
-
-        # Ease the speed up/down instead of jumping to cruise at each waypoint.
-        points = _apply_velocity_smoothing(points, velocity_smoothing)
-
-        shows.append(
-            {
-                "mission": {
-                    "id": f"path-planner-drone-{drone.drone_id + 1}",
-                    "numDrones": 1,
-                },
-                "coordinateSystem": {
-                    "type": "nwu",
-                    "origin": {"lat": 0.0, "lon": 0.0},
-                    "orientation": 0.0,
-                },
-                "home": [*drone.initial],
-                "trajectory": {
-                    "version": 1,
-                    "home": [*drone.initial],
-                    "takeoffTime": 0.0,
-                    "points": points,
-                },
-            }
-        )
-
-    return shows
-
-
-def build_skyc_bytes(
-    result: SolverResult,
-    duration_ms: int = DEFAULT_DURATION_MS,
-    *,
-    takeoff_time: float = 0.0,
-    coordinate_system: Optional[dict] = None,
-    amsl_reference: Optional[float] = None,
-    max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
-    velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
-) -> bytes:
-    """Build a ``.skyc`` ZIP for Skybrush Viewer.
-
-    Uses the same per-drone payload as Live / MAV upload (:func:`build_show_dicts`)
-    and **inlines** trajectories (no ``$ref``), so the reader does not need to
-    resolve JSON references inside the archive.
+    Uses the exact show dicts that are uploaded to the UAVs / saved to disk,
+    so the ``shows`` field of the API response is always identical to what
+    the drones actually receive.
     """
-    show_dicts = build_show_dicts(
-        result,
-        duration_ms,
-        takeoff_time,
-        coordinate_system=coordinate_system,
-        amsl_reference=amsl_reference,
-        max_yaw_rate_deg_s=max_yaw_rate_deg_s,
-        velocity_smoothing=velocity_smoothing,
-    )
-    return skyc_bytes_from_show_dicts(show_dicts)
+    return [
+        {
+            "mission": {
+                "id": f"path-planner-drone-{idx + 1}",
+                "numDrones": 1,
+            },
+            **show_dict,
+        }
+        for idx, show_dict in enumerate(show_dicts)
+    ]
+
+
+def _max_geofence_altitude(show_dicts: list[dict[str, Any]]) -> float:
+    max_alt = 30.0
+    for show_dict in show_dicts:
+        fence = show_dict.get("geofence") or {}
+        try:
+            max_alt = max(max_alt, float(fence.get("maxAltitude", 0.0)))
+        except (TypeError, ValueError):
+            continue
+    return math.ceil(max_alt)
 
 
 def skyc_bytes_from_show_dicts(show_dicts: list[dict[str, Any]]) -> bytes:
     """Pack a list of per-drone show dicts into a ``.skyc`` ZIP for Viewer.
 
-    Shared by :func:`build_skyc_bytes` (solver output) and the pre-built path
-    delivery flow, so both produce identical archive structure.
+    The validation block reuses the same limits the planner enforces
+    (velocity caps from ``converter``, minimum distance from the collision
+    envelope), so the Viewer never flags a show the planner considers safe
+    and vice versa.
     """
     cues = {"version": 1, "items": [{"time": 0.0, "name": "start"}]}
 
@@ -173,10 +152,10 @@ def skyc_bytes_from_show_dicts(show_dicts: list[dict[str, Any]]) -> bytes:
         "settings": {
             "cues": cues,
             "validation": {
-                "maxAltitude": 150,
-                "maxVelocityXY": 8,
-                "maxVelocityZ": 2.5,
-                "minDistance": 3,
+                "maxAltitude": _max_geofence_altitude(show_dicts),
+                "maxVelocityXY": MAX_VELOCITY_XY,
+                "maxVelocityZ": MAX_VELOCITY_Z,
+                "minDistance": MIN_DISTANCE_FOR_VALIDATION,
             },
         },
         "swarm": {"drones": drones_swarm},

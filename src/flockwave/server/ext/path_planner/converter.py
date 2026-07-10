@@ -4,31 +4,61 @@ This module takes a ``SolverResult`` (per-drone waypoint lists produced by
 the greedy path-planning solver) and produces:
 
 1. **Per-drone Skybrush trajectory specification dicts** – the JSON structure
-   that ``TrajectorySpecification`` expects (version 1, linear segments).
+   that ``TrajectorySpecification`` expects (version 1, linear or cubic
+   Bézier segments).
 2. **Per-drone ``.skyb`` binary show files** – the compact binary format that
    can be uploaded to MAVLink drones.
-3. A **combined show JSON file** containing all drone trajectories and a
-   placeholder coordinate system / light program.
+3. A **combined show JSON file** containing all drone trajectories.
 
-All generated files are written to a caller-supplied output directory
-(typically the workspace parent folder).
+Safety contract
+---------------
+The solver proves clearance for *synchronized, constant-speed linear* motion
+using envelopes inflated by ``PLANNING_MARGIN``. Everything this module does
+to the timing must keep each drone within a bounded distance of that nominal
+schedule:
+
+- Velocity smoothing eases the speed **per segment only** for solver output
+  (no collinear-run merging), which bounds the schedule deviation to at most
+  ~9.7% of a single solver step — far below the planning margin.
+- Peak speeds of eased segments are computed in closed form and clamped to
+  ``MAX_VELOCITY_XY`` / ``MAX_VELOCITY_Z``; if a trajectory cannot be eased
+  within the limits it falls back to constant-speed motion, and if even the
+  cruise speed violates the limits a :class:`TrajectoryLimitError` is raised
+  so the request fails loudly instead of producing an unflyable show.
+- Takeoff/landing durations are sized so the **peak** vertical speed (not the
+  average) equals the configured takeoff/landing speed.
+
+The final spatio-temporal verification gate (see ``verify``) re-checks the
+built trajectories independently of these guarantees.
 """
 
 from __future__ import annotations
 
 import json
 import math
-import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 from .solver import SolverResult
 
-# Conservative default for small quadrotors (e.g. Crazyflie) during in-place turns.
+# Single source of truth for the per-step duration default. 1000 ms per
+# 1 m solver step gives a 1 m/s cruise speed; with the default easing the
+# peak speed at ramp segments is 1.5 m/s — far below MAX_VELOCITY_XY, and
+# the per-segment peak clamp enforces the limits regardless of what a
+# request chooses here.
+DEFAULT_DURATION_MS = 1000
+
+# Hard velocity limits enforced on every generated trajectory (m/s). These
+# are also exported into the .skyc validation block so the planner, the
+# firmware expectations and the Viewer validation agree on one set of values.
+MAX_VELOCITY_XY = 8.0
+MAX_VELOCITY_Z = 2.5
+
+# Conservative default for small quadrotors during in-place turns.
 DEFAULT_MAX_YAW_RATE_DEG_S = 90.0
 
 # Default velocity-smoothing strength applied to every generated path. See
-# ``_apply_velocity_smoothing`` for the exact meaning. This is the value used
+# ``apply_velocity_smoothing`` for the exact meaning. This is the value used
 # when the path-planner extension is loaded without an explicit configuration
 # override; the server config UI can adjust it globally.
 DEFAULT_VELOCITY_SMOOTHING = 1.0
@@ -41,19 +71,70 @@ DEFAULT_VELOCITY_SMOOTHING = 1.0
 # near-collinear pass-through and cruise speed is preserved.
 CORNER_ANGLE_THRESHOLD_DEG = 5.0
 
+# Ease makes the peak speed of a start-from-rest/stop-to-rest segment 1.5×
+# its average speed (property of the cubic ease profile).
+_EASE_PEAK_FACTOR = 1.5
+
+
+class TrajectoryLimitError(ValueError):
+    """A generated trajectory cannot satisfy the velocity or yaw-rate limits."""
+
+
+class YawRateError(TrajectoryLimitError):
+    """A yaw change does not fit its time budget at the allowed yaw rate."""
+
 
 # ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
 
 
+def _vertical_segment_duration(
+    altitude_delta: float, speed: float, smoothing: float
+) -> float:
+    """Duration of a vertical climb/descent so its *peak* speed equals *speed*.
+
+    With easing enabled the segment starts and ends at rest, which makes the
+    peak speed 1.5× the average — so the segment must take 1.5× longer for
+    the same peak. Without easing the motion is constant-speed.
+    """
+    if altitude_delta <= 0:
+        return 0.0
+    factor = _EASE_PEAK_FACTOR if smoothing > 0 else 1.0
+    return round(factor * altitude_delta / speed, 4)
+
+
+def _takeoff_landing_profile(
+    first_pos: Sequence[float],
+    last_pos: Sequence[float],
+    ground_start_z: float,
+    ground_end_z: float,
+    takeoff_speed: float,
+    landing_speed: float,
+    smoothing: float,
+) -> tuple[float, float, float, float]:
+    """Shared takeoff/landing math for the trajectory and yaw builders.
+
+    Returns ``(takeoff_alt, takeoff_duration, landing_alt, landing_duration)``.
+    """
+    takeoff_alt = max(0.0, first_pos[2] - ground_start_z)
+    landing_alt = max(0.0, last_pos[2] - ground_end_z)
+    return (
+        takeoff_alt,
+        _vertical_segment_duration(takeoff_alt, takeoff_speed, smoothing),
+        landing_alt,
+        _vertical_segment_duration(landing_alt, landing_speed, smoothing),
+    )
+
+
 def solver_result_to_trajectory_dicts(
     result: SolverResult,
-    duration_ms: int = 300,
+    duration_ms: int = DEFAULT_DURATION_MS,
     takeoff_time: float = 0.0,
     takeoff_speed: float = 1.5,
     landing_speed: float = 1.0,
     velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
+    ground_positions: Optional[Sequence[Sequence[float]]] = None,
 ) -> List[dict]:
     """Convert a *SolverResult* into a list of Skybrush trajectory dicts.
 
@@ -64,8 +145,8 @@ def solver_result_to_trajectory_dicts(
             "version": 1,
             "takeoffTime": <float>,
             "points": [
-                [t, [x, y, z], []],          # first point (no control pts)
-                [t, [x, y, z], []],           # subsequent – linear segment
+                [t, [x, y, z], []],           # linear segment
+                [t, [x, y, z], [c1, c2]],     # eased (cubic Bézier) segment
                 ...
             ]
         }
@@ -78,28 +159,29 @@ def solver_result_to_trajectory_dicts(
         result: output of ``PathSolver.solve()``
         duration_ms: milliseconds per step (from the API request)
         takeoff_time: seconds to wait on the ground before takeoff
-        takeoff_speed: vertical speed during takeoff in m/s
-        landing_speed: vertical speed during landing in m/s
+        takeoff_speed: peak vertical speed during takeoff in m/s
+        landing_speed: peak vertical speed during landing in m/s
         velocity_smoothing: strength of the speed-ramp smoothing in ``[0, 1]``.
-            0 disables it (constant-velocity linear segments, the historical
-            behaviour); any value > 0 replaces the linear segments with cubic
-            Bézier segments whose control points lie *on* the straight line
-            between waypoints, so the path is unchanged but the speed ramps up
-            from / down to zero at the trajectory start, end and every hold.
-            Larger values additionally slow the drone down at direction-change
-            corners (1 = full stop at each corner). See
-            :func:`_apply_velocity_smoothing`.
+            0 disables it; any value > 0 replaces the linear segments with
+            cubic Bézier segments whose control points lie *on* the straight
+            line between waypoints, so the path is unchanged but the speed
+            ramps up from / down to zero at the trajectory start, end and
+            every hold. Larger values additionally slow the drone down at
+            direction-change corners (1 = full stop at each corner).
+        ground_positions: optional per-drone ``[x, y, z]`` ground positions;
+            the z coordinate is used as the ground level for takeoff and
+            landing instead of assuming a flat ground at z=0.
     """
-    num_drones = len(result.drones)
     duration_sec = duration_ms / 1000.0
-
-    # Build per-drone position timelines from the step records.
-    # steps[0] is the initial position (step == 0).
     trajectories: List[dict] = []
 
-    for drone in result.drones:
+    for idx, drone in enumerate(result.drones):
         did = drone.drone_id
         points: List[list] = []
+
+        ground_z = 0.0
+        if ground_positions is not None and idx < len(ground_positions):
+            ground_z = float(ground_positions[idx][2])
 
         # Collect raw waypoints from solver
         raw_points: List[list] = []
@@ -119,20 +201,19 @@ def solver_result_to_trajectory_dicts(
         first_pos = raw_points[0][1]  # [x, y, z]
         last_pos = raw_points[-1][1]
 
-        # Ground position: same x, y but z=0
-        ground_start = [first_pos[0], first_pos[1], 0]
-        ground_end = [last_pos[0], last_pos[1], 0]
+        ground_start = [first_pos[0], first_pos[1], round(ground_z, 4)]
+        ground_end = [last_pos[0], last_pos[1], round(ground_z, 4)]
 
-        # Takeoff duration based on altitude and speed
-        takeoff_alt = abs(first_pos[2])
-        takeoff_duration = (
-            round(takeoff_alt / takeoff_speed, 4) if takeoff_alt > 0 else 0
-        )
-
-        # Landing duration based on altitude and speed
-        landing_alt = abs(last_pos[2])
-        landing_duration = (
-            round(landing_alt / landing_speed, 4) if landing_alt > 0 else 0
+        takeoff_alt, takeoff_duration, _, landing_duration = (
+            _takeoff_landing_profile(
+                first_pos,
+                last_pos,
+                ground_z,
+                ground_z,
+                takeoff_speed,
+                landing_speed,
+                velocity_smoothing,
+            )
         )
 
         # Build full trajectory:
@@ -141,36 +222,31 @@ def solver_result_to_trajectory_dicts(
         # 3) Solver waypoints shifted by takeoff_duration
         # 4) Landing to ground
 
-        # (1) ground start
         points.append([0, ground_start, []])
 
-        # (2) top of takeoff (= first solver position)
         if takeoff_duration > 0:
             points.append([round(takeoff_duration, 4), list(first_pos), []])
 
-        # (3) solver waypoints (time-shifted)
         for raw_pt in raw_points:
             t_shifted = round(raw_pt[0] + takeoff_duration, 4)
             # Skip duplicate of first point (already added as takeoff end)
             if takeoff_duration > 0 and raw_pt is raw_points[0]:
                 continue
             # At ground level, ground_start at t=0 already matches raw_points[0].
-            if takeoff_duration == 0 and raw_pt is raw_points[0] and first_pos[2] == 0:
+            if takeoff_duration == 0 and raw_pt is raw_points[0] and takeoff_alt <= 0:
                 continue
             points.append([t_shifted, list(raw_pt[1]), []])
 
-        # (4) landing to ground
         last_t = points[-1][0]
         if landing_duration > 0:
             points.append([round(last_t + landing_duration, 4), ground_end, []])
 
-        # Optimisation: collapse consecutive identical positions into a
-        # single keyframe (the encoder will produce a constant segment).
+        # Collapse consecutive identical positions into a single constant
+        # segment, then ease the speed. Collinear runs are NOT merged for
+        # solver output: merging would let the schedule deviation grow with
+        # the run length and break the solver's collision guarantees.
         optimised = _collapse_stationary(points)
-
-        # Give the speed a gradient (ease-in / ease-out) so the drone does not
-        # jump from 0 to cruise speed instantly at every waypoint.
-        smoothed = _apply_velocity_smoothing(optimised, velocity_smoothing)
+        smoothed = apply_velocity_smoothing(optimised, velocity_smoothing)
 
         trajectories.append(
             {
@@ -192,11 +268,7 @@ def _normalize_yaw_deg(yaw: float) -> float:
 
 
 def _lerp_yaw_deg(start: float, end: float, fraction: float) -> float:
-    """Linearly interpolate yaw along the shortest path on the circle.
-
-    Setpoints must stay on one continuous branch (no 0/360 wrap) because
-    firmware interpolates yaw linearly between consecutive entries.
-    """
+    """Linearly interpolate yaw along the shortest path on the circle."""
     delta = _yaw_delta_deg(start, end)
     return _normalize_yaw_deg(start + delta * fraction)
 
@@ -204,6 +276,16 @@ def _lerp_yaw_deg(start: float, end: float, fraction: float) -> float:
 def _yaw_delta_deg(start: float, end: float) -> float:
     """Shortest signed yaw change from *start* to *end* in degrees."""
     return (end - start + 180.0) % 360.0 - 180.0
+
+
+# Public aliases for other modules in this package (e.g. the extension's
+# yaw-transition scheduling) so they don't reach into private helpers.
+yaw_delta_deg = _yaw_delta_deg
+
+
+def lerp_yaw_deg(start: float, end: float, fraction: float) -> float:
+    """Public alias of :func:`_lerp_yaw_deg`."""
+    return _lerp_yaw_deg(start, end, fraction)
 
 
 def _append_yaw_setpoint(setpoints: list[list[float]], t: float, yaw: float) -> None:
@@ -225,14 +307,24 @@ def _append_yaw_ramp_setpoints(
     max_yaw_rate_deg_s: float,
     min_segment_s: float = 0.05,
 ) -> float:
-    """Append rate-limited yaw setpoints; return the ramp end time."""
+    """Append yaw setpoints ramping at most *max_yaw_rate_deg_s*.
+
+    Raises :class:`YawRateError` when the change cannot fit *t_budget* at the
+    allowed rate — the rate limit is a hard contract, never silently exceeded.
+    Returns the ramp end time.
+    """
     delta = _yaw_delta_deg(yaw_start, yaw_end)
     if abs(delta) < 1e-9:
         return t_start
 
     needed = abs(delta) / max_yaw_rate_deg_s
-    duration = min(t_budget, needed) if t_budget > 0 else needed
-    duration = max(duration, 0.001)
+    if t_budget > 0 and needed > t_budget + 1e-6:
+        raise YawRateError(
+            f"yaw change of {abs(delta):.1f}° needs {needed:.2f}s at "
+            f"{max_yaw_rate_deg_s:.0f}°/s but only {t_budget:.2f}s is "
+            "available; increase the hold time or lower the yaw change"
+        )
+    duration = max(needed, 0.001)
 
     n_segments = max(1, int(math.ceil(duration / min_segment_s)))
     for i in range(1, n_segments + 1):
@@ -255,14 +347,12 @@ def _yaw_at_step(
 def _apply_takeoff_time_to_yaw_setpoints(
     setpoints: list[list[float]], takeoff_time: float
 ) -> list[list[float]]:
-    """Shift yaw setpoints onto the show-wide timeline used by Skybrush Viewer."""
+    """Shift yaw setpoints onto the show-wide timeline used by Skybrush."""
     if takeoff_time <= 0:
         return setpoints
 
     initial_yaw = setpoints[0][1]
-    shifted = [
-        [round(t + takeoff_time, 4), yaw] for t, yaw in setpoints
-    ]
+    shifted = [[round(t + takeoff_time, 4), yaw] for t, yaw in setpoints]
     if shifted[0][0] > 0:
         shifted.insert(0, [0.0, initial_yaw])
     return shifted
@@ -277,6 +367,8 @@ def build_yaw_control_dict(
     takeoff_speed: float = 1.5,
     landing_speed: float = 1.0,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
+    velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
+    ground_positions: Optional[Sequence[Sequence[float]]] = None,
 ) -> dict[str, Any] | None:
     """Build a Skybrush ``yawControl`` block for one drone.
 
@@ -286,72 +378,63 @@ def build_yaw_control_dict(
     Between setpoints the firmware interpolates yaw linearly.
 
     In-place yaw changes (same position, different yaw) are spread over time
-    according to *max_yaw_rate_deg_s*, up to the solver step interval.
+    according to *max_yaw_rate_deg_s*; changes that cannot fit the available
+    time raise :class:`YawRateError`. Runs in O(number of steps).
     """
+    if max_yaw_rate_deg_s <= 0:
+        raise ValueError("max_yaw_rate_deg_s must be > 0")
     if not result.steps or not any(rec.yaws for rec in result.steps):
         return None
 
     did = result.drones[drone_idx].drone_id
     duration_sec = duration_ms / 1000.0
 
-    raw_points: list[tuple[float, int]] = []
-    for rec in result.steps:
-        t_sec = round(rec.step * duration_sec, 4)
-        raw_points.append((t_sec, rec.step))
+    records = result.steps  # already ordered by step number
+    ground_z = 0.0
+    if ground_positions is not None and drone_idx < len(ground_positions):
+        ground_z = float(ground_positions[drone_idx][2])
 
-    if not raw_points:
-        return None
-
-    first_pos = result.steps[0].positions[did]
-    last_pos = result.steps[-1].positions[did]
-    takeoff_alt = abs(first_pos[2])
-    takeoff_duration = round(takeoff_alt / takeoff_speed, 4) if takeoff_alt > 0 else 0.0
-    landing_alt = abs(last_pos[2])
-    landing_duration = round(landing_alt / landing_speed, 4) if landing_alt > 0 else 0.0
-
-    def yaw_for_step(step: int) -> float:
-        for rec in result.steps:
-            if rec.step == step:
-                return _yaw_at_step(rec.yaws, did)
-        return 0.0
-
-    def position_for_step(step: int) -> list[float] | None:
-        for rec in result.steps:
-            if rec.step == step:
-                pos = rec.positions.get(did)
-                return list(pos) if pos is not None else None
-        return None
-
-    if max_yaw_rate_deg_s <= 0:
-        raise ValueError("max_yaw_rate_deg_s must be > 0")
+    first_pos = records[0].positions[did]
+    last_pos = records[-1].positions[did]
+    takeoff_alt, takeoff_duration, _, landing_duration = _takeoff_landing_profile(
+        first_pos,
+        last_pos,
+        ground_z,
+        ground_z,
+        takeoff_speed,
+        landing_speed,
+        velocity_smoothing,
+    )
 
     setpoints: list[list[float]] = []
 
-    def append_setpoint(t: float, step: int) -> None:
-        _append_yaw_setpoint(setpoints, t, yaw_for_step(step))
+    def yaw_of(rec) -> float:
+        return _yaw_at_step(rec.yaws, did)
 
-    append_setpoint(0.0, 0)
+    _append_yaw_setpoint(setpoints, 0.0, yaw_of(records[0]))
     if takeoff_duration > 0:
-        append_setpoint(takeoff_duration, 0)
+        _append_yaw_setpoint(setpoints, takeoff_duration, yaw_of(records[0]))
 
-    for raw_idx, (t_sec, step) in enumerate(raw_points):
-        t_shifted = round(t_sec + takeoff_duration, 4)
-        if takeoff_duration > 0 and step == 0:
-            continue
-        if takeoff_duration == 0 and step == 0 and first_pos[2] == 0:
-            continue
-        if raw_idx > 0:
-            prev_t_sec, prev_step = raw_points[raw_idx - 1]
-            prev_t_shifted = round(prev_t_sec + takeoff_duration, 4)
-            prev_pos = position_for_step(prev_step)
-            curr_pos = position_for_step(step)
-            prev_yaw = yaw_for_step(prev_step)
-            curr_yaw = yaw_for_step(step)
+    prev_rec = None
+    for rec in records:
+        t_shifted = round(rec.step * duration_sec + takeoff_duration, 4)
+        if rec.step == records[0].step:
+            if takeoff_duration > 0 or takeoff_alt <= 0:
+                prev_rec = rec
+                continue
+        if prev_rec is not None:
+            prev_t_shifted = round(
+                prev_rec.step * duration_sec + takeoff_duration, 4
+            )
+            prev_pos = prev_rec.positions.get(did)
+            curr_pos = rec.positions.get(did)
+            prev_yaw = yaw_of(prev_rec)
+            curr_yaw = yaw_of(rec)
             if (
                 prev_pos is not None
                 and curr_pos is not None
                 and prev_pos == curr_pos
-                and abs(prev_yaw - curr_yaw) > 1e-9
+                and abs(_yaw_delta_deg(prev_yaw, curr_yaw)) > 1e-9
             ):
                 t_budget = max(t_shifted - prev_t_shifted, 0.001)
                 ramp_end = _append_yaw_ramp_setpoints(
@@ -363,13 +446,17 @@ def build_yaw_control_dict(
                     max_yaw_rate_deg_s=max_yaw_rate_deg_s,
                 )
                 if ramp_end < t_shifted - 1e-6:
-                    append_setpoint(t_shifted, step)
+                    _append_yaw_setpoint(setpoints, t_shifted, curr_yaw)
+                prev_rec = rec
                 continue
-        append_setpoint(t_shifted, step)
+        _append_yaw_setpoint(setpoints, t_shifted, yaw_of(rec))
+        prev_rec = rec
 
     last_t = setpoints[-1][0]
     if landing_duration > 0:
-        append_setpoint(last_t + landing_duration, result.steps[-1].step)
+        _append_yaw_setpoint(
+            setpoints, last_t + landing_duration, yaw_of(records[-1])
+        )
 
     if len(setpoints) < 2:
         return None
@@ -389,43 +476,67 @@ def _default_coordinate_system() -> dict:
     return {"type": "nwu", "origin": [0, 0], "orientation": 0}
 
 
-def _assemble_show_dict(
+def derive_geofence(
     trajectory: dict,
-    home: list,
-    coordinate_system: dict,
-    amsl_reference: Optional[float],
+    home: Sequence[float],
+    *,
+    altitude_margin: float = 10.0,
+    distance_margin: float = 20.0,
 ) -> dict:
-    """Wrap a trajectory dict into a full show-specification dict.
+    """Derive a per-drone geofence from the trajectory's actual extents.
 
-    Adds the minimal light program, a permissive default geofence, the home
-    position, the coordinate system and (optionally) the AMSL reference — i.e.
-    everything except the yaw control block, which is caller-specific.
+    The fence hugs the real flight volume plus a margin instead of a fixed
+    "wide enough" constant, so a runaway drone is stopped near the show area.
+    Control points of eased segments lie on the straight line between the
+    keyframes, so keyframe extents already bound the flown path.
     """
-    import base64
-
-    # Minimal light program: a single END (0x00) byte
-    minimal_light = base64.b64encode(b"\x00").decode("ascii")
-
-    # Permissive default geofence so the firmware does not reject the show on
-    # reload because of missing fence info. The values are wide enough not to
-    # interfere with typical small flights.
-    geofence = {
+    points = trajectory.get("points") or []
+    max_alt = 0.0
+    max_dist = 0.0
+    for _t, pos, _ctrl in points:
+        max_alt = max(max_alt, float(pos[2]))
+        max_dist = max(
+            max_dist, math.hypot(pos[0] - home[0], pos[1] - home[1])
+        )
+    return {
         "version": 1,
         "enabled": True,
-        "maxAltitude": 100.0,
-        "maxDistance": 500.0,
+        "maxAltitude": math.ceil(max(30.0, max_alt + altitude_margin)),
+        "maxDistance": math.ceil(max(50.0, max_dist + distance_margin)),
         "minAltitude": -5.0,
         "action": "land",
         "polygons": [],
         "rallyPoints": [],
     }
 
+
+def _assemble_show_dict(
+    trajectory: dict,
+    home: list,
+    coordinate_system: dict,
+    amsl_reference: Optional[float],
+    geofence: Optional[dict] = None,
+) -> dict:
+    """Wrap a trajectory dict into a full show-specification dict.
+
+    Adds the minimal light program, the geofence (derived from the trajectory
+    unless an explicit one is supplied), the home position, the coordinate
+    system and (optionally) the AMSL reference — i.e. everything except the
+    yaw control block, which is caller-specific.
+    """
+    import base64
+
+    # Minimal light program: a single END (0x00) byte
+    minimal_light = base64.b64encode(b"\x00").decode("ascii")
+
     show_dict = {
         "trajectory": trajectory,
         "lights": {"version": 1, "data": minimal_light},
         "home": home,
         "coordinateSystem": coordinate_system,
-        "geofence": geofence,
+        "geofence": geofence
+        if geofence is not None
+        else derive_geofence(trajectory, home),
     }
     # Setting an AMSL reference makes the firmware interpret the trajectory Z
     # coordinates as offsets from this absolute altitude (in meters) rather
@@ -439,47 +550,57 @@ def _assemble_show_dict(
 
 def build_show_dicts(
     result: SolverResult,
-    duration_ms: int = 300,
+    duration_ms: int = DEFAULT_DURATION_MS,
     takeoff_time: float = 0.0,
     coordinate_system: Optional[dict] = None,
     amsl_reference: Optional[float] = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
     velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
+    ground_positions: Optional[Sequence[Sequence[float]]] = None,
+    geofence: Optional[dict] = None,
 ) -> List[dict]:
     """Build a list of full *show specification* dicts (one per drone).
 
     Each dict mirrors what Skybrush Live sends to the server during
-    ``OBJ-CMD`` / ``__show_upload``::
-
-        {
-            "trajectory": { ... },
-            "lights": { "version": 1, "data": "AA==" },
-            "home": [x, y, z],
-            "coordinateSystem": { ... },
-        }
+    ``OBJ-CMD`` / ``__show_upload``. This is the single builder used for
+    saving .skyb files, uploading to UAVs and exporting .skyc, so all three
+    always agree byte-for-byte.
 
     Parameters:
         coordinate_system: optional dict like
             ``{"type": "nwu", "origin": [lon, lat], "orientation": 0}``.
-            Defaults to a WGS-84 origin at ``[0, 0]`` with 0° orientation
-            when *None*.
+        ground_positions: optional per-drone ground ``[x, y, z]`` used for the
+            takeoff/landing profile and as the home position. Defaults to the
+            solver's initial positions.
+        geofence: optional explicit geofence dict; when omitted a per-drone
+            fence is derived from the trajectory extents.
     """
     if coordinate_system is None:
         coordinate_system = _default_coordinate_system()
 
     traj_dicts = solver_result_to_trajectory_dicts(
-        result, duration_ms, takeoff_time, velocity_smoothing=velocity_smoothing
+        result,
+        duration_ms,
+        takeoff_time,
+        velocity_smoothing=velocity_smoothing,
+        ground_positions=ground_positions,
     )
     shows: List[dict] = []
 
     for idx, (drone, traj) in enumerate(zip(result.drones, traj_dicts)):
+        if ground_positions is not None and idx < len(ground_positions):
+            home_src = ground_positions[idx]
+        else:
+            home_src = drone.initial
         home = [
-            round(drone.initial[0], 4),
-            round(drone.initial[1], 4),
-            round(drone.initial[2], 4),
+            round(float(home_src[0]), 4),
+            round(float(home_src[1]), 4),
+            round(float(home_src[2]), 4),
         ]
 
-        show_dict = _assemble_show_dict(traj, home, coordinate_system, amsl_reference)
+        show_dict = _assemble_show_dict(
+            traj, home, coordinate_system, amsl_reference, geofence
+        )
 
         yaw_control = build_yaw_control_dict(
             result,
@@ -487,6 +608,8 @@ def build_show_dicts(
             duration_ms,
             takeoff_time=takeoff_time,
             max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+            velocity_smoothing=velocity_smoothing,
+            ground_positions=ground_positions,
         )
         if yaw_control is not None:
             show_dict["yawControl"] = yaw_control
@@ -500,6 +623,9 @@ def _delivery_drone_to_trajectory_dict(
     drone: dict,
     takeoff_time: float,
     velocity_smoothing: float,
+    *,
+    takeoff_speed: float = 1.5,
+    landing_speed: float = 1.0,
 ) -> dict:
     """Convert one pre-built delivery drone (``{initial_position, path}``) into a
     Skybrush trajectory dict.
@@ -508,12 +634,20 @@ def _delivery_drone_to_trajectory_dict(
     its own ``durationMs`` (time to travel from the previous point to this one)
     and an optional ``holdMs`` (extra time to hover at the point). Unlike the
     solver output there is no global step timeline, so timing is accumulated
-    point-by-point here. Stationary runs are collapsed and the same velocity
-    smoothing as the generated paths is applied so hand-edited paths also ramp
-    their speed up/down instead of jerking between waypoints.
+    point-by-point here.
+
+    When the first point is above the drone's ground level (``ground_z`` field
+    of the drone entry, default 0), a ground start and a peak-speed-limited
+    takeoff segment are prepended, and a matching landing segment is appended,
+    so delivery shows behave like generated shows instead of starting mid-air.
     """
     init = drone.get("initial_position") or [0.0, 0.0, 0.0]
-    start = [round(float(init[0]), 4), round(float(init[1]), 4), round(float(init[2]), 4)]
+    start = [
+        round(float(init[0]), 4),
+        round(float(init[1]), 4),
+        round(float(init[2]), 4),
+    ]
+    ground_z = float(drone.get("ground_z", 0.0))
 
     points: List[list] = [[0.0, start, []]]
     t = 0.0
@@ -536,8 +670,41 @@ def _delivery_drone_to_trajectory_dict(
             t = round(t + hold, 3)
             points.append([t, list(pos), []])
 
+    # Wrap with ground start / takeoff / landing when the path flies above
+    # the ground level.
+    first_pos = points[0][1]
+    last_pos = points[-1][1]
+    takeoff_alt, takeoff_duration, landing_alt, landing_duration = (
+        _takeoff_landing_profile(
+            first_pos,
+            last_pos,
+            ground_z,
+            ground_z,
+            takeoff_speed,
+            landing_speed,
+            velocity_smoothing,
+        )
+    )
+    if takeoff_alt > 0:
+        points = [
+            [0.0, [first_pos[0], first_pos[1], round(ground_z, 4)], []]
+        ] + [[round(pt + takeoff_duration, 4), pos, ctrl] for pt, pos, ctrl in points]
+    if landing_alt > 0:
+        points.append(
+            [
+                round(points[-1][0] + landing_duration, 4),
+                [last_pos[0], last_pos[1], round(ground_z, 4)],
+                [],
+            ]
+        )
+
     optimised = _collapse_stationary(points)
-    smoothed = _apply_velocity_smoothing(optimised, velocity_smoothing)
+    # Delivery paths were not produced by the solver, so there is no
+    # synchronized schedule to preserve; merging collinear runs is allowed
+    # here and the verification gate checks the final result anyway.
+    smoothed = apply_velocity_smoothing(
+        optimised, velocity_smoothing, merge_collinear=True
+    )
 
     return {"version": 1, "takeoffTime": takeoff_time, "points": smoothed}
 
@@ -549,6 +716,7 @@ def build_delivery_show_dicts(
     coordinate_system: Optional[dict] = None,
     amsl_reference: Optional[float] = None,
     velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
+    geofence: Optional[dict] = None,
 ) -> List[dict]:
     """Build per-drone show dicts from a pre-built delivery ``drones`` payload.
 
@@ -565,31 +733,25 @@ def build_delivery_show_dicts(
             drone, takeoff_time, velocity_smoothing
         )
         init = drone.get("initial_position") or [0.0, 0.0, 0.0]
-        home = [round(float(init[0]), 4), round(float(init[1]), 4), round(float(init[2]), 4)]
+        ground_z = float(drone.get("ground_z", 0.0))
+        home = [round(float(init[0]), 4), round(float(init[1]), 4), round(ground_z, 4)]
         shows.append(
-            _assemble_show_dict(traj, home, coordinate_system, amsl_reference)
+            _assemble_show_dict(
+                traj, home, coordinate_system, amsl_reference, geofence
+            )
         )
 
     return shows
 
 
 async def save_skyb_files(
-    result: SolverResult,
+    show_dicts: List[dict],
     output_dir: str | Path,
-    duration_ms: int = 300,
-    takeoff_time: float = 0.0,
-    coordinate_system: Optional[dict] = None,
-    amsl_reference: Optional[float] = None,
-    max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
-    velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
 ) -> Dict[str, str]:
-    """Generate ``.skyb`` files for every drone and save them to *output_dir*.
+    """Save ready-made per-drone show dicts as ``.skyb`` files + ``show.json``.
 
-    Also writes a ``show.json`` containing all drone show specifications.
-
-    The ``coordinate_system`` argument is forwarded to :func:`build_show_dicts`
-    so the JSON saved on disk matches what the drone actually receives over
-    MAVFTP. Pass the same dict you use for the auto-upload step.
+    Takes the exact show dicts that are uploaded to the UAVs, so the files on
+    disk always match what the drones receive over MAVFTP.
 
     Returns a dict mapping drone id strings to their ``.skyb`` file paths.
     """
@@ -600,25 +762,12 @@ async def save_skyb_files(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    show_dicts = build_show_dicts(
-        result,
-        duration_ms,
-        takeoff_time,
-        coordinate_system=coordinate_system,
-        amsl_reference=amsl_reference,
-        max_yaw_rate_deg_s=max_yaw_rate_deg_s,
-        velocity_smoothing=velocity_smoothing,
-    )
-    traj_dicts = solver_result_to_trajectory_dicts(
-        result, duration_ms, takeoff_time, velocity_smoothing=velocity_smoothing
-    )
     skyb_paths: Dict[str, str] = {}
 
-    for idx, (show_dict, traj_dict) in enumerate(zip(show_dicts, traj_dicts)):
+    for idx, show_dict in enumerate(show_dicts):
         drone_id = f"drone-{idx + 1}"
 
-        # ── .skyb binary ────────────────────────────────────────────
-        traj_spec = TrajectorySpecification(traj_dict)
+        traj_spec = TrajectorySpecification(show_dict["trajectory"])
 
         async with SkybrushBinaryShowFile.create_in_memory(version=2) as f:
             await f.add_trajectory(traj_spec)
@@ -642,11 +791,11 @@ async def save_skyb_files(
     combined = {
         "version": 1,
         "num_drones": len(show_dicts),
-        "drones": {},
+        "drones": {
+            f"drone-{idx + 1}": show_dict
+            for idx, show_dict in enumerate(show_dicts)
+        },
     }
-    for idx, show_dict in enumerate(show_dicts):
-        drone_id = f"drone-{idx + 1}"
-        combined["drones"][drone_id] = show_dict
 
     show_json_path = output_dir / "show.json"
     show_json_path.write_text(json.dumps(combined, indent=2), encoding="utf-8")
@@ -656,24 +805,26 @@ async def save_skyb_files(
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Velocity smoothing
 # ---------------------------------------------------------------------------
 
 
 def _merge_collinear_runs(
     points: List[list], angle_threshold_deg: float = CORNER_ANGLE_THRESHOLD_DEG
 ) -> List[list]:
-    """Merge consecutive same-direction (collinear) moving segments into one.
+    """Merge consecutive same-direction (near-collinear) moving segments.
 
-    When A, B, C are collinear and travelled in the same direction, the middle
-    keyframe B is dropped so that A→C becomes a *single* straight segment. The
-    kept keyframes keep their original timestamps, so the merged run still spans
-    the full A→C duration.
+    When A, B, C are travelled in the same direction (within
+    ``angle_threshold_deg``), the middle keyframe B is dropped so that A→C
+    becomes a single segment spanning the full duration.
 
-    This lets the velocity smoothing ease *once* over the whole straight run
-    (ramp up at the run's start, ramp down at its end) instead of once per short
-    sub-segment. Corners (direction change > ``angle_threshold_deg``), holds
-    (zero-length segments) and the trajectory ends always break a run.
+    NOTE: with a non-zero angle threshold this is *not* geometry-preserving —
+    a dropped keyframe may sit up to ``sin(threshold)`` × segment-length away
+    from the merged straight line, and the drone's position at intermediate
+    times deviates from the original schedule by up to ~9.7% of the merged
+    run's length. It is therefore only used for externally supplied (delivery)
+    paths, never for solver output whose collision guarantees depend on the
+    schedule. Corners, holds and the trajectory ends always break a run.
     """
     n = len(points)
     if n < 3:
@@ -696,8 +847,6 @@ def _merge_collinear_runs(
             if u1 is not None and u2 is not None:
                 dot = u1[0] * u2[0] + u1[1] * u2[1] + u1[2] * u2[2]
                 if dot >= cos_threshold:
-                    # collinear & same direction -> drop the middle keyframe,
-                    # extending the current run to points[i].
                     result[-1] = points[i]
                     continue
         result.append(points[i])
@@ -705,60 +854,95 @@ def _merge_collinear_runs(
     return result
 
 
-def _apply_velocity_smoothing(
-    points: List[list], smoothing: float
+def _control_distances(
+    v0: float, v1: float, length: float, dt: float
+) -> tuple[float, float]:
+    """Distances of the two Bézier control points along the segment line.
+
+    For a cubic Bézier of duration ``dt`` the endpoint speeds are
+    ``3·d1/dt`` and ``3·(L-d2)/dt``, so the control distances encode the
+    entry/exit speeds. Clamped so the motion stays monotonic (no overshoot).
+    """
+    d1 = v0 * dt / 3.0
+    d2 = length - v1 * dt / 3.0
+    d1 = max(0.0, min(d1, length))
+    d2 = max(0.0, min(d2, length))
+    if d2 < d1:
+        d1 = d2 = 0.5 * (d1 + d2)
+    return d1, d2
+
+
+def _segment_peak_speed(v0: float, v1: float, length: float, dt: float) -> float:
+    """Exact peak speed of an eased segment (closed form, no sampling).
+
+    The parametric speed of a collinear cubic Bézier is a quadratic in t,
+    so its maximum over [0, 1] is at an endpoint or the interior vertex.
+    """
+    d1, d2 = _control_distances(v0, v1, length, dt)
+    # p'(t) = c + b·t + a·t² (distance per unit parameter)
+    c = 3.0 * d1
+    b = 6.0 * d2 - 12.0 * d1
+    a = 9.0 * d1 - 9.0 * d2 + 3.0 * length
+    best = max(c, c + b + a)  # endpoints t=0 and t=1
+    if a < -1e-12:  # concave -> interior maximum possible
+        tv = -b / (2.0 * a)
+        if 0.0 < tv < 1.0:
+            best = max(best, c + b * tv + a * tv * tv)
+    return best / dt
+
+
+def apply_velocity_smoothing(
+    points: List[list],
+    smoothing: float,
+    *,
+    merge_collinear: bool = False,
+    max_velocity_xy: float = MAX_VELOCITY_XY,
+    max_velocity_z: float = MAX_VELOCITY_Z,
 ) -> List[list]:
     """Give the trajectory a smooth speed profile without changing its path.
 
     The input ``points`` is the list of ``[t, [x, y, z], control]`` keyframes
-    produced by :func:`solver_result_to_trajectory_dicts` (after
-    :func:`_collapse_stationary`), where every ``control`` list is empty, i.e.
-    every segment is linear and therefore travelled at *constant* speed. Plotted
-    as a velocity-vs-time graph that is a step function: speed jumps from 0 to
-    cruise the instant a segment starts and back to 0 the instant it ends, which
-    is an (near-)infinite acceleration — the "inertia" the drone feels.
+    (after :func:`_collapse_stationary`) where every segment is linear and
+    travelled at constant speed — the speed jumps from 0 to cruise instantly
+    at every segment boundary, which is the "inertia" jerk the drone feels.
 
-    This replaces each moving segment with a **cubic Bézier** whose two interior
-    control points lie *on the straight line* between the segment endpoints.
-    Because the control points are collinear with the endpoints, the geometric
-    path is byte-for-byte the same straight line as before; only the speed along
-    it changes. For a cubic Bézier ``P0 P1 P2 P3`` of duration ``T`` the speed
-    at the endpoints is ``3·|P1-P0|/T`` and ``3·|P3-P2|/T``, so positioning the
-    control points sets the entry/exit speed of each waypoint.
+    Each moving segment is replaced with a **cubic Bézier** whose two interior
+    control points lie *on the straight line* between the segment endpoints,
+    so the geometric path is unchanged; only the speed along it changes.
 
-    Per-waypoint target speed (at the shared keyframe between two segments):
+    Per-waypoint target speed at the shared keyframe between two segments:
 
-    * trajectory start / end, and any waypoint next to a hold (a zero-length
-      segment): **0** — the drone is genuinely at rest there, so the speed ramps
-      smoothly down to and up from zero (this is what removes the sudden
-      departure / arrival jerk).
+    * trajectory start / end, and any waypoint next to a hold: **0** — the
+      drone is genuinely at rest there.
     * direction-change **corner** (angle > ``CORNER_ANGLE_THRESHOLD_DEG``):
-      ``(1 - smoothing) · cruise`` — with a straight path a corner taken at
-      non-zero speed still snaps the velocity *vector*, so higher ``smoothing``
-      slows it down more (``smoothing == 1`` → full stop at the corner).
-    * near-collinear pass-through: cruise speed is preserved, so the drone flies
-      straight through without slowing down.
+      ``(1 - smoothing) · cruise`` (``smoothing == 1`` → full stop).
+    * near-collinear pass-through: cruise speed, i.e. the segment stays
+      effectively constant-speed (zero schedule deviation).
 
-    ``smoothing`` is clamped to ``[0, 1]``; ``0`` returns the input unchanged
-    (the historical constant-velocity behaviour).
+    Velocity safety: the exact peak speed of every eased segment is checked
+    against ``max_velocity_xy`` / ``max_velocity_z``. Segments that would
+    exceed a limit get their easing relaxed toward constant speed; if the
+    limits still cannot be met the whole trajectory falls back to constant
+    speed. If even the *cruise* speed violates a limit, the trajectory is
+    unflyable at this timing and :class:`TrajectoryLimitError` is raised.
 
-    Consecutive collinear segments are first merged into a single straight run
-    (see :func:`_merge_collinear_runs`) so the ease-in/ease-out spans the whole
-    run rather than each short sub-segment.
+    ``smoothing`` is clamped to ``[0, 1]``; ``0`` returns the input unchanged.
+    ``merge_collinear`` must stay False for solver output (see
+    :func:`_merge_collinear_runs`).
     """
-    if smoothing <= 0.0 or len(points) < 2:
+    if len(points) < 2:
         return points
-    smoothing = min(1.0, smoothing)
+    smoothing = min(1.0, max(0.0, smoothing))
 
-    # Merge collinear runs so A→B→C (same direction) becomes one A→C segment;
-    # the ease then ramps up once at the run start and down once at its end.
-    points = _merge_collinear_runs(points)
+    if merge_collinear and smoothing > 0.0:
+        points = _merge_collinear_runs(points)
     n = len(points)
 
     # Per-segment geometry. Segment k (for k in 1..n-1) ends at keyframe k and
     # carries its control points on keyframe k (Skybrush trajectory convention).
     seg_dir: List[Optional[List[float]]] = [None] * n
     seg_len: List[float] = [0.0] * n
+    seg_dt: List[float] = [0.0] * n
     seg_cruise: List[float] = [0.0] * n
     for k in range(1, n):
         a = points[k - 1][1]
@@ -767,10 +951,40 @@ def _apply_velocity_smoothing(
         length = math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
         dt = points[k][0] - points[k - 1][0]
         seg_len[k] = length
+        seg_dt[k] = dt
         if length > 1e-9 and dt > 1e-9:
             seg_dir[k] = [d[0] / length, d[1] / length, d[2] / length]
             seg_cruise[k] = length / dt
-        # else: zero-length hold or zero-duration -> leave as a constant segment
+        # else: zero-length hold or zero-duration -> constant segment
+
+    # The cruise speed itself must respect the limits — easing can only make
+    # peaks higher, never fix an infeasible schedule.
+    def axis_limit(direction: List[float]) -> float:
+        h_xy = math.hypot(direction[0], direction[1])
+        v_z = abs(direction[2])
+        limit = math.inf
+        if h_xy > 1e-9:
+            limit = min(limit, max_velocity_xy / h_xy)
+        if v_z > 1e-9:
+            limit = min(limit, max_velocity_z / v_z)
+        return limit
+
+    seg_limit: List[float] = [math.inf] * n
+    for k in range(1, n):
+        u = seg_dir[k]
+        if u is None:
+            continue
+        seg_limit[k] = axis_limit(u)
+        if seg_cruise[k] > seg_limit[k] * (1.0 + 1e-6):
+            raise TrajectoryLimitError(
+                f"segment ending at t={points[k][0]:.2f}s requires a cruise "
+                f"speed of {seg_cruise[k]:.2f} m/s which exceeds the "
+                f"velocity limit of {seg_limit[k]:.2f} m/s; increase the "
+                "segment duration"
+            )
+
+    if smoothing <= 0.0:
+        return points
 
     # Target speed at each keyframe (see docstring).
     speed_at: List[float] = [0.0] * n
@@ -780,7 +994,11 @@ def _apply_velocity_smoothing(
         if prev_dir is None or next_dir is None:
             speed_at[i] = 0.0  # start / end / next to a hold -> at rest
             continue
-        dot = prev_dir[0] * next_dir[0] + prev_dir[1] * next_dir[1] + prev_dir[2] * next_dir[2]
+        dot = (
+            prev_dir[0] * next_dir[0]
+            + prev_dir[1] * next_dir[1]
+            + prev_dir[2] * next_dir[2]
+        )
         dot = max(-1.0, min(1.0, dot))
         angle_deg = math.degrees(math.acos(dot))
         pass_through = min(seg_cruise[i], seg_cruise[i + 1])
@@ -789,6 +1007,49 @@ def _apply_velocity_smoothing(
         else:
             speed_at[i] = pass_through  # straight-through, keep cruising
 
+    # Peak-speed enforcement: relax the easing (raise endpoint speeds toward
+    # cruise) on segments whose eased peak would exceed the velocity limits.
+    for _ in range(4):
+        any_violation = False
+        for k in range(1, n):
+            if seg_dir[k] is None:
+                continue
+            peak = _segment_peak_speed(
+                speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k]
+            )
+            if peak <= seg_limit[k] * (1.0 + 1e-9):
+                continue
+            any_violation = True
+            cruise = seg_cruise[k]
+            # Endpoint speeds and the peak are affine in the ease amount, so
+            # the relaxation factor has a closed form.
+            beta = (seg_limit[k] - cruise) / max(peak - cruise, 1e-9)
+            beta = max(0.0, min(1.0, beta))
+            for endpoint in (k - 1, k):
+                current = speed_at[endpoint]
+                demanded = cruise + beta * (current - cruise)
+                bound_candidates = []
+                if endpoint >= 1 and seg_dir[endpoint] is not None:
+                    bound_candidates.append(seg_cruise[endpoint])
+                if endpoint + 1 < n and seg_dir[endpoint + 1] is not None:
+                    bound_candidates.append(seg_cruise[endpoint + 1])
+                bound = min(bound_candidates) if bound_candidates else cruise
+                speed_at[endpoint] = min(max(current, demanded), bound)
+        if not any_violation:
+            break
+
+    # Final safety check; fall back to constant speed if the limits still
+    # cannot be met with easing (constant speed is feasible per the cruise
+    # check above).
+    for k in range(1, n):
+        if seg_dir[k] is None:
+            continue
+        peak = _segment_peak_speed(
+            speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k]
+        )
+        if peak > seg_limit[k] * (1.0 + 1e-6):
+            return points
+
     out: List[list] = [list(p) for p in points]
     for k in range(1, n):
         u = seg_dir[k]
@@ -796,18 +1057,9 @@ def _apply_velocity_smoothing(
             out[k][2] = []  # keep holds / degenerate segments constant
             continue
         a = points[k - 1][1]
-        length = seg_len[k]
-        dt = points[k][0] - points[k - 1][0]
-        # Distance of each control point from the segment start, along the line.
-        # speed_at[endpoint] is bounded by this segment's own cruise (it is a
-        # min() that includes seg_cruise[k]), so 0 <= d1 <= L/3 <= 2L/3 <= d2 <= L
-        # and the motion stays monotonic (no overshoot / reversal).
-        d1 = speed_at[k - 1] * dt / 3.0
-        d2 = length - speed_at[k] * dt / 3.0
-        d1 = max(0.0, min(d1, length))
-        d2 = max(0.0, min(d2, length))
-        if d2 < d1:
-            d1 = d2 = 0.5 * (d1 + d2)
+        d1, d2 = _control_distances(
+            speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k]
+        )
         p1 = [round(a[j] + u[j] * d1, 4) for j in range(3)]
         p2 = [round(a[j] + u[j] * d2, 4) for j in range(3)]
         out[k][2] = [p1, p2]
