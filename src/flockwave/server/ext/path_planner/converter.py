@@ -57,6 +57,16 @@ MAX_VELOCITY_Z = 2.5
 # Conservative default for small quadrotors during in-place turns.
 DEFAULT_MAX_YAW_RATE_DEG_S = 90.0
 
+# Default horizontal cruise speed during formation moves (m/s). Keep in
+# sync with DEFAULT_DURATION_MS (= step_size / cruise speed for a 1 m step).
+DEFAULT_CRUISE_SPEED_M_S = 1.0
+
+# Default vertical speed while descending to land (m/s).
+DEFAULT_LANDING_SPEED_M_S = 0.2
+
+# Default vertical speed during takeoff (m/s).
+DEFAULT_TAKEOFF_SPEED_M_S = 1.5
+
 # Default velocity-smoothing strength applied to every generated path. See
 # ``apply_velocity_smoothing`` for the exact meaning. This is the value used
 # when the path-planner extension is loaded without an explicit configuration
@@ -82,6 +92,15 @@ class TrajectoryLimitError(ValueError):
 
 class YawRateError(TrajectoryLimitError):
     """A yaw change does not fit its time budget at the allowed yaw rate."""
+
+
+def duration_ms_for_cruise_speed(step_size: float, cruise_speed_m_s: float) -> int:
+    """Return milliseconds per solver step for a target cruise speed."""
+    if step_size <= 0:
+        raise ValueError("step_size must be positive")
+    if cruise_speed_m_s <= 0:
+        raise ValueError("cruise_speed must be positive")
+    return max(1, round(step_size / cruise_speed_m_s * 1000))
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +150,8 @@ def solver_result_to_trajectory_dicts(
     result: SolverResult,
     duration_ms: int = DEFAULT_DURATION_MS,
     takeoff_time: float = 0.0,
-    takeoff_speed: float = 1.5,
-    landing_speed: float = 1.0,
+    takeoff_speed: float = DEFAULT_TAKEOFF_SPEED_M_S,
+    landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
     velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
     ground_positions: Optional[Sequence[Sequence[float]]] = None,
 ) -> List[dict]:
@@ -364,8 +383,8 @@ def build_yaw_control_dict(
     duration_ms: int,
     *,
     takeoff_time: float = 0.0,
-    takeoff_speed: float = 1.5,
-    landing_speed: float = 1.0,
+    takeoff_speed: float = DEFAULT_TAKEOFF_SPEED_M_S,
+    landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
     velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
     ground_positions: Optional[Sequence[Sequence[float]]] = None,
@@ -556,6 +575,8 @@ def build_show_dicts(
     amsl_reference: Optional[float] = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
     velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
+    takeoff_speed: float = DEFAULT_TAKEOFF_SPEED_M_S,
+    landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
     ground_positions: Optional[Sequence[Sequence[float]]] = None,
     geofence: Optional[dict] = None,
 ) -> List[dict]:
@@ -582,6 +603,8 @@ def build_show_dicts(
         result,
         duration_ms,
         takeoff_time,
+        takeoff_speed=takeoff_speed,
+        landing_speed=landing_speed,
         velocity_smoothing=velocity_smoothing,
         ground_positions=ground_positions,
     )
@@ -607,6 +630,8 @@ def build_show_dicts(
             idx,
             duration_ms,
             takeoff_time=takeoff_time,
+            takeoff_speed=takeoff_speed,
+            landing_speed=landing_speed,
             max_yaw_rate_deg_s=max_yaw_rate_deg_s,
             velocity_smoothing=velocity_smoothing,
             ground_positions=ground_positions,
@@ -624,8 +649,8 @@ def _delivery_drone_to_trajectory_dict(
     takeoff_time: float,
     velocity_smoothing: float,
     *,
-    takeoff_speed: float = 1.5,
-    landing_speed: float = 1.0,
+    takeoff_speed: float = DEFAULT_TAKEOFF_SPEED_M_S,
+    landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
 ) -> dict:
     """Convert one pre-built delivery drone (``{initial_position, path}``) into a
     Skybrush trajectory dict.
@@ -716,6 +741,8 @@ def build_delivery_show_dicts(
     coordinate_system: Optional[dict] = None,
     amsl_reference: Optional[float] = None,
     velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
+    takeoff_speed: float = DEFAULT_TAKEOFF_SPEED_M_S,
+    landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
     geofence: Optional[dict] = None,
 ) -> List[dict]:
     """Build per-drone show dicts from a pre-built delivery ``drones`` payload.
@@ -730,7 +757,11 @@ def build_delivery_show_dicts(
     shows: List[dict] = []
     for drone in drones:
         traj = _delivery_drone_to_trajectory_dict(
-            drone, takeoff_time, velocity_smoothing
+            drone,
+            takeoff_time,
+            velocity_smoothing,
+            takeoff_speed=takeoff_speed,
+            landing_speed=landing_speed,
         )
         init = drone.get("initial_position") or [0.0, 0.0, 0.0]
         ground_z = float(drone.get("ground_z", 0.0))

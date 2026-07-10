@@ -80,9 +80,23 @@ def test_wake_clears_when_far_below() -> None:
     theta = math.radians(WAKE_ANGLE_DEG)
     wake_dz = WAKE_LENGTH * math.cos(theta)
     half_z = BODY_SIZE_Z * 0.5
+    # Body-body needs 2*half_z; the (short) wake may or may not extend past
+    # the body, so the required clearance is whichever reach is larger.
+    clearance = max(2.0 * half_z, half_z + wake_dz + WAKE_RADIUS) + 0.01
     a = [0.0, 0.0, 10.0]
-    b = [0.0, 0.0, 10.0 - half_z - wake_dz - WAKE_RADIUS - 0.01]
+    b = [0.0, 0.0, 10.0 - clearance]
     assert not volumes_overlap(a, b)
+
+
+def test_tight_formation_spacing_is_allowed() -> None:
+    """With the small-drone wake, sub-meter spacing must clear the envelope.
+
+    Guards the intent of the wake shrink (0.15 m length / 0.03 m radius):
+    two drones 0.75 m apart on either horizontal axis are safe.
+    """
+    assert GUARANTEED_XY_CLEARANCE < 0.75
+    assert not volumes_overlap([0.0, 0.0, 10.0], [0.75, 0.0, 10.0])
+    assert not volumes_overlap([0.0, 0.0, 10.0], [0.0, 0.75, 10.0])
 
 
 def test_margin_inflates_envelope() -> None:

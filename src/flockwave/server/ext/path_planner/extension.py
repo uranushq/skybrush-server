@@ -50,12 +50,15 @@ from flockwave.server.ext.base import Extension
 from flockwave.server.utils import overridden
 
 from .converter import (
-    DEFAULT_DURATION_MS,
+    DEFAULT_CRUISE_SPEED_M_S,
+    DEFAULT_LANDING_SPEED_M_S,
     DEFAULT_MAX_YAW_RATE_DEG_S,
+    DEFAULT_TAKEOFF_SPEED_M_S,
     DEFAULT_VELOCITY_SMOOTHING,
     TrajectoryLimitError,
     build_delivery_show_dicts,
     build_show_dicts,
+    duration_ms_for_cruise_speed,
     lerp_yaw_deg,
     save_skyb_files,
     yaw_delta_deg,
@@ -1045,6 +1048,13 @@ async def _handle_path_delivery(body: dict):
     smoothing = float(body.get("velocity_smoothing", velocity_smoothing))
     if not (0.0 <= smoothing <= 1.0):
         return jsonify({"error": "'velocity_smoothing' must be between 0 and 1"}), 400
+    takeoff_speed = float(body.get("takeoff_speed", DEFAULT_TAKEOFF_SPEED_M_S))
+    landing_speed = float(body.get("landing_speed", DEFAULT_LANDING_SPEED_M_S))
+    if takeoff_speed <= 0 or landing_speed <= 0:
+        return (
+            jsonify({"error": "'takeoff_speed' and 'landing_speed' must be > 0"}),
+            400,
+        )
 
     takeoff_time = float(body.get("takeoff_time", 0.0))
     takeoff_time_adjusted = takeoff_time < MIN_TAKEOFF_TIME
@@ -1116,6 +1126,8 @@ async def _handle_path_delivery(body: dict):
             coordinate_system=coordinate_system,
             amsl_reference=amsl_reference,
             velocity_smoothing=smoothing_value,
+            takeoff_speed=takeoff_speed,
+            landing_speed=landing_speed,
             geofence=body.get("geofence"),
         )
 
@@ -1232,7 +1244,11 @@ async def plan():
 
     # --- optional parameters ---
     step_size: float = float(body.get("step_size", 1.0))
-    duration_ms: int = int(body.get("duration_ms", DEFAULT_DURATION_MS))
+    cruise_speed: float = float(
+        body.get("cruise_speed", body.get("formation_speed", DEFAULT_CRUISE_SPEED_M_S))
+    )
+    takeoff_speed: float = float(body.get("takeoff_speed", DEFAULT_TAKEOFF_SPEED_M_S))
+    landing_speed: float = float(body.get("landing_speed", DEFAULT_LANDING_SPEED_M_S))
     seed: Optional[int] = body.get("seed")
     max_yaw_rate_deg_s: float = float(
         body.get("max_yaw_rate_deg_s", DEFAULT_MAX_YAW_RATE_DEG_S)
@@ -1241,6 +1257,19 @@ async def plan():
 
     if step_size <= 0:
         return jsonify({"error": "'step_size' must be > 0"}), 400
+    if cruise_speed <= 0:
+        return jsonify({"error": "'cruise_speed' must be > 0"}), 400
+    if takeoff_speed <= 0 or landing_speed <= 0:
+        return (
+            jsonify({"error": "'takeoff_speed' and 'landing_speed' must be > 0"}),
+            400,
+        )
+    # Time per solver step. When omitted, derive it from step_size and the
+    # target cruise speed (default 1 m/s).
+    if "duration_ms" in body:
+        duration_ms: int = int(body["duration_ms"])
+    else:
+        duration_ms = duration_ms_for_cruise_speed(step_size, cruise_speed)
     if duration_ms <= 0:
         return jsonify({"error": "'duration_ms' must be > 0"}), 400
     if max_yaw_rate_deg_s <= 0:
@@ -1470,6 +1499,8 @@ async def plan():
             amsl_reference=amsl_reference,
             max_yaw_rate_deg_s=max_yaw_rate_deg_s,
             velocity_smoothing=smoothing_value,
+            takeoff_speed=takeoff_speed,
+            landing_speed=landing_speed,
             ground_positions=ground_positions,
             geofence=body.get("geofence"),
         )
@@ -1498,6 +1529,12 @@ async def plan():
     output["validation"] = validation_payload
     output["verification"] = {"checked": True, "violations": 0}
     output["smoothing"] = {"requested": smoothing, "applied": applied_smoothing}
+    output["timing"] = {
+        "duration_ms": duration_ms,
+        "cruise_speed": cruise_speed,
+        "takeoff_speed": takeoff_speed,
+        "landing_speed": landing_speed,
+    }
     if takeoff_time_adjusted:
         output["adjustments"] = {"takeoff_time": takeoff_time}
     if uses_phases:

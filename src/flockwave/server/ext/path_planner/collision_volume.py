@@ -54,8 +54,8 @@ MOTOR_POSITIONS = (
 
 # Wake geometry (meters)
 WAKE_ANGLE_DEG = 30.0
-WAKE_LENGTH = 0.5
-WAKE_RADIUS = 0.08
+WAKE_LENGTH = 0.15
+WAKE_RADIUS = 0.03
 
 # Margin (meters, per side of each drone's envelope) used for all plan-time
 # collision checks. Must stay well above the velocity-smoothing schedule
