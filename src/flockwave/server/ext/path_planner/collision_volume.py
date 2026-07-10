@@ -30,8 +30,8 @@ MOTOR_POSITIONS = (
 
 # Wake geometry (meters)
 WAKE_ANGLE_DEG = 30.0
-WAKE_LENGTH = 0.5
-WAKE_RADIUS = 0.08
+WAKE_LENGTH = 0.15
+WAKE_RADIUS = 0.03
 
 # Legacy names used by the REST API / formation validator
 COLLISION_X = BODY_SIZE_X

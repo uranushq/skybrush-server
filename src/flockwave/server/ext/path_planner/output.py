@@ -28,7 +28,9 @@ from typing import Any, List, Optional
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from .converter import (
+    DEFAULT_LANDING_SPEED_M_S,
     DEFAULT_MAX_YAW_RATE_DEG_S,
+    DEFAULT_TAKEOFF_SPEED_M_S,
     DEFAULT_VELOCITY_SMOOTHING,
     _apply_velocity_smoothing,
     build_show_dicts,
@@ -131,6 +133,8 @@ def build_skyc_bytes(
     amsl_reference: Optional[float] = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
     velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
+    takeoff_speed: float = DEFAULT_TAKEOFF_SPEED_M_S,
+    landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
 ) -> bytes:
     """Build a ``.skyc`` ZIP for Skybrush Viewer.
 
@@ -146,6 +150,8 @@ def build_skyc_bytes(
         amsl_reference=amsl_reference,
         max_yaw_rate_deg_s=max_yaw_rate_deg_s,
         velocity_smoothing=velocity_smoothing,
+        takeoff_speed=takeoff_speed,
+        landing_speed=landing_speed,
     )
     return skyc_bytes_from_show_dicts(show_dicts)
 

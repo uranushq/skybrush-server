@@ -27,6 +27,15 @@ from .solver import SolverResult
 # Conservative default for small quadrotors (e.g. Crazyflie) during in-place turns.
 DEFAULT_MAX_YAW_RATE_DEG_S = 90.0
 
+# Default horizontal cruise speed during formation moves (m/s).
+DEFAULT_CRUISE_SPEED_M_S = 0.1
+
+# Default vertical speed while descending to land (m/s).
+DEFAULT_LANDING_SPEED_M_S = 0.2
+
+# Default vertical speed during takeoff (m/s).
+DEFAULT_TAKEOFF_SPEED_M_S = 1.5
+
 # Default velocity-smoothing strength applied to every generated path. See
 # ``_apply_velocity_smoothing`` for the exact meaning. This is the value used
 # when the path-planner extension is loaded without an explicit configuration
@@ -42,6 +51,15 @@ DEFAULT_VELOCITY_SMOOTHING = 1.0
 CORNER_ANGLE_THRESHOLD_DEG = 5.0
 
 
+def duration_ms_for_cruise_speed(step_size: float, cruise_speed_m_s: float) -> int:
+    """Return milliseconds per solver step for a target cruise speed."""
+    if step_size <= 0:
+        raise ValueError("step_size must be positive")
+    if cruise_speed_m_s <= 0:
+        raise ValueError("cruise_speed must be positive")
+    return max(1, round(step_size / cruise_speed_m_s * 1000))
+
+
 # ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
@@ -51,8 +69,8 @@ def solver_result_to_trajectory_dicts(
     result: SolverResult,
     duration_ms: int = 300,
     takeoff_time: float = 0.0,
-    takeoff_speed: float = 1.5,
-    landing_speed: float = 1.0,
+    takeoff_speed: float = DEFAULT_TAKEOFF_SPEED_M_S,
+    landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
     velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
 ) -> List[dict]:
     """Convert a *SolverResult* into a list of Skybrush trajectory dicts.
@@ -274,8 +292,8 @@ def build_yaw_control_dict(
     duration_ms: int,
     *,
     takeoff_time: float = 0.0,
-    takeoff_speed: float = 1.5,
-    landing_speed: float = 1.0,
+    takeoff_speed: float = DEFAULT_TAKEOFF_SPEED_M_S,
+    landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
 ) -> dict[str, Any] | None:
     """Build a Skybrush ``yawControl`` block for one drone.
@@ -445,6 +463,8 @@ def build_show_dicts(
     amsl_reference: Optional[float] = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
     velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
+    takeoff_speed: float = DEFAULT_TAKEOFF_SPEED_M_S,
+    landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
 ) -> List[dict]:
     """Build a list of full *show specification* dicts (one per drone).
 
@@ -468,7 +488,12 @@ def build_show_dicts(
         coordinate_system = _default_coordinate_system()
 
     traj_dicts = solver_result_to_trajectory_dicts(
-        result, duration_ms, takeoff_time, velocity_smoothing=velocity_smoothing
+        result,
+        duration_ms,
+        takeoff_time,
+        takeoff_speed=takeoff_speed,
+        landing_speed=landing_speed,
+        velocity_smoothing=velocity_smoothing,
     )
     shows: List[dict] = []
 
@@ -486,6 +511,8 @@ def build_show_dicts(
             idx,
             duration_ms,
             takeoff_time=takeoff_time,
+            takeoff_speed=takeoff_speed,
+            landing_speed=landing_speed,
             max_yaw_rate_deg_s=max_yaw_rate_deg_s,
         )
         if yaw_control is not None:
@@ -582,6 +609,8 @@ async def save_skyb_files(
     amsl_reference: Optional[float] = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
     velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
+    takeoff_speed: float = DEFAULT_TAKEOFF_SPEED_M_S,
+    landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
 ) -> Dict[str, str]:
     """Generate ``.skyb`` files for every drone and save them to *output_dir*.
 
@@ -608,9 +637,16 @@ async def save_skyb_files(
         amsl_reference=amsl_reference,
         max_yaw_rate_deg_s=max_yaw_rate_deg_s,
         velocity_smoothing=velocity_smoothing,
+        takeoff_speed=takeoff_speed,
+        landing_speed=landing_speed,
     )
     traj_dicts = solver_result_to_trajectory_dicts(
-        result, duration_ms, takeoff_time, velocity_smoothing=velocity_smoothing
+        result,
+        duration_ms,
+        takeoff_time,
+        takeoff_speed=takeoff_speed,
+        landing_speed=landing_speed,
+        velocity_smoothing=velocity_smoothing,
     )
     skyb_paths: Dict[str, str] = {}
 

@@ -53,10 +53,14 @@ from flockwave.server.ext.base import Extension
 from flockwave.server.utils import overridden
 
 from .converter import (
+    DEFAULT_CRUISE_SPEED_M_S,
+    DEFAULT_LANDING_SPEED_M_S,
     DEFAULT_MAX_YAW_RATE_DEG_S,
+    DEFAULT_TAKEOFF_SPEED_M_S,
     DEFAULT_VELOCITY_SMOOTHING,
     build_delivery_show_dicts,
     build_show_dicts,
+    duration_ms_for_cruise_speed,
     save_skyb_files,
 )
 from .drone import Drone
@@ -889,10 +893,21 @@ async def plan():
 
     # --- optional parameters ---
     step_size: float = float(body.get("step_size", 1.0))
-    # Time per solver step (i.e. for one `step_size` worth of horizontal
-    # motion). 5000 ms keeps horizontal speed below the ArduPilot DRONE_SHOW
-    # firmware acceptance limits and avoids reload rejection on small shows.
-    duration_ms: int = int(body.get("duration_ms", 5000))
+    cruise_speed: float = float(
+        body.get("cruise_speed", body.get("formation_speed", DEFAULT_CRUISE_SPEED_M_S))
+    )
+    takeoff_speed: float = float(
+        body.get("takeoff_speed", DEFAULT_TAKEOFF_SPEED_M_S)
+    )
+    landing_speed: float = float(
+        body.get("landing_speed", DEFAULT_LANDING_SPEED_M_S)
+    )
+    # Time per solver step. When omitted, derive it from step_size and the
+    # target cruise speed (default 0.1 m/s = 10 cm/s).
+    if "duration_ms" in body:
+        duration_ms: int = int(body["duration_ms"])
+    else:
+        duration_ms = duration_ms_for_cruise_speed(step_size, cruise_speed)
     seed: Optional[int] = body.get("seed")
     max_yaw_rate_deg_s: float = float(
         body.get("max_yaw_rate_deg_s", DEFAULT_MAX_YAW_RATE_DEG_S)
@@ -904,6 +919,12 @@ async def plan():
 
     if step_size <= 0:
         return jsonify({"error": "'step_size' must be > 0"}), 400
+    if cruise_speed <= 0:
+        return jsonify({"error": "'cruise_speed' must be > 0"}), 400
+    if takeoff_speed <= 0:
+        return jsonify({"error": "'takeoff_speed' must be > 0"}), 400
+    if landing_speed <= 0:
+        return jsonify({"error": "'landing_speed' must be > 0"}), 400
     if duration_ms <= 0:
         return jsonify({"error": "'duration_ms' must be > 0"}), 400
     if max_yaw_rate_deg_s <= 0:
@@ -1078,6 +1099,8 @@ async def plan():
             amsl_reference=amsl_reference,
             max_yaw_rate_deg_s=max_yaw_rate_deg_s,
             velocity_smoothing=smoothing,
+            takeoff_speed=takeoff_speed,
+            landing_speed=landing_speed,
         )
         output["skybrush_files"] = saved
         if log:
@@ -1102,6 +1125,8 @@ async def plan():
             amsl_reference=amsl_reference,
             max_yaw_rate_deg_s=max_yaw_rate_deg_s,
             velocity_smoothing=smoothing,
+            takeoff_speed=takeoff_speed,
+            landing_speed=landing_speed,
         )
         output["upload"] = upload_results
 
@@ -1125,6 +1150,8 @@ async def plan():
                         amsl_reference=amsl_reference,
                         max_yaw_rate_deg_s=max_yaw_rate_deg_s,
                         velocity_smoothing=smoothing,
+                        takeoff_speed=takeoff_speed,
+                        landing_speed=landing_speed,
                     ),
                     mimetype="application/zip",
                 )
@@ -1245,6 +1272,8 @@ async def _upload_to_connected_uavs(
     amsl_reference: Optional[float] = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
     velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
+    takeoff_speed: float = DEFAULT_TAKEOFF_SPEED_M_S,
+    landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
 ) -> dict:
     """Upload per-drone show specs to connected UAVs.
 
@@ -1279,6 +1308,8 @@ async def _upload_to_connected_uavs(
         amsl_reference=amsl_reference,
         max_yaw_rate_deg_s=max_yaw_rate_deg_s,
         velocity_smoothing=velocity_smoothing,
+        takeoff_speed=takeoff_speed,
+        landing_speed=landing_speed,
     )
     return await _upload_show_dicts(show_dicts)
 
