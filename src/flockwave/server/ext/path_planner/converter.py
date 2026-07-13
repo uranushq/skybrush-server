@@ -103,6 +103,22 @@ def duration_ms_for_cruise_speed(step_size: float, cruise_speed_m_s: float) -> i
     return max(1, round(step_size / cruise_speed_m_s * 1000))
 
 
+def step_time_ms(rec, duration_ms: int) -> int:
+    """Absolute solver-timeline time for *rec* in milliseconds.
+
+    Prefers ``rec.time_ms`` when present (variable per-segment timing);
+    otherwise falls back to the uniform ``step * duration_ms`` schedule.
+    """
+    if getattr(rec, "time_ms", None) is not None:
+        return int(rec.time_ms)
+    return int(rec.step) * int(duration_ms)
+
+
+def step_time_sec(rec, duration_ms: int) -> float:
+    """Absolute solver-timeline time for *rec* in seconds."""
+    return step_time_ms(rec, duration_ms) / 1000.0
+
+
 # ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
@@ -176,7 +192,8 @@ def solver_result_to_trajectory_dicts(
 
     Parameters:
         result: output of ``PathSolver.solve()``
-        duration_ms: milliseconds per step (from the API request)
+        duration_ms: milliseconds per step (from the API request). Ignored for
+            individual steps that already carry an absolute ``time_ms``.
         takeoff_time: seconds to wait on the ground before takeoff
         takeoff_speed: peak vertical speed during takeoff in m/s
         landing_speed: peak vertical speed during landing in m/s
@@ -191,7 +208,6 @@ def solver_result_to_trajectory_dicts(
             the z coordinate is used as the ground level for takeoff and
             landing instead of assuming a flat ground at z=0.
     """
-    duration_sec = duration_ms / 1000.0
     trajectories: List[dict] = []
 
     for idx, drone in enumerate(result.drones):
@@ -205,7 +221,7 @@ def solver_result_to_trajectory_dicts(
         # Collect raw waypoints from solver
         raw_points: List[list] = []
         for rec in result.steps:
-            t_sec = round(rec.step * duration_sec, 4)
+            t_sec = round(step_time_sec(rec, duration_ms), 4)
             pos = rec.positions[did]
             raw_points.append(
                 [t_sec, [round(pos[0], 4), round(pos[1], 4), round(pos[2], 4)], []]
@@ -223,16 +239,14 @@ def solver_result_to_trajectory_dicts(
         ground_start = [first_pos[0], first_pos[1], round(ground_z, 4)]
         ground_end = [last_pos[0], last_pos[1], round(ground_z, 4)]
 
-        takeoff_alt, takeoff_duration, _, landing_duration = (
-            _takeoff_landing_profile(
-                first_pos,
-                last_pos,
-                ground_z,
-                ground_z,
-                takeoff_speed,
-                landing_speed,
-                velocity_smoothing,
-            )
+        takeoff_alt, takeoff_duration, _, landing_duration = _takeoff_landing_profile(
+            first_pos,
+            last_pos,
+            ground_z,
+            ground_z,
+            takeoff_speed,
+            landing_speed,
+            velocity_smoothing,
         )
 
         # Build full trajectory:
@@ -406,7 +420,6 @@ def build_yaw_control_dict(
         return None
 
     did = result.drones[drone_idx].drone_id
-    duration_sec = duration_ms / 1000.0
 
     records = result.steps  # already ordered by step number
     ground_z = 0.0
@@ -436,14 +449,14 @@ def build_yaw_control_dict(
 
     prev_rec = None
     for rec in records:
-        t_shifted = round(rec.step * duration_sec + takeoff_duration, 4)
+        t_shifted = round(step_time_sec(rec, duration_ms) + takeoff_duration, 4)
         if rec.step == records[0].step:
             if takeoff_duration > 0 or takeoff_alt <= 0:
                 prev_rec = rec
                 continue
         if prev_rec is not None:
             prev_t_shifted = round(
-                prev_rec.step * duration_sec + takeoff_duration, 4
+                step_time_sec(prev_rec, duration_ms) + takeoff_duration, 4
             )
             prev_pos = prev_rec.positions.get(did)
             curr_pos = rec.positions.get(did)
@@ -473,9 +486,7 @@ def build_yaw_control_dict(
 
     last_t = setpoints[-1][0]
     if landing_duration > 0:
-        _append_yaw_setpoint(
-            setpoints, last_t + landing_duration, yaw_of(records[-1])
-        )
+        _append_yaw_setpoint(setpoints, last_t + landing_duration, yaw_of(records[-1]))
 
     if len(setpoints) < 2:
         return None
@@ -514,9 +525,7 @@ def derive_geofence(
     max_dist = 0.0
     for _t, pos, _ctrl in points:
         max_alt = max(max_alt, float(pos[2]))
-        max_dist = max(
-            max_dist, math.hypot(pos[0] - home[0], pos[1] - home[1])
-        )
+        max_dist = max(max_dist, math.hypot(pos[0] - home[0], pos[1] - home[1]))
     return {
         "version": 1,
         "enabled": True,
@@ -711,9 +720,9 @@ def _delivery_drone_to_trajectory_dict(
         )
     )
     if takeoff_alt > 0:
-        points = [
-            [0.0, [first_pos[0], first_pos[1], round(ground_z, 4)], []]
-        ] + [[round(pt + takeoff_duration, 4), pos, ctrl] for pt, pos, ctrl in points]
+        points = [[0.0, [first_pos[0], first_pos[1], round(ground_z, 4)], []]] + [
+            [round(pt + takeoff_duration, 4), pos, ctrl] for pt, pos, ctrl in points
+        ]
     if landing_alt > 0:
         points.append(
             [
@@ -767,9 +776,7 @@ def build_delivery_show_dicts(
         ground_z = float(drone.get("ground_z", 0.0))
         home = [round(float(init[0]), 4), round(float(init[1]), 4), round(ground_z, 4)]
         shows.append(
-            _assemble_show_dict(
-                traj, home, coordinate_system, amsl_reference, geofence
-            )
+            _assemble_show_dict(traj, home, coordinate_system, amsl_reference, geofence)
         )
 
     return shows
@@ -823,8 +830,7 @@ async def save_skyb_files(
         "version": 1,
         "num_drones": len(show_dicts),
         "drones": {
-            f"drone-{idx + 1}": show_dict
-            for idx, show_dict in enumerate(show_dicts)
+            f"drone-{idx + 1}": show_dict for idx, show_dict in enumerate(show_dicts)
         },
     }
 
@@ -1075,9 +1081,7 @@ def apply_velocity_smoothing(
     for k in range(1, n):
         if seg_dir[k] is None:
             continue
-        peak = _segment_peak_speed(
-            speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k]
-        )
+        peak = _segment_peak_speed(speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k])
         if peak > seg_limit[k] * (1.0 + 1e-6):
             return points
 
@@ -1088,9 +1092,7 @@ def apply_velocity_smoothing(
             out[k][2] = []  # keep holds / degenerate segments constant
             continue
         a = points[k - 1][1]
-        d1, d2 = _control_distances(
-            speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k]
-        )
+        d1, d2 = _control_distances(speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k])
         p1 = [round(a[j] + u[j] * d1, 4) for j in range(3)]
         p2 = [round(a[j] + u[j] * d2, 4) for j in range(3)]
         out[k][2] = [p1, p2]

@@ -36,6 +36,7 @@ from .converter import (
     DEFAULT_DURATION_MS,
     MAX_VELOCITY_XY,
     MAX_VELOCITY_Z,
+    step_time_ms,
 )
 from .solver import SolverResult
 
@@ -46,29 +47,32 @@ __all__ = (
 )
 
 
-def build_output(
-    result: SolverResult, duration_ms: int = DEFAULT_DURATION_MS
-) -> dict:
+def build_output(result: SolverResult, duration_ms: int = DEFAULT_DURATION_MS) -> dict:
     """Convert a SolverResult into the JSON-serialisable output dict.
 
     Consecutive steps at the same position are collapsed into a single
     entry with an accumulated ``durationMs`` so long holds don't bloat the
-    payload with identical waypoints.
+    payload with identical waypoints. When steps carry explicit ``time_ms``
+    values, those drive the per-hop duration instead of the global default.
     """
     drones_out: List[dict] = []
 
     for drone in result.drones:
         path: List[dict] = []
+        prev_time_ms = step_time_ms(result.steps[0], duration_ms) if result.steps else 0
 
         for step_rec in result.steps:
             if step_rec.step == 0:
                 continue
             step_pos = step_rec.positions[drone.drone_id]
+            curr_time_ms = step_time_ms(step_rec, duration_ms)
+            hop_ms = max(1, curr_time_ms - prev_time_ms)
+            prev_time_ms = curr_time_ms
             entry = {
                 "x": round(step_pos[0], 4),
                 "y": round(step_pos[1], 4),
                 "z": round(step_pos[2], 4),
-                "durationMs": duration_ms,
+                "durationMs": hop_ms,
             }
             if (
                 path
@@ -76,7 +80,7 @@ def build_output(
                 and path[-1]["y"] == entry["y"]
                 and path[-1]["z"] == entry["z"]
             ):
-                path[-1]["durationMs"] += duration_ms
+                path[-1]["durationMs"] += hop_ms
             else:
                 path.append(entry)
 

@@ -13,7 +13,7 @@ Formation-phase flow (``phases`` present)::
       │  solver: collision-avoided move
       ▼
     staging grid   (grid_spacing apart, default 2 m — the algorithm's start)
-      │  solver: phase 1, phase 2, ... (+ per-phase holds and yaw changes)
+      │  solver: phase 1, phase 2, ... (+ per-phase holds, yaw, optional durationMs)
       ▼
     return to staging hover  (when return_to_initial, default true)
       │  vertical landing
@@ -49,6 +49,12 @@ from trio import sleep_forever, to_thread
 from flockwave.server.ext.base import Extension
 from flockwave.server.utils import overridden
 
+from .collision_volume import (
+    PLANNED_XY_CLEARANCE,
+    PLANNING_MARGIN,
+    describe_collision_envelope,
+    envelope_overlap,
+)
 from .converter import (
     DEFAULT_CRUISE_SPEED_M_S,
     DEFAULT_LANDING_SPEED_M_S,
@@ -61,6 +67,7 @@ from .converter import (
     duration_ms_for_cruise_speed,
     lerp_yaw_deg,
     save_skyb_files,
+    step_time_ms,
     yaw_delta_deg,
 )
 from .drone import Drone
@@ -68,12 +75,6 @@ from .output import (
     build_output,
     build_show_specifications,
     skyc_bytes_from_show_dicts,
-)
-from .collision_volume import (
-    PLANNED_XY_CLEARANCE,
-    PLANNING_MARGIN,
-    describe_collision_envelope,
-    envelope_overlap,
 )
 from .solver import PathSolver, SolverResult, StepRecord
 from .validators import (
@@ -238,6 +239,28 @@ def _validate_phases(phases, *, num_drones: int):
                 jsonify({"error": f"'phases[{phase_index}].holdMs' must be >= 0"}),
                 400,
             )
+
+        if "durationMs" in phase and phase.get("durationMs") is not None:
+            try:
+                phase_duration_ms = int(phase["durationMs"])
+            except (TypeError, ValueError):
+                return (
+                    jsonify(
+                        {
+                            "error": (
+                                f"'phases[{phase_index}].durationMs' must be an integer"
+                            )
+                        }
+                    ),
+                    400,
+                )
+            if phase_duration_ms <= 0:
+                return (
+                    jsonify(
+                        {"error": (f"'phases[{phase_index}].durationMs' must be > 0")}
+                    ),
+                    400,
+                )
 
         seen: set[int] = set()
         for point_index, point in enumerate(points):
@@ -625,6 +648,7 @@ def _append_yaw_transition(
     duration_sec: float,
     max_yaw_rate_deg_s: float,
     min_steps: int = 0,
+    duration_ms: int | None = None,
 ) -> list[float]:
     """Append in-place steps rotating to *target_yaws* within the rate limit.
 
@@ -632,17 +656,25 @@ def _append_yaw_transition(
     ``max_yaw_rate_deg_s`` (so the converter's ramp always fits its budget);
     ``min_steps`` extends the tail as a hold at the target yaw. Returns the
     new per-drone yaw list.
+
+    When *duration_ms* is given (and prior steps carry ``time_ms``), each
+    appended step advances the absolute timeline by that amount.
     """
     yaw_steps = _yaw_steps_needed(
         current_yaws, target_yaws, duration_sec, max_yaw_rate_deg_s
     )
     total_steps = max(yaw_steps, min_steps)
+    hop_ms = int(duration_ms) if duration_ms is not None else None
     for k in range(1, total_steps + 1):
         fraction = 1.0 if yaw_steps == 0 else min(1.0, k / yaw_steps)
         yaws = [
             lerp_yaw_deg(current, target, fraction)
             for current, target in zip(current_yaws, target_yaws)
         ]
+        time_ms = None
+        if hop_ms is not None:
+            prev_t = step_time_ms(steps[-1], hop_ms)
+            time_ms = prev_t + hop_ms
         steps.append(
             StepRecord(
                 step=steps[-1].step + 1,
@@ -651,6 +683,7 @@ def _append_yaw_transition(
                 reverted_drones=[],
                 verified=True,
                 yaws={idx: yaws[idx] for idx in range(len(positions))},
+                time_ms=time_ms,
             )
         )
     return list(target_yaws) if total_steps > 0 else list(current_yaws)
@@ -666,11 +699,15 @@ def _extend_with_solver_run(
     min_z: float,
     current_yaws: list[float],
     label: str,
+    duration_ms: int | None = None,
 ) -> list[tuple[float, float, float]]:
     """Run one solver segment and append its steps to the combined timeline.
 
     Raises :class:`PlanningError` when the segment cannot be solved — the
     caller never sees a partial path.
+
+    When *duration_ms* is given, each appended step gets an absolute
+    ``time_ms`` advanced by that duration from the previous step.
     """
     num_drones = len(current_positions)
     solver = PathSolver(
@@ -693,7 +730,13 @@ def _extend_with_solver_run(
         )
 
     step_offset = combined_steps[-1].step
+    hop_ms = int(duration_ms) if duration_ms is not None else None
+    cursor_ms = step_time_ms(combined_steps[-1], hop_ms) if hop_ms is not None else None
     for record in result.steps[1:]:
+        time_ms = None
+        if hop_ms is not None and cursor_ms is not None:
+            cursor_ms += hop_ms
+            time_ms = cursor_ms
         combined_steps.append(
             StepRecord(
                 step=step_offset + record.step,
@@ -702,6 +745,7 @@ def _extend_with_solver_run(
                 reverted_drones=list(record.reverted_drones),
                 verified=record.verified,
                 yaws={idx: current_yaws[idx] for idx in range(num_drones)},
+                time_ms=time_ms,
             )
         )
     return [tuple(result.steps[-1].positions[idx]) for idx in range(num_drones)]
@@ -728,13 +772,14 @@ def _plan_formation_phases(
     the hover positions at the end (so landing descends onto the original
     ground spots).
 
+    Each phase may override the per-step duration with ``durationMs``; omitted
+    phases inherit the request-level ``duration_ms``. Staging and return
+    segments always use the request-level default.
+
     Raises :class:`PlanningError` on any unsolvable segment.
     """
     num_drones = len(start_positions)
-    duration_sec = duration_ms / 1000.0
-    current_positions = [
-        tuple(float(v) for v in point) for point in start_positions
-    ]
+    current_positions = [tuple(float(v) for v in point) for point in start_positions]
     original_initials = list(current_positions)
     current_yaws = list(initial_yaws or [0.0] * num_drones)
     original_yaws = list(current_yaws)
@@ -748,26 +793,42 @@ def _plan_formation_phases(
             reverted_drones=[],
             verified=True,
             yaws={idx: current_yaws[idx] for idx in range(num_drones)},
+            time_ms=0,
         )
     ]
     phase_summaries: list[dict] = []
     segment_counter = 0
 
-    def summarize(name: str, arrival_step: int, hold_ms: int, hold_steps: int) -> None:
+    def summarize(
+        name: str,
+        arrival_step: int,
+        hold_ms: int,
+        hold_steps: int,
+        segment_duration_ms: int,
+    ) -> None:
+        arrival_ms = next(
+            (
+                step_time_ms(rec, segment_duration_ms)
+                for rec in combined_steps
+                if rec.step == arrival_step
+            ),
+            arrival_step * segment_duration_ms,
+        )
         phase_summaries.append(
             {
                 "name": name,
                 "arrivalStep": arrival_step,
-                "arrivalTimeMs": arrival_step * duration_ms,
+                "arrivalTimeMs": arrival_ms,
                 "holdMs": hold_ms,
                 "holdSteps": hold_steps,
+                "durationMs": segment_duration_ms,
                 "endStep": combined_steps[-1].step,
-                "endTimeMs": combined_steps[-1].step * duration_ms,
+                "endTimeMs": step_time_ms(combined_steps[-1], segment_duration_ms),
                 "success": True,
             }
         )
 
-    def run_segment(targets, label: str) -> None:
+    def run_segment(targets, label: str, segment_duration_ms: int) -> None:
         nonlocal current_positions, segment_counter
         if _positions_match(current_positions, targets):
             current_positions = [tuple(t) for t in targets]
@@ -781,34 +842,39 @@ def _plan_formation_phases(
             min_z=min_z,
             current_yaws=current_yaws,
             label=label,
+            duration_ms=segment_duration_ms,
         )
         segment_counter += 1
 
     # ── staging: move from the hover line-up into the grid ──────────────
     if staging_targets is not None:
-        run_segment(staging_targets, "staging-grid")
-        summarize("staging-grid", combined_steps[-1].step, 0, 0)
+        run_segment(staging_targets, "staging-grid", duration_ms)
+        summarize("staging-grid", combined_steps[-1].step, 0, 0, duration_ms)
 
     # ── requested formation phases ───────────────────────────────────────
     for phase_index, phase in enumerate(phases):
         name = str(phase.get("name", f"phase-{phase_index + 1}"))
         targets = _phase_targets(phase, num_drones)
         target_yaws = _phase_target_yaws(phase, num_drones)
+        phase_duration_ms = int(phase.get("durationMs", duration_ms))
+        phase_duration_sec = phase_duration_ms / 1000.0
 
-        run_segment(targets, name)
+        run_segment(targets, name, phase_duration_ms)
         arrival_step = combined_steps[-1].step
 
         hold_ms = int(phase.get("holdMs", 0))
-        hold_steps = ceil(hold_ms / duration_ms) if hold_ms > 0 else 0
+        hold_steps = ceil(hold_ms / phase_duration_ms) if hold_ms > 0 else 0
         current_yaws = _append_yaw_transition(
             combined_steps,
             current_positions,
             current_yaws,
             target_yaws,
-            duration_sec=duration_sec,
+            duration_sec=phase_duration_sec,
             max_yaw_rate_deg_s=max_yaw_rate_deg_s,
             min_steps=hold_steps,
+            duration_ms=phase_duration_ms,
         )
+        summarize(name, arrival_step, hold_ms, hold_steps, phase_duration_ms)
 
         # Reset yaw to neutral before the next translation (if any actually
         # moves the fleet), so all cruising happens at a known heading.
@@ -825,11 +891,10 @@ def _plan_formation_phases(
                 current_positions,
                 current_yaws,
                 neutral_yaws,
-                duration_sec=duration_sec,
+                duration_sec=phase_duration_sec,
                 max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+                duration_ms=phase_duration_ms,
             )
-
-        summarize(name, arrival_step, hold_ms, hold_steps)
 
     # ── return to the staging hover positions ────────────────────────────
     final_targets = (
@@ -838,7 +903,7 @@ def _plan_formation_phases(
         else [tuple(t) for t in _phase_targets(phases[-1], num_drones)]
     )
     if return_to_initial:
-        run_segment(original_initials, "return-to-start")
+        run_segment(original_initials, "return-to-start", duration_ms)
         arrival_step = combined_steps[-1].step
         if not _yaw_lists_match(current_yaws, original_yaws):
             current_yaws = _append_yaw_transition(
@@ -846,10 +911,11 @@ def _plan_formation_phases(
                 current_positions,
                 current_yaws,
                 original_yaws,
-                duration_sec=duration_sec,
+                duration_sec=duration_ms / 1000.0,
                 max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+                duration_ms=duration_ms,
             )
-        summarize("return-to-start", arrival_step, 0, 0)
+        summarize("return-to-start", arrival_step, 0, 0, duration_ms)
 
     drones = [
         Drone(
@@ -1003,9 +1069,7 @@ def _validate_delivery_drones(drones):
             return jsonify({"error": f"'drones[{i}]' must be an object"}), 400
         if not _is_vec3(d.get("initial_position")):
             return (
-                jsonify(
-                    {"error": f"'drones[{i}].initial_position' must be [x, y, z]"}
-                ),
+                jsonify({"error": f"'drones[{i}].initial_position' must be [x, y, z]"}),
                 400,
             )
         path = d.get("path")
@@ -1284,7 +1348,10 @@ async def plan():
     staging_altitude: float = float(
         body.get(
             "staging_altitude",
-            body.get("initial_altitude", body.get("takeoff_altitude", DEFAULT_STAGING_ALTITUDE)),
+            body.get(
+                "initial_altitude",
+                body.get("takeoff_altitude", DEFAULT_STAGING_ALTITUDE),
+            ),
         )
     )
     grid_spacing: float = float(body.get("grid_spacing", DEFAULT_GRID_SPACING))
@@ -1474,9 +1541,7 @@ async def plan():
                 f"planning failed: {result.failure_reason}",
                 details={
                     "reason": result.failure_reason,
-                    "stuck_drones": [
-                        f"drone-{i + 1}" for i in result.stuck_drones
-                    ],
+                    "stuck_drones": [f"drone-{i + 1}" for i in result.stuck_drones],
                     "steps_completed": result.total_steps,
                 },
             )
@@ -1695,8 +1760,7 @@ def _derive_amsl_reference_from_first_uav() -> Optional[float]:
 def _natural_sort_key(value: str):
     """Sort key treating digit runs numerically, so uav-2 < uav-10."""
     return [
-        int(token) if token.isdigit() else token
-        for token in re.split(r"(\d+)", value)
+        int(token) if token.isdigit() else token for token in re.split(r"(\d+)", value)
     ]
 
 
@@ -1737,9 +1801,7 @@ async def _upload_show_dicts(
             return {"error": "'uav_ids' must be an array of UAV id strings"}
         uav_ids = list(explicit_uav_ids)
     else:
-        uav_ids = sorted(
-            app.object_registry.ids_by_type(UAV), key=_natural_sort_key
-        )
+        uav_ids = sorted(app.object_registry.ids_by_type(UAV), key=_natural_sort_key)
     if not uav_ids:
         return {"error": "No UAVs connected", "uploaded": 0, "details": {}}
 

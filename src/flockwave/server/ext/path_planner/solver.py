@@ -69,6 +69,10 @@ class StepRecord:
     reverted_drones: List[int]
     verified: bool
     yaws: Dict[int, float] | None = None
+    # Absolute time from the start of the solver timeline in milliseconds.
+    # When set (e.g. multi-phase plans with per-phase ``durationMs``),
+    # converters use this instead of ``step * global_duration_ms``.
+    time_ms: int | None = None
 
 
 @dataclass
@@ -135,7 +139,9 @@ class PathSolver:
         prev_b: List[float],
         next_b: List[float],
     ) -> bool:
-        return envelope_overlap_swept(prev_a, next_a, prev_b, next_b, margin=self.margin)
+        return envelope_overlap_swept(
+            prev_a, next_a, prev_b, next_b, margin=self.margin
+        )
 
     def _candidate_pairs(
         self, prev: Dict[int, List[float]], proposed: Dict[int, List[float]]

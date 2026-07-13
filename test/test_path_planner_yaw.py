@@ -32,7 +32,7 @@ def test_plan_formation_phases_changes_yaw_after_arrival() -> None:
         }
     ]
     result, _ = _plan_formation_phases(
-        initial=initial,
+        start_positions=initial,
         phases=phases,
         step_size=1.0,
         duration_ms=1000,
@@ -44,7 +44,9 @@ def test_plan_formation_phases_changes_yaw_after_arrival() -> None:
     move_records = [rec for rec in result.steps if rec.step > 0]
     assert move_records
     arrival_idx = _formation_arrival_index(result.steps)
-    assert all(abs(rec.yaws[0] - 0.0) < 1e-6 for rec in result.steps[1 : arrival_idx + 1])
+    assert all(
+        abs(rec.yaws[0] - 0.0) < 1e-6 for rec in result.steps[1 : arrival_idx + 1]
+    )
     assert abs(result.steps[arrival_idx + 1].yaws[0] - 90.0) < 1e-6
     assert (
         result.steps[arrival_idx].positions == result.steps[arrival_idx + 1].positions
@@ -140,9 +142,7 @@ def test_in_place_yaw_change_is_rate_limited() -> None:
 
     for idx in range(1, len(setpoints)):
         dt = setpoints[idx][0] - setpoints[idx - 1][0]
-        dyaw = abs(
-            (setpoints[idx][1] - setpoints[idx - 1][1] + 180.0) % 360.0 - 180.0
-        )
+        dyaw = abs((setpoints[idx][1] - setpoints[idx - 1][1] + 180.0) % 360.0 - 180.0)
         if dt > 1e-6 and dyaw > 1e-6:
             assert dyaw / dt <= 90.0 + 1.0
 
@@ -244,7 +244,7 @@ def test_phase_hold_starts_after_yaw_change() -> None:
         }
     ]
     result, summaries = _plan_formation_phases(
-        initial=initial,
+        start_positions=initial,
         phases=phases,
         step_size=1.0,
         duration_ms=1000,
@@ -276,7 +276,7 @@ def test_yaw_changes_during_hold_after_arrival_not_before() -> None:
         }
     ]
     result, summaries = _plan_formation_phases(
-        initial=initial,
+        start_positions=initial,
         phases=phases,
         step_size=1.0,
         duration_ms=1000,
@@ -288,9 +288,7 @@ def test_yaw_changes_during_hold_after_arrival_not_before() -> None:
     arrival_idx = _formation_arrival_index(result.steps)
     hold_end_step = summaries[0]["endStep"]
     reset_idx = next(
-        idx
-        for idx, rec in enumerate(result.steps)
-        if rec.step == hold_end_step + 1
+        idx for idx, rec in enumerate(result.steps) if rec.step == hold_end_step + 1
     )
 
     assert result.steps[arrival_idx].yaws[0] == 0.0
@@ -300,17 +298,15 @@ def test_yaw_changes_during_hold_after_arrival_not_before() -> None:
     )
     assert result.steps[reset_idx].yaws[0] == 0.0
 
-    yaw_control = build_show_dicts(
-        result, duration_ms=1000, takeoff_time=5.0
-    )[0]["yawControl"]
+    yaw_control = build_show_dicts(result, duration_ms=1000, takeoff_time=5.0)[0][
+        "yawControl"
+    ]
     assert yaw_control is not None
     setpoints = yaw_control["setpoints"]
     takeoff_time = 5.0
     takeoff_duration = round(1.0 / 1.5, 4)
     arrival_t = round(takeoff_time + arrival_idx * 1.0 + takeoff_duration, 4)
-    reset_t = round(
-        takeoff_time + (hold_end_step + 1) * 1.0 + takeoff_duration, 4
-    )
+    reset_t = round(takeoff_time + (hold_end_step + 1) * 1.0 + takeoff_duration, 4)
     first_ramp_t = min(t for t, yaw in setpoints if yaw < -1.0)
     first_reset_ramp_t = min(
         t for t, yaw in setpoints if t >= reset_t - 0.001 and yaw > -1.0
@@ -336,7 +332,7 @@ def test_yaw_setpoints_match_trajectory_player_timeline() -> None:
         }
     ]
     result, _ = _plan_formation_phases(
-        initial=initial,
+        start_positions=initial,
         phases=phases,
         step_size=1.0,
         duration_ms=1000,
@@ -378,7 +374,7 @@ def test_plan_formation_phases_resets_yaw_after_hold_before_return() -> None:
         }
     ]
     result, summaries = _plan_formation_phases(
-        initial=initial,
+        start_positions=initial,
         phases=phases,
         step_size=1.0,
         duration_ms=1000,
