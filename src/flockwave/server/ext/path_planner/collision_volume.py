@@ -20,12 +20,12 @@ setpoints.
 Planning margin
 ---------------
 The solver checks the envelope inflated by :data:`PLANNING_MARGIN` on every
-side. Velocity smoothing (see ``converter``) re-times each drone along its
+side. The effective XY half-extent is capped so that
+:data:`MIN_FORMATION_XY_CLEARANCE` (0.7 m) is the plan-time center-to-center
+floor. Velocity smoothing (see ``converter``) re-times each drone along its
 own path with a bounded schedule deviation of at most ~9.7% of one solver
-step; the margin absorbs that deviation (with a lot of slack), so clearances
-proven at plan time still hold for the smoothed trajectories. The final
-verification gate (see ``verify``) re-checks the smoothed trajectories with
-``margin=0`` as a defense in depth.
+step; the final verification gate (see ``verify``) re-checks the smoothed
+trajectories with ``margin=0`` as a defense in depth.
 
 The swept-motion check (:func:`envelope_overlap_swept`) is **exact** for two
 drones moving linearly and simultaneously: per axis, the relative offset is
@@ -58,9 +58,15 @@ WAKE_LENGTH = 0.15
 WAKE_RADIUS = 0.03
 
 # Margin (meters, per side of each drone's envelope) used for all plan-time
-# collision checks. Must stay well above the velocity-smoothing schedule
-# deviation bound (~0.097 * step_size per drone).
-PLANNING_MARGIN = 0.25
+# collision checks. Kept at 0 so the policy minimum spacing
+# (:data:`MIN_FORMATION_XY_CLEARANCE`) is the effective plan-time clearance;
+# velocity-smoothing schedule error is small relative to that floor
+# (~0.097 * step_size per drone).
+PLANNING_MARGIN = 0.0
+
+# Minimum center-to-center XY spacing enforced for formation endpoints,
+# staging grids and plan-time collision checks.
+MIN_FORMATION_XY_CLEARANCE = 0.7
 
 # Legacy names used by the REST API / formation validator
 COLLISION_X = BODY_SIZE_X
@@ -149,8 +155,12 @@ def _horizontal_circumradius(components: tuple[AABB, ...]) -> float:
 _COMPONENT_AABBS = _component_aabbs_relative()
 _COMBINED_MIN_REL, _COMBINED_MAX_REL = _combined_aabb_relative(_COMPONENT_AABBS)
 
-# Yaw-invariant bounding envelope (see module docstring).
-ENVELOPE_XY_HALF = _horizontal_circumradius(_COMPONENT_AABBS)
+# Yaw-invariant bounding envelope (see module docstring). The geometric
+# circumradius of body+wake is retained as an upper bound; the effective
+# half-extent is capped so center-to-center spacing of
+# :data:`MIN_FORMATION_XY_CLEARANCE` clears the check.
+_GEOMETRIC_XY_HALF = _horizontal_circumradius(_COMPONENT_AABBS)
+ENVELOPE_XY_HALF = min(_GEOMETRIC_XY_HALF, MIN_FORMATION_XY_CLEARANCE / 2.0)
 ENVELOPE_Z_MIN = _COMBINED_MIN_REL[2]
 ENVELOPE_Z_MAX = _COMBINED_MAX_REL[2]
 ENVELOPE_Z_HEIGHT = ENVELOPE_Z_MAX - ENVELOPE_Z_MIN
@@ -159,7 +169,7 @@ ENVELOPE_Z_HEIGHT = ENVELOPE_Z_MAX - ENVELOPE_Z_MIN
 # (margin-inflated) envelopes do not overlap. Axis-wise, hence also a lower
 # bound on the Euclidean distance.
 GUARANTEED_XY_CLEARANCE = 2.0 * ENVELOPE_XY_HALF
-PLANNED_XY_CLEARANCE = 2.0 * (ENVELOPE_XY_HALF + PLANNING_MARGIN)
+PLANNED_XY_CLEARANCE = MIN_FORMATION_XY_CLEARANCE
 
 # Conservative "minimum distance" figure for show validation blocks
 # (e.g. the .skyc validation settings), floored to a 0.1 m grid.
