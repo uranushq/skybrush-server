@@ -18,8 +18,9 @@ to the timing must keep each drone within a bounded distance of that nominal
 schedule:
 
 - Velocity smoothing eases the speed **per segment only** for solver output
-  (no collinear-run merging), which bounds the schedule deviation to at most
-  ~9.7% of a single solver step — far below the planning margin.
+  (no collinear-run merging) along a natural-log profile, which bounds the
+  schedule deviation to at most ~15% of a single solver step — well below
+  the planning margin.
 - Peak speeds of eased segments are computed in closed form and clamped to
   ``MAX_VELOCITY_XY`` / ``MAX_VELOCITY_Z``; if a trajectory cannot be eased
   within the limits it falls back to constant-speed motion, and if even the
@@ -42,10 +43,10 @@ from typing import Any, Dict, List, Optional, Sequence
 from .solver import SolverResult
 
 # Single source of truth for the per-step duration default. 1000 ms per
-# 1 m solver step gives a 1 m/s cruise speed; with the default easing the
-# peak speed at ramp segments is 1.5 m/s — far below MAX_VELOCITY_XY, and
-# the per-segment peak clamp enforces the limits regardless of what a
-# request chooses here.
+# 1 m solver step gives a 1 m/s cruise speed; with the default log easing
+# the peak speed at ramp segments stays below ~1.5 m/s — far below
+# MAX_VELOCITY_XY, and the per-segment peak clamp enforces the limits
+# regardless of what a request chooses here.
 DEFAULT_DURATION_MS = 1000
 
 # Hard velocity limits enforced on every generated trajectory (m/s). These
@@ -81,9 +82,95 @@ DEFAULT_VELOCITY_SMOOTHING = 1.0
 # near-collinear pass-through and cruise speed is preserved.
 CORNER_ANGLE_THRESHOLD_DEG = 5.0
 
-# Ease makes the peak speed of a start-from-rest/stop-to-rest segment 1.5×
-# its average speed (property of the cubic ease profile).
-_EASE_PEAK_FACTOR = 1.5
+# ── natural-log velocity profile ─────────────────────────────────────────
+# Eased segments follow a *natural-logarithm* speed curve:
+#
+#     v(τ) = v0·w(1−τ) + v1·w(τ) + C·w(τ)·w(1−τ),   τ = t / dt ∈ [0, 1]
+#
+# where w(τ) = ln(1 + (e−1)·τ) rises 0 → 1 along a natural-log arc (fast
+# pick-up, gentle approach), the first two terms pin the entry/exit speeds
+# and the symmetric log "bump" coefficient C is fixed in closed form so the
+# drone still covers exactly the segment length in the segment duration —
+# knot times never move, which is what bounds the schedule deviation the
+# planning margin has to absorb (≤ ~15% of one segment, see the test suite).
+# The curve is rendered as ``_LOG_SUBDIVISIONS`` cubic Bézier pieces whose
+# knots sample the profile with matching speeds (C¹ continuous).
+_LOG_BETA = math.e - 1.0
+
+# Bézier pieces per eased segment when rendering the log profile.
+_LOG_SUBDIVISIONS = 4
+
+
+def _log_w(tau: float) -> float:
+    """Log ease basis: 0 → 1 with natural-log curvature (ln(1+β) == 1)."""
+    return math.log1p(_LOG_BETA * tau)
+
+
+def _log_w_integral(tau: float) -> float:
+    """Closed form of ``∫₀^τ w(u) du``."""
+    x = 1.0 + _LOG_BETA * tau
+    return (x * math.log(x) - _LOG_BETA * tau) / _LOG_BETA
+
+
+def _log_bump(tau: float) -> float:
+    """Symmetric log bump ``w(τ)·w(1−τ)`` — zero at both ends."""
+    return _log_w(tau) * _log_w(1.0 - tau)
+
+
+def _simpson(fn, lo: float, hi: float, intervals: int) -> float:
+    """Composite Simpson quadrature (deterministic, no dependencies)."""
+    h = (hi - lo) / intervals
+    total = fn(lo) + fn(hi)
+    for i in range(1, intervals):
+        total += fn(lo + i * h) * (4.0 if i % 2 else 2.0)
+    return total * h / 3.0
+
+
+_LOG_W_AREA = _log_w_integral(1.0)  # = 1/(e−1)
+_LOG_BUMP_AREA = _simpson(_log_bump, 0.0, 1.0, 512)
+
+
+def _log_bump_integral(tau: float) -> float:
+    """``∫₀^τ w(u)·w(1−u) du`` (numeric; the integrand has no closed form)."""
+    if tau <= 0.0:
+        return 0.0
+    return _simpson(_log_bump, 0.0, tau, 128)
+
+
+def _log_profile(v0: float, v1: float, length: float, dt: float):
+    """Speed and arc-length functions of one log-eased segment.
+
+    Returns ``(speed, arc)`` callables over normalized time ``τ ∈ [0, 1]``;
+    ``arc(1) == length`` exactly, so knot times are preserved.
+    """
+    avg = length / dt
+    c = (avg - (v0 + v1) * _LOG_W_AREA) / _LOG_BUMP_AREA
+
+    def speed(tau: float) -> float:
+        return v0 * _log_w(1.0 - tau) + v1 * _log_w(tau) + c * _log_bump(tau)
+
+    def arc(tau: float) -> float:
+        return (
+            v0 * (_LOG_W_AREA - _log_w_integral(1.0 - tau))
+            + v1 * _log_w_integral(tau)
+            + c * _log_bump_integral(tau)
+        ) * dt
+
+    return speed, arc
+
+
+def _log_profile_peak(
+    v0: float, v1: float, length: float, dt: float, samples: int = 32
+) -> float:
+    """Peak speed of the log profile (dense deterministic sampling)."""
+    speed, _ = _log_profile(v0, v1, length, dt)
+    return max(speed(i / samples) for i in range(samples + 1))
+
+
+# Peak/average speed ratio of a rest-to-rest log-eased segment (the bump is
+# symmetric, so the peak sits at τ = 0.5). Used to size takeoff/landing
+# durations so their *peak* vertical speed matches the configured speed.
+_EASE_PEAK_FACTOR = _log_bump(0.5) / _LOG_BUMP_AREA
 
 
 class TrajectoryLimitError(ValueError):
@@ -114,8 +201,9 @@ def _vertical_segment_duration(
     """Duration of a vertical climb/descent so its *peak* speed equals *speed*.
 
     With easing enabled the segment starts and ends at rest, which makes the
-    peak speed 1.5× the average — so the segment must take 1.5× longer for
-    the same peak. Without easing the motion is constant-speed.
+    peak speed ``_EASE_PEAK_FACTOR`` × the average (≈1.49 for the log
+    profile) — so the segment must take that much longer for the same peak.
+    Without easing the motion is constant-speed.
     """
     if altitude_delta <= 0:
         return 0.0
@@ -202,14 +290,18 @@ def solver_result_to_trajectory_dicts(
         if ground_positions is not None and idx < len(ground_positions):
             ground_z = float(ground_positions[idx][2])
 
-        # Collect raw waypoints from solver
+        # Collect raw waypoints from solver; steps flagged constant-speed
+        # (staged stack-entry climbs) are smoothing-exempt.
         raw_points: List[list] = []
+        constant_raw_times: set = set()
         for rec in result.steps:
             t_sec = round(rec.step * duration_sec, 4)
             pos = rec.positions[did]
             raw_points.append(
                 [t_sec, [round(pos[0], 4), round(pos[1], 4), round(pos[2], 4)], []]
             )
+            if rec.constant_speed:
+                constant_raw_times.add(t_sec)
 
         if not raw_points:
             trajectories.append(
@@ -264,8 +356,13 @@ def solver_result_to_trajectory_dicts(
         # segment, then ease the speed. Collinear runs are NOT merged for
         # solver output: merging would let the schedule deviation grow with
         # the run length and break the solver's collision guarantees.
+        constant_times = {
+            round(t + takeoff_duration, 4) for t in constant_raw_times
+        }
         optimised = _collapse_stationary(points)
-        smoothed = apply_velocity_smoothing(optimised, velocity_smoothing)
+        smoothed = apply_velocity_smoothing(
+            optimised, velocity_smoothing, constant_times=constant_times
+        )
 
         trajectories.append(
             {
@@ -929,6 +1026,7 @@ def apply_velocity_smoothing(
     merge_collinear: bool = False,
     max_velocity_xy: float = MAX_VELOCITY_XY,
     max_velocity_z: float = MAX_VELOCITY_Z,
+    constant_times: Optional[set] = None,
 ) -> List[list]:
     """Give the trajectory a smooth speed profile without changing its path.
 
@@ -937,9 +1035,12 @@ def apply_velocity_smoothing(
     travelled at constant speed — the speed jumps from 0 to cruise instantly
     at every segment boundary, which is the "inertia" jerk the drone feels.
 
-    Each moving segment is replaced with a **cubic Bézier** whose two interior
-    control points lie *on the straight line* between the segment endpoints,
-    so the geometric path is unchanged; only the speed along it changes.
+    Each accelerating/decelerating segment is re-timed along a **natural-log
+    speed profile** (see the ``_log_profile`` block) and rendered as
+    ``_LOG_SUBDIVISIONS`` cubic Bézier pieces whose control points lie *on
+    the straight line* between the segment endpoints, so the geometric path
+    is unchanged; only the speed along it changes. Segments cruising at
+    constant speed on both ends stay single linear segments.
 
     Per-waypoint target speed at the shared keyframe between two segments:
 
@@ -950,7 +1051,11 @@ def apply_velocity_smoothing(
     * near-collinear pass-through: cruise speed, i.e. the segment stays
       effectively constant-speed (zero schedule deviation).
 
-    Velocity safety: the exact peak speed of every eased segment is checked
+    Segments whose end keyframe time is listed in ``constant_times`` are
+    smoothing-exempt: they keep their exact constant commanded speed (used
+    for staged stack-entry climbs).
+
+    Velocity safety: the peak speed of every eased segment is checked
     against ``max_velocity_xy`` / ``max_velocity_z``. Segments that would
     exceed a limit get their easing relaxed toward constant speed; if the
     limits still cannot be met the whole trajectory falls back to constant
@@ -1017,6 +1122,14 @@ def apply_velocity_smoothing(
     if smoothing <= 0.0:
         return points
 
+    # Smoothing-exempt segments (constant commanded speed, e.g. stack-entry
+    # climbs), keyed by the end keyframe's timestamp.
+    exempt: List[bool] = [False] * n
+    if constant_times:
+        for k in range(1, n):
+            if points[k][0] in constant_times:
+                exempt[k] = True
+
     # Target speed at each keyframe (see docstring).
     speed_at: List[float] = [0.0] * n
     for i in range(n):
@@ -1038,22 +1151,31 @@ def apply_velocity_smoothing(
         else:
             speed_at[i] = pass_through  # straight-through, keep cruising
 
+    def needs_easing(k: int) -> bool:
+        """Eased iff moving, not exempt and not a pure cruise pass-through."""
+        if seg_dir[k] is None or exempt[k]:
+            return False
+        return (
+            abs(speed_at[k - 1] - seg_cruise[k]) > 1e-9
+            or abs(speed_at[k] - seg_cruise[k]) > 1e-9
+        )
+
     # Peak-speed enforcement: relax the easing (raise endpoint speeds toward
-    # cruise) on segments whose eased peak would exceed the velocity limits.
+    # cruise) on segments whose log-profile peak would exceed the velocity
+    # limits. The profile is affine in the endpoint speeds, so pulling them
+    # toward cruise pulls the peak toward cruise.
     for _ in range(4):
         any_violation = False
         for k in range(1, n):
-            if seg_dir[k] is None:
+            if not needs_easing(k):
                 continue
-            peak = _segment_peak_speed(
+            peak = _log_profile_peak(
                 speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k]
             )
             if peak <= seg_limit[k] * (1.0 + 1e-9):
                 continue
             any_violation = True
             cruise = seg_cruise[k]
-            # Endpoint speeds and the peak are affine in the ease amount, so
-            # the relaxation factor has a closed form.
             beta = (seg_limit[k] - cruise) / max(peak - cruise, 1e-9)
             beta = max(0.0, min(1.0, beta))
             for endpoint in (k - 1, k):
@@ -1073,27 +1195,51 @@ def apply_velocity_smoothing(
     # cannot be met with easing (constant speed is feasible per the cruise
     # check above).
     for k in range(1, n):
-        if seg_dir[k] is None:
+        if not needs_easing(k):
             continue
-        peak = _segment_peak_speed(
+        peak = _log_profile_peak(
             speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k]
         )
         if peak > seg_limit[k] * (1.0 + 1e-6):
             return points
 
-    out: List[list] = [list(p) for p in points]
+    # Render: eased segments become _LOG_SUBDIVISIONS C¹-continuous cubic
+    # Bézier pieces sampling the log profile; everything else stays a single
+    # linear segment. Knot times of the original keyframes never move.
+    out: List[list] = [list(points[0])]
     for k in range(1, n):
-        u = seg_dir[k]
-        if u is None:
-            out[k][2] = []  # keep holds / degenerate segments constant
+        end_time = points[k][0]
+        end_pos = list(points[k][1])
+        if not needs_easing(k):
+            out.append([end_time, end_pos, []])
             continue
+
+        u = seg_dir[k]
         a = points[k - 1][1]
-        d1, d2 = _control_distances(
+        t0 = points[k - 1][0]
+        speed, arc = _log_profile(
             speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k]
         )
-        p1 = [round(a[j] + u[j] * d1, 4) for j in range(3)]
-        p2 = [round(a[j] + u[j] * d2, 4) for j in range(3)]
-        out[k][2] = [p1, p2]
+        prev_tau = 0.0
+        prev_arc = 0.0
+        prev_speed = speed_at[k - 1]
+        for i in range(1, _LOG_SUBDIVISIONS + 1):
+            tau = i / _LOG_SUBDIVISIONS
+            last = i == _LOG_SUBDIVISIONS
+            s = seg_len[k] if last else min(seg_len[k], max(prev_arc, arc(tau)))
+            v = speed_at[k] if last else max(0.0, speed(tau))
+            sub_len = s - prev_arc
+            sub_dt = (tau - prev_tau) * seg_dt[k]
+            d1, d2 = _control_distances(prev_speed, v, sub_len, sub_dt)
+            p1 = [round(a[j] + u[j] * (prev_arc + d1), 4) for j in range(3)]
+            p2 = [round(a[j] + u[j] * (prev_arc + d2), 4) for j in range(3)]
+            if last:
+                knot_t, knot_pos = end_time, end_pos
+            else:
+                knot_t = round(t0 + tau * seg_dt[k], 4)
+                knot_pos = [round(a[j] + u[j] * s, 4) for j in range(3)]
+            out.append([knot_t, knot_pos, [p1, p2]])
+            prev_tau, prev_arc, prev_speed = tau, s, v
 
     return out
 

@@ -20,6 +20,16 @@ Formation-phase flow (``phases`` present)::
       ▼
     ground
 
+Two downwash-aware operational rules apply inside every solver segment:
+
+* **Dispatch gate** (see ``solver``): drones depart staggered, highest
+  destination altitude first — never more than 5 moving at once, and a
+  drone only departs once every active mover is ≥ 5 m away horizontally.
+* **Staged stack entry** (:func:`_stack_entry_plan`): a drone whose target
+  sits within 4 m under another drone approaches 4 m below its target and
+  climbs the final stretch vertically at a constant 0.5 m/s, after the
+  drones above it have settled.
+
 Safety contract (fail-loudly)
 -----------------------------
 Planning failures never produce partial output: if any solver segment fails,
@@ -70,6 +80,7 @@ from .output import (
     skyc_bytes_from_show_dicts,
 )
 from .collision_volume import (
+    GUARANTEED_XY_CLEARANCE,
     PLANNED_XY_CLEARANCE,
     PLANNING_MARGIN,
     describe_collision_envelope,
@@ -113,6 +124,18 @@ MIN_TAKEOFF_TIME = 5.0
 # form a grid with this spacing before the requested formation phases start.
 DEFAULT_STAGING_ALTITUDE = 5.0
 DEFAULT_GRID_SPACING = 2.0
+
+# Vertical-stack entry (downwash mitigation). When a target formation places
+# one drone within STACK_VERTICAL_GAP above another with horizontal offset
+# below STACK_XY_TOLERANCE (i.e. inside the upper drone's downwash column),
+# the lower drone first flies to an approach point STACK_APPROACH_OFFSET
+# below its target and enters the last stretch as a pure vertical climb at a
+# constant STACK_CLIMB_SPEED — only after every stacked drone above it has
+# settled at its own target.
+STACK_VERTICAL_GAP = 4.0
+STACK_APPROACH_OFFSET = 4.0
+STACK_XY_TOLERANCE = GUARANTEED_XY_CLEARANCE
+STACK_CLIMB_SPEED = 0.5
 
 
 class PlanningError(Exception):
@@ -598,6 +621,82 @@ def _segment_seed(seed: Optional[int], index: int) -> Optional[int]:
     return None if seed is None else seed + index
 
 
+def _stack_entry_plan(
+    targets: Sequence[tuple[float, float, float]], *, min_z: float
+) -> tuple[list[tuple[float, float, float]], list[list[int]]]:
+    """Split entry into a stacked formation into approach + climb waves.
+
+    Detects vertical stacks in *targets*: drones whose horizontal offset is
+    below :data:`STACK_XY_TOLERANCE` form a column; within a column, a drone
+    sitting within :data:`STACK_VERTICAL_GAP` below the drone above it needs
+    the staged entry.
+
+    Returns ``(approach_targets, climb_waves)``. ``approach_targets`` equals
+    *targets* except for stacked lower drones, which stop
+    :data:`STACK_APPROACH_OFFSET` below their real target (never below
+    *min_z*). ``climb_waves[k]`` lists the drone indices that perform their
+    final vertical climb in wave ``k`` — ordered so that drones higher in a
+    column always settle before anyone climbs underneath them.
+
+    Raises :class:`PlanningError` when altitude clamping squashes two
+    approach points of the same column together (no safe staged entry
+    exists).
+    """
+    n = len(targets)
+    approach: list[tuple[float, float, float]] = [tuple(t) for t in targets]
+    waves: dict[int, list[int]] = {}
+
+    # Connected components under horizontal proximity.
+    adjacency: dict[int, set[int]] = {i: set() for i in range(n)}
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = targets[i][0] - targets[j][0]
+            dy = targets[i][1] - targets[j][1]
+            if sqrt(dx * dx + dy * dy) < STACK_XY_TOLERANCE:
+                adjacency[i].add(j)
+                adjacency[j].add(i)
+
+    unvisited = set(range(n))
+    while unvisited:
+        frontier = [unvisited.pop()]
+        component = set(frontier)
+        while frontier:
+            node = frontier.pop()
+            for neighbour in adjacency[node]:
+                if neighbour in component:
+                    continue
+                component.add(neighbour)
+                frontier.append(neighbour)
+        unvisited -= component
+        if len(component) < 2:
+            continue
+
+        order = sorted(component, key=lambda i: -targets[i][2])
+        depth = 0
+        for above, below in zip(order, order[1:]):
+            if targets[above][2] - targets[below][2] <= STACK_VERTICAL_GAP:
+                depth += 1
+            else:
+                depth = 0  # gap break: this drone is the top of a new stack
+            if depth > 0:
+                x, y, z = targets[below]
+                approach[below] = (x, y, max(min_z, z - STACK_APPROACH_OFFSET))
+                waves.setdefault(depth, []).append(below)
+
+        for above, below in zip(order, order[1:]):
+            if approach[above][2] - approach[below][2] < 1e-6 and (
+                approach[above] != targets[above] or approach[below] != targets[below]
+            ):
+                raise PlanningError(
+                    "staged stack entry is impossible: approach points for "
+                    f"drones {above + 1} and {below + 1} collapse at the "
+                    "minimum altitude; raise the formation or min_alt",
+                    details={"drones": [f"drone-{above + 1}", f"drone-{below + 1}"]},
+                )
+
+    return approach, [waves[k] for k in sorted(waves)]
+
+
 def _yaw_steps_needed(
     current_yaws: list[float],
     target_yaws: list[float],
@@ -666,8 +765,12 @@ def _extend_with_solver_run(
     min_z: float,
     current_yaws: list[float],
     label: str,
+    constant_speed: bool = False,
 ) -> list[tuple[float, float, float]]:
     """Run one solver segment and append its steps to the combined timeline.
+
+    ``constant_speed`` marks the appended steps as smoothing-exempt (used
+    for staged stack-entry climbs whose speed must stay exactly constant).
 
     Raises :class:`PlanningError` when the segment cannot be solved — the
     caller never sees a partial path.
@@ -702,6 +805,7 @@ def _extend_with_solver_run(
                 reverted_drones=list(record.reverted_drones),
                 verified=record.verified,
                 yaws={idx: current_yaws[idx] for idx in range(num_drones)},
+                constant_speed=constant_speed,
             )
         )
     return [tuple(result.steps[-1].positions[idx]) for idx in range(num_drones)]
@@ -767,7 +871,7 @@ def _plan_formation_phases(
             }
         )
 
-    def run_segment(targets, label: str) -> None:
+    def run_stage(targets, label: str, *, stage_step_size, constant_speed) -> None:
         nonlocal current_positions, segment_counter
         if _positions_match(current_positions, targets):
             current_positions = [tuple(t) for t in targets]
@@ -776,13 +880,55 @@ def _plan_formation_phases(
             combined_steps,
             current_positions,
             targets,
-            step_size=step_size,
+            step_size=stage_step_size,
             seed=_segment_seed(seed, segment_counter),
             min_z=min_z,
             current_yaws=current_yaws,
             label=label,
+            constant_speed=constant_speed,
         )
         segment_counter += 1
+
+    def run_segment(targets, label: str) -> None:
+        """One formation move: approach stage plus staged stack-entry climbs.
+
+        Stacked lower drones stop :data:`STACK_APPROACH_OFFSET` below their
+        target during the approach and climb the final stretch vertically at
+        a constant :data:`STACK_CLIMB_SPEED`, wave by wave (top first), only
+        after the drones above them have settled.
+        """
+        approach_targets, climb_waves = _stack_entry_plan(targets, min_z=min_z)
+
+        # Drones already parked on their target stay put — no re-entry dip.
+        stationary = {
+            i
+            for i in range(len(targets))
+            if Drone.distance(current_positions[i], targets[i]) < 1e-9
+        }
+        if stationary:
+            approach_targets = [
+                tuple(targets[i]) if i in stationary else approach_targets[i]
+                for i in range(len(targets))
+            ]
+            climb_waves = [
+                [i for i in wave if i not in stationary] for wave in climb_waves
+            ]
+            climb_waves = [wave for wave in climb_waves if wave]
+
+        run_stage(
+            approach_targets, label, stage_step_size=step_size, constant_speed=False
+        )
+        climb_step = STACK_CLIMB_SPEED * duration_sec
+        for wave_index, wave in enumerate(climb_waves):
+            wave_targets = list(current_positions)
+            for drone_index in wave:
+                wave_targets[drone_index] = tuple(targets[drone_index])
+            run_stage(
+                wave_targets,
+                f"{label}/stack-climb-{wave_index + 1}",
+                stage_step_size=climb_step,
+                constant_speed=True,
+            )
 
     # ── staging: move from the hover line-up into the grid ──────────────
     if staging_targets is not None:

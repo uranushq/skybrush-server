@@ -21,9 +21,9 @@ Planning margin
 ---------------
 The solver checks the envelope inflated by :data:`PLANNING_MARGIN` on every
 side. Velocity smoothing (see ``converter``) re-times each drone along its
-own path with a bounded schedule deviation of at most ~9.7% of one solver
-step; the margin absorbs that deviation (with a lot of slack), so clearances
-proven at plan time still hold for the smoothed trajectories. The final
+own path with a bounded schedule deviation of at most ~15% of one solver
+step (natural-log profile); the margin absorbs that deviation (with slack),
+so clearances proven at plan time still hold for the smoothed trajectories. The final
 verification gate (see ``verify``) re-checks the smoothed trajectories with
 ``margin=0`` as a defense in depth.
 
@@ -59,7 +59,7 @@ WAKE_RADIUS = 0.03
 
 # Margin (meters, per side of each drone's envelope) used for all plan-time
 # collision checks. Must stay well above the velocity-smoothing schedule
-# deviation bound (~0.097 * step_size per drone).
+# deviation bound (~0.15 * step_size per drone for the log profile).
 PLANNING_MARGIN = 0.25
 
 # Legacy names used by the REST API / formation validator
@@ -167,28 +167,37 @@ MIN_DISTANCE_FOR_VALIDATION = math.floor(GUARANTEED_XY_CLEARANCE * 10.0) / 10.0
 
 
 def envelope_overlap(
-    a: Sequence[float], b: Sequence[float], *, margin: float = 0.0
+    a: Sequence[float],
+    b: Sequence[float],
+    *,
+    margin: float = 0.0,
+    b_extends_below: float = 0.0,
 ) -> bool:
     """Yaw-invariant envelope overlap check for two drones at *a* and *b*.
 
     ``margin`` inflates each drone's envelope on every side; pass
     :data:`PLANNING_MARGIN` for plan-time checks and 0 for final verification.
+    ``b_extends_below`` additionally extends *b*'s envelope that many meters
+    downward — used by route planning to treat a parked drone's downwash
+    column as blocked.
     """
     if abs(a[0] - b[0]) >= 2.0 * (ENVELOPE_XY_HALF + margin):
         return False
     if abs(a[1] - b[1]) >= 2.0 * (ENVELOPE_XY_HALF + margin):
         return False
-    return abs(a[2] - b[2]) < ENVELOPE_Z_HEIGHT + 2.0 * margin
+    z_window = ENVELOPE_Z_HEIGHT + 2.0 * margin
+    dz = a[2] - b[2]
+    return -(z_window + b_extends_below) < dz < z_window
 
 
 def _axis_overlap_interval(
-    c: float, d: float, half_width: float
+    c: float, d: float, lo_bound: float, hi_bound: float
 ) -> tuple[float, float]:
-    """Time interval within [0, 1] where ``|c + t*d| < half_width``."""
+    """Time interval within [0, 1] where ``lo_bound < c + t*d < hi_bound``."""
     if abs(d) < 1e-12:
-        return (0.0, 1.0) if abs(c) < half_width else (1.0, 0.0)
-    t_enter = (-half_width - c) / d
-    t_exit = (half_width - c) / d
+        return (0.0, 1.0) if lo_bound < c < hi_bound else (1.0, 0.0)
+    t_enter = (lo_bound - c) / d
+    t_exit = (hi_bound - c) / d
     lo, hi = (t_enter, t_exit) if t_enter <= t_exit else (t_exit, t_enter)
     return max(lo, 0.0), min(hi, 1.0)
 
@@ -200,23 +209,28 @@ def envelope_overlap_swept(
     b1: Sequence[float],
     *,
     margin: float = 0.0,
+    b_extends_below: float = 0.0,
 ) -> bool:
     """Exact overlap check while both drones move linearly from t=0 to t=1.
 
     The relative offset on each axis is linear in time, so the overlap window
     per axis is solved in closed form; a collision exists iff the three
-    windows intersect. No sampling, no tunneling.
+    windows intersect. No sampling, no tunneling. ``b_extends_below``
+    extends *b*'s envelope downward (see :func:`envelope_overlap`), making
+    the z window asymmetric.
     """
+    xy_window = 2.0 * (ENVELOPE_XY_HALF + margin)
+    z_window = ENVELOPE_Z_HEIGHT + 2.0 * margin
     lo = 0.0
     hi = 1.0
-    for axis, half_width in (
-        (0, 2.0 * (ENVELOPE_XY_HALF + margin)),
-        (1, 2.0 * (ENVELOPE_XY_HALF + margin)),
-        (2, ENVELOPE_Z_HEIGHT + 2.0 * margin),
+    for axis, lo_bound, hi_bound in (
+        (0, -xy_window, xy_window),
+        (1, -xy_window, xy_window),
+        (2, -(z_window + b_extends_below), z_window),
     ):
         c = a0[axis] - b0[axis]
         d = (a1[axis] - a0[axis]) - (b1[axis] - b0[axis])
-        axis_lo, axis_hi = _axis_overlap_interval(c, d, half_width)
+        axis_lo, axis_hi = _axis_overlap_interval(c, d, lo_bound, hi_bound)
         lo = max(lo, axis_lo)
         hi = min(hi, axis_hi)
         if lo >= hi:

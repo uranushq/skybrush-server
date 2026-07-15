@@ -1,6 +1,8 @@
-"""Tests for path-planner request parsing helpers."""
+"""Tests for path-planner request parsing helpers and phase planning."""
 
 from __future__ import annotations
+
+import pytest
 
 from flockwave.server.ext.path_planner.converter import (
     DEFAULT_CRUISE_SPEED_M_S,
@@ -9,9 +11,14 @@ from flockwave.server.ext.path_planner.converter import (
     solver_result_to_trajectory_dicts,
 )
 from flockwave.server.ext.path_planner.extension import (
+    STACK_APPROACH_OFFSET,
+    STACK_CLIMB_SPEED,
+    PlanningError,
     _drone_index_from_id,
     _normalize_vec3_array,
     _phase_point_drone_index,
+    _plan_formation_phases,
+    _stack_entry_plan,
 )
 from flockwave.server.ext.path_planner.solver import Drone, SolverResult, StepRecord
 
@@ -67,3 +74,81 @@ def test_normalize_vec3_array_orders_by_show_drone_id() -> None:
         {"droneId": "show-drone-1", "x": 0, "y": 0, "z": 0},
     ]
     assert _normalize_vec3_array("initial", value) == [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]]
+
+
+# ── staged vertical stack entry ──────────────────────────────────────────
+
+
+def test_stack_entry_plan_detects_column() -> None:
+    targets = [(0.0, 0.0, 8.0), (0.0, 0.0, 5.0), (10.0, 0.0, 5.0)]
+    approach, waves = _stack_entry_plan(targets, min_z=0.0)
+    assert approach[0] == (0.0, 0.0, 8.0)  # top of the stack: normal entry
+    assert approach[1] == (0.0, 0.0, 5.0 - STACK_APPROACH_OFFSET)
+    assert approach[2] == (10.0, 0.0, 5.0)  # horizontally far: untouched
+    assert waves == [[1]]
+
+
+def test_stack_entry_plan_ignores_wide_vertical_gaps() -> None:
+    targets = [(0.0, 0.0, 9.0), (0.0, 0.0, 4.5)]  # gap 4.5 m > 4 m
+    approach, waves = _stack_entry_plan(targets, min_z=0.0)
+    assert approach == [tuple(t) for t in targets]
+    assert waves == []
+
+
+def test_stack_entry_plan_three_deep_column_climbs_top_first() -> None:
+    targets = [(0.0, 0.0, 9.0), (0.0, 0.0, 6.0), (0.0, 0.0, 3.0)]
+    approach, waves = _stack_entry_plan(targets, min_z=0.0)
+    assert approach[1] == (0.0, 0.0, 2.0)
+    assert approach[2] == (0.0, 0.0, 0.0)  # clamped at min_z
+    assert waves == [[1], [2]]  # drone above always settles first
+
+
+def test_stack_entry_plan_fails_loudly_when_approaches_collapse() -> None:
+    targets = [(0.0, 0.0, 8.0), (0.0, 0.0, 6.0), (0.0, 0.0, 4.0)]
+    with pytest.raises(PlanningError):
+        _stack_entry_plan(targets, min_z=2.0)
+
+
+def test_stacked_phase_enters_from_below_at_constant_speed() -> None:
+    # Drone 1 already sits at the stack top; drone 2 must approach 4 m below
+    # its target and climb the last stretch vertically at STACK_CLIMB_SPEED.
+    start = [(0.0, 0.0, 10.0), (8.0, 0.0, 10.0)]
+    phases = [
+        {
+            "name": "stack",
+            "points": [
+                {"x": 0.0, "y": 0.0, "z": 10.0},
+                {"x": 0.0, "y": 0.0, "z": 7.0},
+            ],
+        }
+    ]
+    result, _summaries = _plan_formation_phases(
+        start_positions=start,
+        phases=phases,
+        step_size=1.0,
+        duration_ms=1000,
+        seed=7,
+        return_to_initial=False,
+        min_z=0.0,
+    )
+
+    climb_steps = [rec for rec in result.steps if rec.constant_speed]
+    assert climb_steps, "expected a staged climb segment"
+
+    first_climb_index = next(
+        i for i, rec in enumerate(result.steps) if rec.constant_speed
+    )
+    before_climb = result.steps[first_climb_index - 1].positions[1]
+    assert before_climb == [0.0, 0.0, 7.0 - STACK_APPROACH_OFFSET]
+
+    previous = before_climb
+    for rec in climb_steps:
+        pos = rec.positions[1]
+        # purely vertical, exactly one climb step per record
+        assert pos[0] == previous[0] and pos[1] == previous[1]
+        assert pos[2] - previous[2] == pytest.approx(STACK_CLIMB_SPEED * 1.0)
+        # the drone above never moves while someone climbs underneath
+        assert rec.positions[0] == [0.0, 0.0, 10.0]
+        previous = pos
+
+    assert result.steps[-1].positions[1] == [0.0, 0.0, 7.0]
