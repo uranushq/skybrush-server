@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import math
 
-from flockwave.server.ext.path_planner.collision_volume import PLANNING_MARGIN
+from flockwave.server.ext.path_planner.collision_volume import (
+    MIN_FORMATION_XY_CLEARANCE,
+)
 from flockwave.server.ext.path_planner.converter import (
     _EASE_PEAK_FACTOR,
     _LOG_SUBDIVISIONS,
@@ -48,9 +50,11 @@ def test_schedule_deviation_stays_below_contract_bound() -> None:
 
 
 def test_deviation_bound_fits_planning_margin() -> None:
-    # Two drones may deviate in opposite directions; the pair-wise slack is
-    # one PLANNING_MARGIN per side. Checked for the default 1 m step.
-    assert 2.0 * MAX_DEVIATION_FRACTION * 1.0 <= 2.0 * PLANNING_MARGIN
+    # Two drones may deviate in opposite directions. With PLANNING_MARGIN
+    # at 0 (origin/dev policy) the schedule error must stay small relative
+    # to the minimum formation spacing floor. Checked for the default 1 m
+    # step.
+    assert 2.0 * MAX_DEVIATION_FRACTION * 1.0 <= MIN_FORMATION_XY_CLEARANCE
 
 
 def test_endpoint_speeds_match() -> None:

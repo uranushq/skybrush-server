@@ -60,10 +60,10 @@ DEFAULT_MAX_YAW_RATE_DEG_S = 90.0
 
 # Default horizontal cruise speed during formation moves (m/s). Keep in
 # sync with DEFAULT_DURATION_MS (= step_size / cruise speed for a 1 m step).
-DEFAULT_CRUISE_SPEED_M_S = 1.0
+DEFAULT_CRUISE_SPEED_M_S = 0.1
 
 # Default vertical speed while descending to land (m/s).
-DEFAULT_LANDING_SPEED_M_S = 0.2
+DEFAULT_LANDING_SPEED_M_S = 0.5
 
 # Default vertical speed during takeoff (m/s).
 DEFAULT_TAKEOFF_SPEED_M_S = 1.5

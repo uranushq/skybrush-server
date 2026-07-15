@@ -15,7 +15,6 @@ from flockwave.server.ext.path_planner.collision_volume import (
     ENVELOPE_Z_HEIGHT,
     GUARANTEED_XY_CLEARANCE,
     PLANNED_XY_CLEARANCE,
-    PLANNING_MARGIN,
     WAKE_ANGLE_DEG,
     WAKE_LENGTH,
     WAKE_RADIUS,
@@ -89,24 +88,25 @@ def test_wake_clears_when_far_below() -> None:
 
 
 def test_tight_formation_spacing_is_allowed() -> None:
-    """With the small-drone wake, sub-meter spacing must clear the envelope.
-
-    Guards the intent of the wake shrink (0.15 m length / 0.03 m radius):
-    two drones 0.75 m apart on either horizontal axis are safe.
-    """
-    assert GUARANTEED_XY_CLEARANCE < 0.75
+    """Policy minimum spacing is 0.7 m; 0.75 m on either axis must clear."""
+    assert GUARANTEED_XY_CLEARANCE == 0.7
+    assert PLANNED_XY_CLEARANCE == 0.7
     assert not volumes_overlap([0.0, 0.0, 10.0], [0.75, 0.0, 10.0])
     assert not volumes_overlap([0.0, 0.0, 10.0], [0.0, 0.75, 10.0])
+    assert not volumes_overlap([0.0, 0.0, 10.0], [0.7, 0.0, 10.0])
+    assert volumes_overlap([0.0, 0.0, 10.0], [0.69, 0.0, 10.0])
 
 
 def test_margin_inflates_envelope() -> None:
     a = [0.0, 0.0, 10.0]
     b = [GUARANTEED_XY_CLEARANCE + 0.1, 0.0, 10.0]
     assert not envelope_overlap(a, b)
-    assert envelope_overlap(a, b, margin=PLANNING_MARGIN)
+    # Explicit margin (policy PLANNING_MARGIN is 0) still inflates the check.
+    assert envelope_overlap(a, b, margin=0.25)
     assert not envelope_overlap(
-        [0.0, 0.0, 10.0], [PLANNED_XY_CLEARANCE + 0.01, 0.0, 10.0],
-        margin=PLANNING_MARGIN,
+        [0.0, 0.0, 10.0],
+        [GUARANTEED_XY_CLEARANCE + 2.0 * 0.25 + 0.01, 0.0, 10.0],
+        margin=0.25,
     )
 
 
