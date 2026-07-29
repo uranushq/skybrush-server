@@ -1,4 +1,4 @@
-"""REST API for MAVLink flight-mode parameter management."""
+"""REST API for MAVLink flight-mode and parameter management."""
 
 from __future__ import annotations
 
@@ -14,6 +14,10 @@ from flockwave.server.ext.mavlink.flight_modes import (
     configure_show_mode_flight_mode_slots,
     flight_mode_slot_errors,
     read_show_mode_flight_mode_slots,
+)
+from flockwave.server.ext.mavlink.parameters import (
+    parameter_list_errors,
+    read_all_parameters,
 )
 from flockwave.server.model.uav import UAV, is_uav
 
@@ -123,6 +127,45 @@ async def read_flight_mode_slots(
     return payload, 200
 
 
+async def read_parameter_lists(
+    requested_ids: list[str] | None = None,
+) -> tuple[dict[str, Any], int]:
+    """Download full parameter lists from MAVLink UAVs via MAVFTP.
+
+    Returns ``(payload, HTTP status)``. Status is 404 when no MAVLink UAVs
+    match, 207 when some UAVs fail, otherwise 200.
+    """
+    uavs, skipped = _resolve_mavlink_uavs(requested_ids)
+    if not uavs:
+        return (
+            {
+                "error": "No MAVLink UAVs available",
+                "skipped": skipped,
+            },
+            404,
+        )
+
+    results: dict[str, dict[str, Any]] = {}
+    for uav_id, uav in uavs:
+        results[uav_id] = await read_all_parameters(uav)
+        if log and "error" not in results[uav_id]:
+            log.info(
+                "Downloaded %s parameters from %s",
+                results[uav_id].get("count", 0),
+                uav_id,
+            )
+
+    payload: dict[str, Any] = {
+        "results": results,
+        "skipped": skipped,
+    }
+    errors = parameter_list_errors(results)
+    if errors:
+        payload["errors"] = errors
+        return payload, 207
+    return payload, 200
+
+
 @blueprint.route("/flight-modes", methods=["GET"])
 async def get_flight_mode_slots():
     """Read FLTMODE5 and FLTMODE6 from connected MAVLink UAVs."""
@@ -168,6 +211,32 @@ async def set_flight_mode_slots():
             mode=float(mode),
             requested_ids=requested,
         )
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+    return jsonify(payload), status
+
+
+@blueprint.route("/parameters", methods=["GET"])
+async def get_all_parameters():
+    """Download the full parameter list from connected MAVLink UAVs.
+
+    Query parameters:
+
+    - ``uavs``: optional repeated UAV IDs. When omitted, all connected
+      MAVLink UAVs are queried.
+
+    Example::
+
+        GET /api/v1/mavlink/parameters?uavs=1
+
+    Each successful UAV entry contains ``count`` and a ``parameters`` list of
+    ``{name, value, type, default}`` objects (sorted by name). ArduPilot
+    vehicles are supported via MAVFTP ``@PARAM/param.pck`` download.
+    """
+    requested = request.args.getlist("uavs") or None
+
+    try:
+        payload, status = await read_parameter_lists(requested)
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 503
     return jsonify(payload), status

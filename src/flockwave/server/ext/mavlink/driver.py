@@ -66,6 +66,7 @@ from flockwave.server.utils.generic import nop
 
 from .accelerometer import AccelerometerCalibration
 from .autopilots import ArduPilot, Autopilot, UnknownAutopilot
+from .autopilots.ardupilot import decode_parameters_from_packed_format
 from .channel import Channel
 from .compass import CompassCalibration
 from .compassmot import CompassMotorInterferenceCalibration
@@ -1533,6 +1534,54 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         return self._autopilot.decode_param_from_wire_representation(
             response.param_value, response.param_type
         )
+
+    async def get_all_parameters(self) -> list[dict[str, Any]]:
+        """Download the full parameter list from the UAV via MAVFTP.
+
+        ArduPilot exposes the onboard parameter store as
+        ``@PARAM/param.pck``. This is much faster than issuing one
+        ``PARAM_REQUEST_READ`` per name (the Flockwave ``PRM-GET`` path).
+
+        Returns:
+            A list of parameter dicts sorted by name. Each entry has
+            ``name``, ``value``, ``type`` (MAVLink type name) and
+            ``default`` (``None`` when the packed stream has no defaults).
+
+        Raises:
+            NotSupportedError: when the autopilot does not support MAVFTP
+                packed parameter download
+            RuntimeError: when the download or decode fails
+        """
+        if not self._autopilot.supports_mavftp_parameter_upload:
+            raise NotSupportedError(
+                "Autopilot does not support bulk parameter download via MAVFTP"
+            )
+
+        async with aclosing(MAVFTP.for_uav(self)) as ftp:
+            data = await ftp.get("@PARAM/param.pck")
+
+        if not data:
+            raise RuntimeError("Empty parameter bundle received from UAV")
+
+        entries: list[dict[str, Any]] = []
+        for param in decode_parameters_from_packed_format(data):
+            name = param.name.decode("ascii", "replace")
+            type_name = param.type.name if param.type is not None else None
+            entries.append(
+                {
+                    "name": name,
+                    "value": float(param.value),
+                    "type": type_name,
+                    "default": (
+                        float(param.default_value)
+                        if param.default_value is not None
+                        else None
+                    ),
+                }
+            )
+
+        entries.sort(key=lambda item: item["name"])
+        return entries
 
     async def _get_parameter(self, name: str) -> MAVLinkMessage:
         """Retrieves the value of a parameter from the UAV and returns a
