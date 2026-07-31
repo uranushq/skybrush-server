@@ -211,6 +211,17 @@ def _vertical_segment_duration(
     return round(factor * altitude_delta / speed, 4)
 
 
+def vertical_transit_duration_sec(
+    altitude_delta: float, speed: float, smoothing: float
+) -> float:
+    """Public alias of :func:`_vertical_segment_duration`.
+
+    Used by the extension to report the actual takeoff duration (and hence
+    the absolute show-timeline offset of every solver step) to API clients.
+    """
+    return _vertical_segment_duration(altitude_delta, speed, smoothing)
+
+
 def _takeoff_landing_profile(
     first_pos: Sequence[float],
     last_pos: Sequence[float],

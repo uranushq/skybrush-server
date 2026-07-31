@@ -30,6 +30,14 @@ Two downwash-aware operational rules apply inside every solver segment:
   climbs the final stretch vertically at a constant 0.5 m/s, after the
   drones above it have settled.
 
+A phase may pin selected drones to **user-defined fixed paths** via
+``fixedPaths`` (``[{"droneId": "drone-3", "path": [{x, y, z}, ...]}]``):
+during the transition *into* that phase the drone follows the waypoints
+verbatim (the last waypoint must equal its phase target) while the solver
+routes everyone else around it. Fixed-path drones skip the dispatch gate
+and the staged stack entry — the drawn path is trusted as the user's
+intent — but the final verification gate still checks the result.
+
 Safety contract (fail-loudly)
 -----------------------------
 Planning failures never produce partial output: if any solver segment fails,
@@ -71,6 +79,7 @@ from .converter import (
     duration_ms_for_cruise_speed,
     lerp_yaw_deg,
     save_skyb_files,
+    vertical_transit_duration_sec,
     yaw_delta_deg,
 )
 from .drone import Drone
@@ -263,6 +272,7 @@ def _validate_phases(phases, *, num_drones: int):
             )
 
         seen: set[int] = set()
+        targets_by_index: dict[int, tuple[float, float, float]] = {}
         for point_index, point in enumerate(points):
             if not isinstance(point, dict):
                 return (
@@ -333,8 +343,150 @@ def _validate_phases(phases, *, num_drones: int):
                     400,
                 )
             seen.add(drone_index)
+            targets_by_index[drone_index] = (
+                float(point["x"]),
+                float(point["y"]),
+                float(point["z"]),
+            )
+
+        error = _validate_phase_fixed_paths(
+            phase, phase_index, num_drones, targets_by_index
+        )
+        if error is not None:
+            return error
 
     return None
+
+
+# A fixed path's last waypoint must land on the drone's phase target within
+# this tolerance (meters) — the path *defines* the transition into the phase.
+FIXED_PATH_TARGET_TOLERANCE = 0.01
+
+
+def _validate_phase_fixed_paths(
+    phase: dict,
+    phase_index: int,
+    num_drones: int,
+    targets_by_index: dict[int, tuple[float, float, float]],
+):
+    """Validate the optional ``fixedPaths`` block of one phase.
+
+    Shape: ``[{"droneId": "drone-3", "path": [{"x":..,"y":..,"z":..}, ...]}]``.
+    The path is the exact route the drone must fly while transitioning
+    *into* this phase; its last waypoint must match the drone's target in
+    the phase's ``points``.
+    """
+    fixed = phase.get("fixedPaths", phase.get("fixed_paths"))
+    if fixed is None:
+        return None
+    prefix = f"'phases[{phase_index}].fixedPaths"
+    if not isinstance(fixed, list):
+        return jsonify({"error": f"{prefix}' must be an array"}), 400
+
+    seen: set[int] = set()
+    for entry_index, entry in enumerate(fixed):
+        if not isinstance(entry, dict):
+            return (
+                jsonify({"error": f"{prefix}[{entry_index}]' must be an object"}),
+                400,
+            )
+        drone_id = entry.get("droneId", entry.get("id"))
+        drone_index = _drone_index_from_id(drone_id) if drone_id is not None else None
+        if drone_index is None or not (0 <= drone_index < num_drones):
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"{prefix}[{entry_index}].droneId' must match one "
+                            "of drone-1..drone-N"
+                        )
+                    }
+                ),
+                400,
+            )
+        if drone_index in seen:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"{prefix}' contains duplicate entry for "
+                            f"drone-{drone_index + 1}"
+                        )
+                    }
+                ),
+                400,
+            )
+        seen.add(drone_index)
+
+        path = entry.get("path")
+        if not isinstance(path, list) or not path:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"{prefix}[{entry_index}].path' must be a "
+                            "non-empty array of waypoints"
+                        )
+                    }
+                ),
+                400,
+            )
+        for wp_index, waypoint in enumerate(path):
+            if not isinstance(waypoint, dict) or any(
+                not isinstance(waypoint.get(key), (int, float))
+                for key in ("x", "y", "z")
+            ):
+                return (
+                    jsonify(
+                        {
+                            "error": (
+                                f"{prefix}[{entry_index}].path[{wp_index}]' "
+                                "must be an object with numeric x, y, z"
+                            )
+                        }
+                    ),
+                    400,
+                )
+
+        target = targets_by_index[drone_index]
+        last = path[-1]
+        deviation = sqrt(
+            (float(last["x"]) - target[0]) ** 2
+            + (float(last["y"]) - target[1]) ** 2
+            + (float(last["z"]) - target[2]) ** 2
+        )
+        if deviation > FIXED_PATH_TARGET_TOLERANCE:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"{prefix}[{entry_index}].path' must end at "
+                            f"drone-{drone_index + 1}'s target for this phase "
+                            f"(off by {deviation:.3f} m)"
+                        )
+                    }
+                ),
+                400,
+            )
+    return None
+
+
+def _phase_fixed_routes(
+    phase: dict, num_drones: int
+) -> dict[int, list[tuple[float, float, float]]]:
+    """Parse a validated phase's ``fixedPaths`` into solver fixed routes."""
+    fixed = phase.get("fixedPaths", phase.get("fixed_paths")) or []
+    routes: dict[int, list[tuple[float, float, float]]] = {}
+    for entry in fixed:
+        drone_id = entry.get("droneId", entry.get("id"))
+        drone_index = _drone_index_from_id(drone_id)
+        if drone_index is None:
+            continue
+        routes[drone_index] = [
+            (float(wp["x"]), float(wp["y"]), float(wp["z"]))
+            for wp in entry["path"]
+        ]
+    return routes
 
 
 _DRONE_ID_STRING_PREFIXES = ("show-drone-", "drone-")
@@ -622,7 +774,10 @@ def _segment_seed(seed: Optional[int], index: int) -> Optional[int]:
 
 
 def _stack_entry_plan(
-    targets: Sequence[tuple[float, float, float]], *, min_z: float
+    targets: Sequence[tuple[float, float, float]],
+    *,
+    min_z: float,
+    exempt: Optional[set[int]] = None,
 ) -> tuple[list[tuple[float, float, float]], list[list[int]]]:
     """Split entry into a stacked formation into approach + climb waves.
 
@@ -630,6 +785,11 @@ def _stack_entry_plan(
     below :data:`STACK_XY_TOLERANCE` form a column; within a column, a drone
     sitting within :data:`STACK_VERTICAL_GAP` below the drone above it needs
     the staged entry.
+
+    Drones in *exempt* (user-pinned fixed paths, drones already parked on
+    their target) never receive a staged entry: their approach point stays
+    their real target and they join no climb wave. They still count for the
+    column ordering, so a non-exempt drone below them stages normally.
 
     Returns ``(approach_targets, climb_waves)``. ``approach_targets`` equals
     *targets* except for stacked lower drones, which stop
@@ -643,6 +803,7 @@ def _stack_entry_plan(
     exists).
     """
     n = len(targets)
+    exempt = exempt or set()
     approach: list[tuple[float, float, float]] = [tuple(t) for t in targets]
     waves: dict[int, list[int]] = {}
 
@@ -678,7 +839,7 @@ def _stack_entry_plan(
                 depth += 1
             else:
                 depth = 0  # gap break: this drone is the top of a new stack
-            if depth > 0:
+            if depth > 0 and below not in exempt:
                 x, y, z = targets[below]
                 approach[below] = (x, y, max(min_z, z - STACK_APPROACH_OFFSET))
                 waves.setdefault(depth, []).append(below)
@@ -687,11 +848,37 @@ def _stack_entry_plan(
             if approach[above][2] - approach[below][2] < 1e-6 and (
                 approach[above] != targets[above] or approach[below] != targets[below]
             ):
+                # Full column diagnostics: which targets were grouped into
+                # this vertical stack (horizontal offset < STACK_XY_TOLERANCE)
+                # and where their staged approach points ended up.
+                column = [
+                    {
+                        "drone": f"drone-{i + 1}",
+                        "target": [round(v, 3) for v in targets[i]],
+                        "approach": [round(v, 3) for v in approach[i]],
+                    }
+                    for i in order
+                ]
+                if log:
+                    log.warning(
+                        "staged stack entry failed: drones "
+                        f"{[i + 1 for i in order]} form one vertical column "
+                        f"(XY offsets < {STACK_XY_TOLERANCE:.2f} m); "
+                        f"min_z={min_z} m clamps the approach points of "
+                        f"drone-{above + 1} and drone-{below + 1} together. "
+                        f"column={column}"
+                    )
                 raise PlanningError(
                     "staged stack entry is impossible: approach points for "
                     f"drones {above + 1} and {below + 1} collapse at the "
                     "minimum altitude; raise the formation or min_alt",
-                    details={"drones": [f"drone-{above + 1}", f"drone-{below + 1}"]},
+                    details={
+                        "drones": [f"drone-{above + 1}", f"drone-{below + 1}"],
+                        "column": column,
+                        "min_z": min_z,
+                        "stack_xy_tolerance": STACK_XY_TOLERANCE,
+                        "stack_approach_offset": STACK_APPROACH_OFFSET,
+                    },
                 )
 
     return approach, [waves[k] for k in sorted(waves)]
@@ -766,11 +953,14 @@ def _extend_with_solver_run(
     current_yaws: list[float],
     label: str,
     constant_speed: bool = False,
+    fixed_routes: Optional[dict[int, list[tuple[float, float, float]]]] = None,
 ) -> list[tuple[float, float, float]]:
     """Run one solver segment and append its steps to the combined timeline.
 
     ``constant_speed`` marks the appended steps as smoothing-exempt (used
     for staged stack-entry climbs whose speed must stay exactly constant).
+    ``fixed_routes`` pins the listed drones to user-defined waypoint routes
+    for this segment (see :class:`PathSolver`).
 
     Raises :class:`PlanningError` when the segment cannot be solved — the
     caller never sees a partial path.
@@ -782,17 +972,31 @@ def _extend_with_solver_run(
         step_size=step_size,
         seed=seed,
         min_z=min_z,
+        fixed_routes=fixed_routes,
     )
     result = solver.solve()
     if not result.success:
+        details = {
+            "segment": label,
+            "reason": result.failure_reason,
+            "stuck_drones": [f"drone-{i + 1}" for i in result.stuck_drones],
+            "steps_completed": result.total_steps,
+        }
+        if result.fixed_conflicts:
+            details["code"] = "FIXED_PATH_CONFLICT"
+            details["fixed_conflicts"] = [
+                {
+                    "drone": f"drone-{c['drone'] + 1}",
+                    "blockedBy": [f"drone-{b + 1}" for b in c["blocked_by"]],
+                    "blockedByFixed": [
+                        f"drone-{b + 1}" for b in c["fixed_blockers"]
+                    ],
+                }
+                for c in result.fixed_conflicts
+            ]
         raise PlanningError(
             f"planning failed in segment '{label}': {result.failure_reason}",
-            details={
-                "segment": label,
-                "reason": result.failure_reason,
-                "stuck_drones": [f"drone-{i + 1}" for i in result.stuck_drones],
-                "steps_completed": result.total_steps,
-            },
+            details=details,
         )
 
     step_offset = combined_steps[-1].step
@@ -871,7 +1075,9 @@ def _plan_formation_phases(
             }
         )
 
-    def run_stage(targets, label: str, *, stage_step_size, constant_speed) -> None:
+    def run_stage(
+        targets, label: str, *, stage_step_size, constant_speed, fixed_routes=None
+    ) -> None:
         nonlocal current_positions, segment_counter
         if _positions_match(current_positions, targets):
             current_positions = [tuple(t) for t in targets]
@@ -886,37 +1092,54 @@ def _plan_formation_phases(
             current_yaws=current_yaws,
             label=label,
             constant_speed=constant_speed,
+            fixed_routes=fixed_routes,
         )
         segment_counter += 1
 
-    def run_segment(targets, label: str) -> None:
+    def run_segment(targets, label: str, fixed_routes=None) -> None:
         """One formation move: approach stage plus staged stack-entry climbs.
 
         Stacked lower drones stop :data:`STACK_APPROACH_OFFSET` below their
         target during the approach and climb the final stretch vertically at
         a constant :data:`STACK_CLIMB_SPEED`, wave by wave (top first), only
         after the drones above them have settled.
-        """
-        approach_targets, climb_waves = _stack_entry_plan(targets, min_z=min_z)
 
-        # Drones already parked on their target stay put — no re-entry dip.
+        Drones with a ``fixed_routes`` entry are exempt from the staged
+        stack entry — their user-defined path *is* the entry — and fly
+        straight to their real target along it during the approach stage.
+        """
+        # Exempt from the staged entry: drones already parked on their
+        # target (no re-entry dip) and user-pinned fixed paths (the drawn
+        # path IS the entry). Must be known *before* the stack analysis —
+        # otherwise an all-pinned column could still fail its collapse check.
         stationary = {
             i
             for i in range(len(targets))
             if Drone.distance(current_positions[i], targets[i]) < 1e-9
         }
-        if stationary:
-            approach_targets = [
-                tuple(targets[i]) if i in stationary else approach_targets[i]
-                for i in range(len(targets))
-            ]
-            climb_waves = [
-                [i for i in wave if i not in stationary] for wave in climb_waves
-            ]
-            climb_waves = [wave for wave in climb_waves if wave]
+        exempt = stationary | set(fixed_routes or ())
+
+        try:
+            approach_targets, climb_waves = _stack_entry_plan(
+                targets, min_z=min_z, exempt=exempt
+            )
+        except PlanningError as exc:
+            exc.details = {**exc.details, "segment": label}
+            raise PlanningError(
+                f"planning failed in segment '{label}': {exc}", details=exc.details
+            ) from exc
 
         run_stage(
-            approach_targets, label, stage_step_size=step_size, constant_speed=False
+            approach_targets,
+            label,
+            stage_step_size=step_size,
+            constant_speed=False,
+            fixed_routes={
+                did: route
+                for did, route in (fixed_routes or {}).items()
+                if did not in stationary
+            }
+            or None,
         )
         climb_step = STACK_CLIMB_SPEED * duration_sec
         for wave_index, wave in enumerate(climb_waves):
@@ -941,7 +1164,7 @@ def _plan_formation_phases(
         targets = _phase_targets(phase, num_drones)
         target_yaws = _phase_target_yaws(phase, num_drones)
 
-        run_segment(targets, name)
+        run_segment(targets, name, fixed_routes=_phase_fixed_routes(phase, num_drones) or None)
         arrival_step = combined_steps[-1].step
 
         hold_ms = int(phase.get("holdMs", 0))
@@ -1342,6 +1565,19 @@ async def plan():
     if body is None:
         return jsonify({"error": "Request body must be valid JSON"}), 400
 
+    # Debugging aid: dump the incoming request verbatim so planning failures
+    # can be traced back to the exact data the client sent.
+    if log:
+        try:
+            body_json = dumps(body, ensure_ascii=False)
+        except (TypeError, ValueError):
+            body_json = repr(body)
+        if len(body_json) > 30000:
+            body_json = (
+                body_json[:30000] + f"... (truncated, total {len(body_json)} chars)"
+            )
+        log.info(f"path-planner request body: {body_json}")
+
     # Path *delivery* mode: the caller supplies ready-made per-drone paths
     # (the 3D view's "path delivery") instead of initial/target/phases.
     if body.get("drones") is not None:
@@ -1541,6 +1777,10 @@ async def plan():
     # (or its fallback). Detours and every planned waypoint stay above it.
     min_z, min_z_source = resolve_min_alt(uav_params)
     validation_payload["altitude_floor"] = {"min_z": min_z, "source": min_z_source}
+    if log:
+        log.info(
+            f"path-planner altitude floor: min_z={min_z} m (source={min_z_source})"
+        )
     if uses_phases and staging_altitude + 1e-9 < min_z:
         return (
             jsonify(
@@ -1569,6 +1809,14 @@ async def plan():
             label = f"phases[{phase_index}]:{phase.get('name') or f'phase-{phase_index + 1}'}"
             spacing_groups.append((label, targets))
             floor_groups.append((label, targets))
+            fixed_routes = _phase_fixed_routes(phase, len(initial))
+            if fixed_routes:
+                floor_groups.append(
+                    (
+                        f"{label}:fixedPaths",
+                        [wp for route in fixed_routes.values() for wp in route],
+                    )
+                )
     else:
         spacing_groups.append(("initial", initial))
         spacing_groups.append(("target", target))
@@ -1684,6 +1932,25 @@ async def plan():
     if takeoff_time_adjusted:
         output["adjustments"] = {"takeoff_time": takeoff_time}
     if uses_phases:
+        # Absolute show-timeline seconds: solver step s happens at
+        # takeoff_time (ground wait) + takeoff climb duration + s×step time.
+        # Every drone climbs exactly ``staging_altitude`` during takeoff, so
+        # the offset is fleet-wide. Lets clients (e.g. the LED timeline)
+        # place phase markers without re-deriving the takeoff profile.
+        takeoff_duration_sec = vertical_transit_duration_sec(
+            staging_altitude, takeoff_speed, applied_smoothing
+        )
+        show_offset_sec = round(takeoff_time + takeoff_duration_sec, 4)
+        for summary in phase_summaries:
+            summary["arrivalTimeAbsSec"] = round(
+                show_offset_sec + summary["arrivalTimeMs"] / 1000.0, 3
+            )
+            summary["endTimeAbsSec"] = round(
+                show_offset_sec + summary["endTimeMs"] / 1000.0, 3
+            )
+        output["timing"]["takeoff_time_sec"] = takeoff_time
+        output["timing"]["takeoff_duration_sec"] = takeoff_duration_sec
+        output["timing"]["show_time_offset_sec"] = show_offset_sec
         output["mode"] = "formation_phases"
         output["phases"] = phase_summaries
         output["ground_initial"] = ground_positions

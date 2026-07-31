@@ -49,6 +49,15 @@ Algorithm
    ``MAX_STEPS`` is reached, the solver aborts with a machine-readable
    failure reason and the list of stuck drones.
 
+6. **Fixed routes** (user-pinned paths): drones listed in ``fixed_routes``
+   follow their prescribed waypoint sequence *verbatim*. They bypass the
+   dispatch gate (released immediately), never re-plan, never detour and
+   always win the yield ordering — automatic drones move out of their way.
+   The only concession a fixed-route drone makes is *holding in place on
+   its own path* while a conflict clears; its geometry is never altered.
+   Two fixed routes that conflict resolve by one holding; a permanent
+   blockage trips the stagnation guard and fails loudly.
+
 The solver is fully deterministic; the ``seed`` parameter is kept for API
 compatibility but no randomness remains.
 """
@@ -187,6 +196,11 @@ class SolverResult:
     success: bool
     failure_reason: Optional[str] = None
     stuck_drones: List[int] = field(default_factory=list)
+    # Structured diagnosis when the failure involves user-pinned fixed
+    # routes: one entry per blocked fixed drone, with the ids of the drones
+    # standing on its remaining path (``blocked_by``) and the subset of
+    # those that are themselves fixed (``fixed_blockers``).
+    fixed_conflicts: List[dict] = field(default_factory=list)
 
 
 class PathSolver:
@@ -207,6 +221,7 @@ class PathSolver:
         on_step: Optional[Callable[[StepRecord], None]] = None,
         min_z: float = 0.0,
         margin: float = PLANNING_MARGIN,
+        fixed_routes: Optional[Dict[int, List[Vec3]]] = None,
     ) -> None:
         assert len(initials) == len(targets), "initial and target counts must match"
         self.step_size = step_size
@@ -258,6 +273,22 @@ class PathSolver:
         self._steps_since_progress: Dict[int, int] = dict.fromkeys(
             range(len(initials)), 0
         )
+
+        # Fixed routes (user-pinned paths, see module docstring item 6):
+        # pre-seed the route queue and release the drone immediately. The
+        # route is guaranteed to end at the drone's target so the normal
+        # waypoint-pursuit/arrival machinery applies unchanged.
+        self._fixed_ids: Set[int] = set()
+        if fixed_routes:
+            for did, waypoints in fixed_routes.items():
+                drone = self._drones_by_id[did]
+                route = [tuple(float(v) for v in wp) for wp in waypoints]
+                if not route or Drone.distance(route[-1], drone.target) > 1e-6:
+                    route.append(tuple(drone.target))
+                if not drone.arrived:
+                    self._routes[did] = route
+                    self._fixed_ids.add(did)
+                    self._released.add(did)
 
         # Broad-phase cell size: two drones can only interact within one
         # envelope reach plus one step of motion on each side.
@@ -385,6 +416,11 @@ class PathSolver:
 
         def priority(did: int) -> float:
             if did in arrived_ids:
+                return float("inf")
+            if did in self._fixed_ids:
+                # Fixed routes yield last: the automatic drones in the
+                # cluster hold instead. Between two fixed drones the sort
+                # order (stable, by id) picks one to hold — on its own path.
                 return float("inf")
             return self._drones_by_id[did].remaining_distance()
 
@@ -652,6 +688,13 @@ class PathSolver:
         """
         did = drone.drone_id
 
+        if did in self._fixed_ids:
+            # Fixed route: pursue the prescribed waypoints verbatim — no
+            # re-planning, no escapes, no detours. Conflicts are resolved by
+            # holding (the collision-resolution phase reverts the proposal),
+            # which keeps the drone *on* its user-defined path.
+            return self._pursue_head(drone)
+
         route = self._routes.get(did)
         if route is not None and self._edge_blocked(
             drone.position, list(route[0]), statics, downwash=True
@@ -707,6 +750,10 @@ class PathSolver:
             if route is not None:
                 self._routes[did] = route
 
+        return self._pursue_head(drone)
+
+    def _pursue_head(self, drone: Drone) -> List[float]:
+        """Step at most ``step_size`` toward the drone's current route head."""
         head = self._route_head(drone)
         dx = head[0] - drone.position[0]
         dy = head[1] - drone.position[1]
@@ -812,6 +859,10 @@ class PathSolver:
             if blocker is None:
                 continue
             if len(movers) >= MAX_CONCURRENT_MOVERS:
+                if mover.drone_id in self._fixed_ids:
+                    # A fixed-route mover is never parked back to waiting;
+                    # its blocker will be boosted once a slot frees up.
+                    continue
                 self._released.discard(mover.drone_id)
                 self._consecutive_holds[mover.drone_id] = 0
                 movers.remove(mover)
@@ -905,9 +956,14 @@ class PathSolver:
                 movers.append(candidate)
                 translating.append(candidate)
 
-    # ── failure helper ───────────────────────────────────────────────────
+    # ── failure helpers ──────────────────────────────────────────────────
 
-    def _failure(self, step_num: int, reason: str) -> SolverResult:
+    def _failure(
+        self,
+        step_num: int,
+        reason: str,
+        fixed_conflicts: Optional[List[dict]] = None,
+    ) -> SolverResult:
         return SolverResult(
             steps=self.history,
             total_steps=step_num,
@@ -915,7 +971,76 @@ class PathSolver:
             success=False,
             failure_reason=reason,
             stuck_drones=[d.drone_id for d in self.drones if not d.arrived],
+            fixed_conflicts=fixed_conflicts or [],
         )
+
+    def _diagnose_fixed_conflicts(self) -> Optional[Tuple[str, List[dict]]]:
+        """Name the blockers of every stuck fixed-route drone.
+
+        Called when the solver is about to fail: a fixed drone may never
+        detour, so anything standing on its remaining path edge is a hard
+        blocker. Returns ``(reason, conflicts)`` with a message that
+        distinguishes pinned-vs-pinned conflicts (the user's own paths
+        collide) from a pinned path blocked by a normally-planned drone —
+        or ``None`` when no fixed drone is blocked (generic failure).
+        """
+        conflicts: List[dict] = []
+        for did in sorted(self._fixed_ids):
+            drone = self._drones_by_id[did]
+            if drone.arrived:
+                continue
+            head = list(self._route_head(drone))
+            blockers = [
+                other.drone_id
+                for other in self.drones
+                if other.drone_id != did
+                and envelope_overlap_swept(
+                    drone.position,
+                    head,
+                    other.position,
+                    other.position,
+                    margin=self.margin,
+                )
+            ]
+            if blockers:
+                conflicts.append(
+                    {
+                        "drone": did,
+                        "blocked_by": blockers,
+                        "fixed_blockers": [
+                            b for b in blockers if b in self._fixed_ids
+                        ],
+                    }
+                )
+        if not conflicts:
+            return None
+
+        def label(ids: Iterable[int]) -> str:
+            return ", ".join(f"drone-{i + 1}" for i in ids)
+
+        pinned_vs_pinned = [c for c in conflicts if c["fixed_blockers"]]
+        if pinned_vs_pinned:
+            pairs = "; ".join(
+                f"drone-{c['drone'] + 1} is blocked by pinned "
+                f"{label(c['fixed_blockers'])}"
+                for c in pinned_vs_pinned
+            )
+            reason = (
+                f"user-pinned straight paths collide with each other: {pairs}. "
+                "These paths cannot all be flown as drawn — unpin one of the "
+                "drones or change its formation position"
+            )
+        else:
+            pairs = "; ".join(
+                f"drone-{c['drone'] + 1} is blocked by {label(c['blocked_by'])}"
+                for c in conflicts
+            )
+            reason = (
+                f"user-pinned straight path is blocked: {pairs}. A pinned "
+                "drone can never detour — move the blocking drone's position "
+                "or unpin the blocked drone"
+            )
+        return reason, conflicts
 
     # ── main loop ────────────────────────────────────────────────────────
 
@@ -1009,7 +1134,11 @@ class PathSolver:
             # already routed around by the planner)
             for did in list(reverted):
                 drone = self._drones_by_id[did]
-                if drone.arrived or did in self._escaped_this_step:
+                if (
+                    drone.arrived
+                    or did in self._escaped_this_step
+                    or did in self._fixed_ids  # never leave a pinned path
+                ):
                     continue
                 # While the drone's goal is still occupied by another drone
                 # a detour achieves nothing — hold (length-free) so the
@@ -1107,6 +1236,9 @@ class PathSolver:
             else:
                 stagnant_steps += 1
                 if stagnant_steps >= STAGNATION_WINDOW:
+                    diagnosis = self._diagnose_fixed_conflicts()
+                    if diagnosis is not None:
+                        return self._failure(step_num, diagnosis[0], diagnosis[1])
                     return self._failure(
                         step_num,
                         f"no progress for {STAGNATION_WINDOW} consecutive "
@@ -1114,6 +1246,9 @@ class PathSolver:
                     )
 
         if not all(d.arrived for d in self.drones):
+            diagnosis = self._diagnose_fixed_conflicts()
+            if diagnosis is not None:
+                return self._failure(step_num, diagnosis[0], diagnosis[1])
             return self._failure(
                 step_num, f"step limit of {MAX_STEPS} reached before arrival"
             )
