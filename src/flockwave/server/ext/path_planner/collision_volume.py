@@ -182,14 +182,16 @@ def envelope_overlap(
     *,
     margin: float = 0.0,
     b_extends_below: float = 0.0,
+    b_extends_above: float = 0.0,
 ) -> bool:
     """Yaw-invariant envelope overlap check for two drones at *a* and *b*.
 
     ``margin`` inflates each drone's envelope on every side; pass
     :data:`PLANNING_MARGIN` for plan-time checks and 0 for final verification.
-    ``b_extends_below`` additionally extends *b*'s envelope that many meters
-    downward — used by route planning to treat a parked drone's downwash
-    column as blocked.
+    ``b_extends_below`` / ``b_extends_above`` additionally extend *b*'s
+    envelope that many meters downward / upward — used by route planning to
+    treat a parked drone's downwash column (and the wash-inflicting zone
+    right above it) as blocked.
     """
     if abs(a[0] - b[0]) >= 2.0 * (ENVELOPE_XY_HALF + margin):
         return False
@@ -197,7 +199,7 @@ def envelope_overlap(
         return False
     z_window = ENVELOPE_Z_HEIGHT + 2.0 * margin
     dz = a[2] - b[2]
-    return -(z_window + b_extends_below) < dz < z_window
+    return -(z_window + b_extends_below) < dz < z_window + b_extends_above
 
 
 def _axis_overlap_interval(
@@ -220,14 +222,15 @@ def envelope_overlap_swept(
     *,
     margin: float = 0.0,
     b_extends_below: float = 0.0,
+    b_extends_above: float = 0.0,
 ) -> bool:
     """Exact overlap check while both drones move linearly from t=0 to t=1.
 
     The relative offset on each axis is linear in time, so the overlap window
     per axis is solved in closed form; a collision exists iff the three
-    windows intersect. No sampling, no tunneling. ``b_extends_below``
-    extends *b*'s envelope downward (see :func:`envelope_overlap`), making
-    the z window asymmetric.
+    windows intersect. No sampling, no tunneling. ``b_extends_below`` /
+    ``b_extends_above`` extend *b*'s envelope downward / upward (see
+    :func:`envelope_overlap`), making the z window asymmetric.
     """
     xy_window = 2.0 * (ENVELOPE_XY_HALF + margin)
     z_window = ENVELOPE_Z_HEIGHT + 2.0 * margin
@@ -236,7 +239,7 @@ def envelope_overlap_swept(
     for axis, lo_bound, hi_bound in (
         (0, -xy_window, xy_window),
         (1, -xy_window, xy_window),
-        (2, -(z_window + b_extends_below), z_window),
+        (2, -(z_window + b_extends_below), z_window + b_extends_above),
     ):
         c = a0[axis] - b0[axis]
         d = (a1[axis] - a0[axis]) - (b1[axis] - b0[axis])

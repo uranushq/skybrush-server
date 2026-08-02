@@ -2,25 +2,25 @@
 
 Algorithm
 ---------
-0. **Dispatch gate** (downwash-aware flow control): drones start each
-   segment *waiting* and are released in **destination-altitude** order
-   (highest target first — upper formation slots fill before anyone flies
-   in underneath them). Every step, waiting drones are scanned in priority order and
-   released only if (a) at most :data:`MAX_CONCURRENT_MOVERS` drones are
-   moving afterwards — a hard cap — and (b) every currently moving drone is
-   at least :data:`RELEASE_DISTANCE` away horizontally. Drones far apart in
-   the plane therefore fly concurrently even at different altitudes, while
-   a drone near (or under) an active mover departs staggered, only after
-   the leader has pulled :data:`RELEASE_DISTANCE` ahead. A waiting drone that sits on a released
-   drone's target is boosted out of turn (the cap still holds; if the cap is
-   full, the blocked mover is parked back to waiting to free a slot).
-1. **Routing**: each released drone follows a per-drone route. When the
-   straight line to the target is clear of every *parked* drone (waiting or
-   arrived — the static obstacles of the moment) the route is that line;
+0. **Simultaneous release, per-step cluster coordination**: every drone is
+   released at the very first step — there is no mover cap and no staggered
+   departure. A formation translating as a unit therefore moves in lockstep
+   with all relative separations preserved exactly, which is both the
+   shortest and the safest way to fly coherent group motion. Coordination
+   happens *dynamically*: each step, drones whose proposed motions interact
+   form a collision cluster (see 2-3) and are sequenced within it; drones
+   whose motions do not interact fly unimpeded. (The former dispatch gate —
+   a hard cap of 5 concurrent movers plus a horizontal release distance —
+   was removed: forcing members of a coherent group to depart separately
+   created more close encounters than it prevented.)
+1. **Routing**: each drone follows a per-drone route. When the
+   straight line to the target is clear of every *parked* drone (arrived —
+   the static obstacles of the moment) the route is that line;
    otherwise a 26-connected lattice **A\*** around the parked drones plans
-   one. The downwash column :data:`DOWNWASH_ROUTE_CLEARANCE` below every
-   parked drone is treated as blocked (except the short final goal-connect
-   edge — targets under a temporarily parked drone stay reachable), and
+   one. The vertical band :data:`DOWNWASH_ROUTE_CLEARANCE` below AND above
+   every parked drone is treated as blocked (except the short final
+   goal-connect edge — targets under a temporarily parked drone stay
+   reachable), and
    route costs discount climbs, penalize descents and surcharge edges
    hugging obstacles — a blocked drone always prefers to go **over** a
    parked formation, never under or through tight lateral gaps. Routes are
@@ -35,10 +35,12 @@ Algorithm
    checked **exactly** (closed-form swept AABB test, no sampling). A spatial
    hash broad-phase keeps the check near-linear in the number of drones.
 3. Colliding drones are grouped into connected clusters. Within each cluster
-   the drone with the largest remaining distance keeps moving; the others
-   hold at their previous position. If conflicts remain, every non-arrived
-   participant holds, which provably restores the previous (collision-free)
-   state — so **every accepted step is collision-free by construction**.
+   movers are admitted greedily in priority order (largest remaining
+   distance first); a drone holds only when its motion conflicts with an
+   already-admitted mover, so unrelated members of the same cluster keep
+   flowing. If conflicts remain, every non-arrived participant holds, which
+   provably restores the previous (collision-free) state — so **every
+   accepted step is collision-free by construction**.
 4. Drones that held for ``DEADLOCK_THRESHOLD`` consecutive steps take a
    detour step, chosen **deterministically** from 26 unit directions:
    goal-biased (shortest resulting distance to the route head), preferring
@@ -50,9 +52,9 @@ Algorithm
    failure reason and the list of stuck drones.
 
 6. **Fixed routes** (user-pinned paths): drones listed in ``fixed_routes``
-   follow their prescribed waypoint sequence *verbatim*. They bypass the
-   dispatch gate (released immediately), never re-plan, never detour and
-   always win the yield ordering — automatic drones move out of their way.
+   follow their prescribed waypoint sequence *verbatim*. They never
+   re-plan, never detour and always win the yield ordering — automatic
+   drones move out of their way.
    The only concession a fixed-route drone makes is *holding in place on
    its own path* while a conflict clears; its geometry is never altered.
    Two fixed routes that conflict resolve by one holding; a permanent
@@ -96,7 +98,7 @@ ESCAPE_AFTER_HOLDS = 2
 
 # While a drone's goal is occupied by another drone, detouring around the
 # goal achieves nothing — the drone politely holds for this many steps to
-# give the dispatch gate's boost chain time to move the squatter away.
+# give the squatter time to fly off on its own toward its target.
 # After the limit it detours anyway: mutual squats (two drones parked on
 # each other's targets) can only be resolved by one of them stepping aside.
 SQUAT_WAIT_LIMIT = 10
@@ -106,22 +108,6 @@ SQUAT_WAIT_LIMIT = 10
 # can otherwise take turns moving in a closed 2-cycle — each step one of
 # them moves, so both look "productive" forever while neither gets closer.
 PRODUCTIVE_PATIENCE = 12
-
-# A mover that held this many consecutive steps counts as hovering (not
-# translating) for the release-distance rule.
-HOVERING_HOLDS = 2
-
-# Dispatch gate: hard cap on simultaneously moving drones. Operational rule —
-# never raise this above 5.
-MAX_CONCURRENT_MOVERS = 5
-
-# A waiting drone is released only when every currently moving drone is at
-# least this far away **horizontally** (meters). Horizontal distance is the
-# right measure for downwash: a mover overhead within this radius is exactly
-# the situation a lower drone must not depart into, while drones far apart
-# in the plane are independent regardless of altitude. Chosen above the 4 m
-# downwash-concern range used by the staged stack entry.
-RELEASE_DISTANCE = 5.0
 
 # ── route planner (lattice A*) tuning ────────────────────────────────────
 # Hard cap on node expansions per plan; beyond this the drone falls back to
@@ -142,11 +128,20 @@ ASTAR_GOAL_CONNECT_STEPS = 1.5
 # admissible.
 ASTAR_ASCENT_DISCOUNT = 0.7
 ASTAR_DOWNWARD_PENALTY = 0.5
-# Route planning treats the downwash column *under* every parked drone as
-# blocked, so routes never pass within this many meters below one (matching
-# the 4 m downwash-concern range of the staged stack entry). Checked
-# exactly via an asymmetric z window in the swept envelope test.
-DOWNWASH_ROUTE_CLEARANCE = 4.0
+# Vertical downwash clearance (meters) used across the planner: route
+# planning treats the column this far *under* every parked drone as blocked
+# (never fly through someone's wash) AND the zone this far *above* it as
+# blocked too (never blast a parked drone from close overhead). Matches the
+# staged stack entry's vertical-concern range. Checked exactly via an
+# asymmetric z window in the swept envelope test.
+DOWNWASH_ROUTE_CLEARANCE = 2.5
+
+# Minimum vertical gap (meters) kept while hovering or travelling directly
+# above another drone's active horizontal route (the "skim-over" guard).
+# Matches the tightest vertical stacking used in formations: crossing
+# traffic may pass under a drone at the formation gap, but never at the
+# bare envelope distance (the 0.5 m passes observed in flown shows).
+TRANSIT_VERTICAL_GAP = 1.5
 # Edges passing within PROXIMITY_EXTRA of a parked drone's (margin-inflated)
 # envelope cost this fraction extra — wide/over routes beat tight squeezes.
 ASTAR_PROXIMITY_SURCHARGE = 0.3
@@ -240,14 +235,9 @@ class PathSolver:
         self.history: List[StepRecord] = []
         self._consecutive_holds: Dict[int, int] = dict.fromkeys(range(len(initials)), 0)
 
-        # Dispatch gate state: highest destination altitude first (drone id
-        # breaks ties deterministically). Everyone starts waiting; drones
-        # already at their target never occupy a mover slot.
-        self._dispatch_order: List[int] = sorted(
-            (d.drone_id for d in self.drones),
-            key=lambda did: (-self._drones_by_id[did].target[2], did),
-        )
-        self._released: Set[int] = {d.drone_id for d in self.drones if d.arrived}
+        # Every drone is released from the very first step; coordination is
+        # purely per-step through collision clusters (no dispatch gate).
+        self._released: Set[int] = {d.drone_id for d in self.drones}
 
         # Route-planner state: per-drone waypoint queue (ending at the
         # target), replan cooldown counters and detour direction memory.
@@ -275,9 +265,9 @@ class PathSolver:
         )
 
         # Fixed routes (user-pinned paths, see module docstring item 6):
-        # pre-seed the route queue and release the drone immediately. The
-        # route is guaranteed to end at the drone's target so the normal
-        # waypoint-pursuit/arrival machinery applies unchanged.
+        # pre-seed the route queue. The route is guaranteed to end at the
+        # drone's target so the normal waypoint-pursuit/arrival machinery
+        # applies unchanged.
         self._fixed_ids: Set[int] = set()
         if fixed_routes:
             for did, waypoints in fixed_routes.items():
@@ -288,7 +278,6 @@ class PathSolver:
                 if not drone.arrived:
                     self._routes[did] = route
                     self._fixed_ids.add(did)
-                    self._released.add(did)
 
         # Broad-phase cell size: two drones can only interact within one
         # envelope reach plus one step of motion on each side.
@@ -398,12 +387,18 @@ class PathSolver:
     ) -> Optional[List[int]]:
         """Revert drones until the step is collision-free.
 
-        Independent collision clusters are resolved independently: each keeps
-        exactly one moving survivor (largest remaining distance first). Falls
-        back to holding every non-arrived participant, which restores the
-        previous verified state. Returns the reverted ids, or ``None`` if a
-        conflict persists even then (the previous state itself must have been
-        invalid — an internal invariant violation).
+        Independent collision clusters are resolved independently: movers are
+        admitted greedily in priority order (largest remaining distance
+        first) and a drone is reverted only when its motion actually
+        conflicts with an already-admitted mover — NOT merely for belonging
+        to the cluster. This matters for chains like A following B while C
+        crosses B's path: holding B (who conflicts only with C) would park
+        it in A's lane and freeze the whole chain; admitting B keeps the
+        convoy flowing while only C waits. Falls back to holding every
+        non-arrived participant, which restores the previous verified state.
+        Returns the reverted ids, or ``None`` if a conflict persists even
+        then (the previous state itself must have been invalid — an internal
+        invariant violation).
         """
         reverted: List[int] = []
         reverted_set: Set[int] = set()
@@ -414,20 +409,63 @@ class PathSolver:
                 reverted.append(did)
                 proposed[did] = list(prev[did])
 
-        def priority(did: int) -> float:
-            if did in arrived_ids:
-                return float("inf")
-            if did in self._fixed_ids:
-                # Fixed routes yield last: the automatic drones in the
-                # cluster hold instead. Between two fixed drones the sort
-                # order (stable, by id) picks one to hold — on its own path.
-                return float("inf")
-            return self._drones_by_id[did].remaining_distance()
-
         for cluster in self._clusters(collisions):
+            # "Clear-your-lane-first" ordering among pinned drones: a pinned
+            # drone whose current position lies on another pinned drone's
+            # remaining route edge must be admitted (sent) first — the
+            # blocked one can only continue after it has left. This decides
+            # WHO of two conflicting pinned drones flies first by geometry
+            # instead of by drone id, so resolvable crossings always unwind
+            # into a temporal stagger; only true mutual blockages (head-on
+            # overlapping lanes) remain stuck and fail with the fixed-path
+            # diagnosis.
+            fixed_members = [
+                did
+                for did in cluster
+                if did in self._fixed_ids and did not in arrived_ids
+            ]
+            blocks: Dict[int, int] = dict.fromkeys(fixed_members, 0)
+            for x in fixed_members:
+                for y in fixed_members:
+                    if x == y:
+                        continue
+                    drone_y = self._drones_by_id[y]
+                    if envelope_overlap_swept(
+                        prev[y],
+                        list(self._route_head(drone_y)),
+                        prev[x],
+                        prev[x],
+                        margin=self.margin,
+                    ):
+                        blocks[x] += 1
+
+            def priority(did: int, blocks: Dict[int, int] = blocks) -> tuple:
+                # Sort key, descending. Rank: parked > pinned > automatic.
+                # Pinned drones order by how many other pinned drones they
+                # are standing in the way of; automatic drones by remaining
+                # distance (the classic rule).
+                if did in arrived_ids:
+                    return (3, 0.0)
+                if did in self._fixed_ids:
+                    return (2, float(blocks.get(did, 0)))
+                return (1, self._drones_by_id[did].remaining_distance())
+
             order = sorted(cluster, key=priority, reverse=True)
-            for did in order[1:]:
-                revert(did)
+            # Parked participants are immovable obstacles for the admission
+            # checks; every candidate mover is tested against them too.
+            admitted: List[int] = [did for did in order if did in arrived_ids]
+            for did in order:
+                if did in arrived_ids:
+                    continue
+                if any(
+                    self._swept_overlap(
+                        prev[did], proposed[did], prev[other], proposed[other]
+                    )
+                    for other in admitted
+                ):
+                    revert(did)
+                else:
+                    admitted.append(did)
 
         max_resolve_iter = len(self.drones) + 5
         for _ in range(max_resolve_iter):
@@ -475,17 +513,24 @@ class PathSolver:
         """Whether the straight edge a→b hits any parked drone's envelope.
 
         With ``downwash=True`` the check also covers each obstacle's
-        downwash column (:data:`DOWNWASH_ROUTE_CLEARANCE` meters below it),
-        so route planning never sends a drone underneath a parked one.
+        downwash column (:data:`DOWNWASH_ROUTE_CLEARANCE` meters below it)
+        AND the zone the same distance above it, so route planning never
+        sends a drone underneath a parked one *or* skimming right over it.
         Dynamic legality checks (the solver's swept collision tests) stay
         envelope-exact — the staged stack entry deliberately climbs through
         this column.
         """
         checked_margin = self.margin if margin is None else margin
-        below = DOWNWASH_ROUTE_CLEARANCE if downwash else 0.0
+        pad = DOWNWASH_ROUTE_CLEARANCE if downwash else 0.0
         for obs in statics:
             if envelope_overlap_swept(
-                a, b, obs, obs, margin=checked_margin, b_extends_below=below
+                a,
+                b,
+                obs,
+                obs,
+                margin=checked_margin,
+                b_extends_below=pad,
+                b_extends_above=pad,
             ):
                 return True
         return False
@@ -528,6 +573,7 @@ class PathSolver:
                 obs,
                 margin=self.margin,
                 b_extends_below=DOWNWASH_ROUTE_CLEARANCE,
+                b_extends_above=DOWNWASH_ROUTE_CLEARANCE,
             ):
                 return None
 
@@ -693,7 +739,10 @@ class PathSolver:
             # re-planning, no escapes, no detours. Conflicts are resolved by
             # holding (the collision-resolution phase reverts the proposal),
             # which keeps the drone *on* its user-defined path.
-            return self._pursue_head(drone)
+            candidate = self._pursue_head(drone)
+            if self._downwash_hold_back(drone, candidate):
+                return list(drone.position)
+            return candidate
 
         route = self._routes.get(did)
         if route is not None and self._edge_blocked(
@@ -750,7 +799,60 @@ class PathSolver:
             if route is not None:
                 self._routes[did] = route
 
-        return self._pursue_head(drone)
+        candidate = self._pursue_head(drone)
+        if self._downwash_hold_back(drone, candidate):
+            return list(drone.position)
+        return candidate
+
+    def _downwash_hold_back(self, drone: Drone, candidate: List[float]) -> bool:
+        """Whether this drone should wait instead of taking its next step.
+
+        Blocks steps into the *skim-over zone*: a position hovering between
+        the envelope height and :data:`TRANSIT_VERTICAL_GAP` above another
+        drone's remaining horizontal route. Descending to 0.5 m above a lane
+        that crossing traffic is about to use — the pattern behind the
+        observed near-misses — is refused; the drone waits higher until the
+        traffic has passed. Same-altitude conflicts are untouched (the
+        envelope collision rules own those), co-flowing drones (same XY
+        direction, e.g. a convoy or a rigid cluster) are exempt, and purely
+        vertical movers neither trigger the guard nor block each other.
+        """
+        if candidate == drone.position:
+            return False
+        my_dx = candidate[0] - drone.position[0]
+        my_dy = candidate[1] - drone.position[1]
+        my_norm = (my_dx * my_dx + my_dy * my_dy) ** 0.5
+        for other in self.drones:
+            if other.drone_id == drone.drone_id or other.arrived:
+                continue
+            head = self._route_head(other)
+            ex = head[0] - other.position[0]
+            ey = head[1] - other.position[1]
+            edge_norm = (ex * ex + ey * ey) ** 0.5
+            if edge_norm < 1e-9:
+                continue  # hovering or purely vertical mover
+            dz = candidate[2] - other.position[2]
+            if not (
+                ENVELOPE_Z_HEIGHT - 1e-9
+                <= dz
+                < TRANSIT_VERTICAL_GAP - 1e-9
+            ):
+                continue  # not in the skim-over zone above this drone
+            if my_norm > 1e-9:
+                dot = (my_dx * ex + my_dy * ey) / (my_norm * edge_norm)
+                if dot > 0.999:
+                    continue  # co-flowing: relative geometry is stable
+            # XY-only sweep: align z so the test reduces to whether the
+            # other drone's remaining edge passes under the candidate.
+            if envelope_overlap_swept(
+                [other.position[0], other.position[1], candidate[2]],
+                [head[0], head[1], candidate[2]],
+                candidate,
+                candidate,
+                margin=self.margin,
+            ):
+                return True
+        return False
 
     def _pursue_head(self, drone: Drone) -> List[float]:
         """Step at most ``step_size`` toward the drone's current route head."""
@@ -822,139 +924,6 @@ class PathSolver:
 
         scored.sort(key=lambda item: (item[0], item[1]))
         return [(candidate, direction) for _, _, candidate, direction in scored]
-
-    # ── dispatch gate ────────────────────────────────────────────────────
-
-    def _update_dispatch(self) -> None:
-        """Release waiting drones for this step (see module docstring).
-
-        Scans in priority order (highest destination altitude first). A
-        candidate is released when the mover cap allows it and every active
-        mover is at least :data:`RELEASE_DISTANCE` away; candidates failing
-        the distance rule are skipped, so lower-priority but independent
-        (far-away) drones may still be released this step.
-        """
-        movers: List[Drone] = [
-            d
-            for d in self.drones
-            if d.drone_id in self._released and not d.arrived
-        ]
-
-        # Unblock target squatters: a waiting drone parked on a mover's
-        # target can never be pushed away by the mover itself, so it gets
-        # released out of turn. The cap is absolute — when it is full, the
-        # blocked mover is parked back to waiting to make room; it will be
-        # re-released by the normal scan once its blocker has pulled away.
-        for mover in list(movers):
-            if self._consecutive_holds[mover.drone_id] < DEADLOCK_THRESHOLD:
-                continue
-            blocker: Optional[Drone] = None
-            for did in self._dispatch_order:
-                if did in self._released:
-                    continue
-                candidate = self._drones_by_id[did]
-                if self._overlap(candidate.position, list(mover.target)):
-                    blocker = candidate
-                    break
-            if blocker is None:
-                continue
-            if len(movers) >= MAX_CONCURRENT_MOVERS:
-                if mover.drone_id in self._fixed_ids:
-                    # A fixed-route mover is never parked back to waiting;
-                    # its blocker will be boosted once a slot frees up.
-                    continue
-                self._released.discard(mover.drone_id)
-                self._consecutive_holds[mover.drone_id] = 0
-                movers.remove(mover)
-            self._released.add(blocker.drone_id)
-            movers.append(blocker)
-
-        def horizontal_distance(a: List[float], b: List[float]) -> float:
-            return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
-
-        # The release-distance rule guards against departing near an
-        # actively *translating* drone; a mover that has been holding for a
-        # while is effectively hovering, so it must not block its
-        # neighbours' releases (which are often exactly what would unstick
-        # it). Stuck movers still occupy a slot under the hard cap.
-        translating = [
-            m
-            for m in movers
-            if self._consecutive_holds.get(m.drone_id, 0) < HOVERING_HOLDS
-        ]
-
-        if len(movers) >= MAX_CONCURRENT_MOVERS:
-            return
-
-        # Release order: altitude first (downwash rule), then drones whose
-        # straight line to the target is least obstructed by parked drones.
-        # Releasing clear-path drones first turns same-lane formations into
-        # convoys (leader first, followers staggered behind) instead of
-        # making back drones climb over the still-parked drones ahead —
-        # this is what keeps flown paths close to the straight-line length.
-        waiting = [did for did in self._dispatch_order if did not in self._released]
-        if not waiting:
-            return
-        parked_positions = [
-            (d.drone_id, list(d.position))
-            for d in self.drones
-            if d.arrived or d.drone_id not in self._released
-        ]
-
-        def blocked_count(did: int) -> int:
-            drone = self._drones_by_id[did]
-            goal = list(drone.target)
-            count = 0
-            for obs_id, obs in parked_positions:
-                if obs_id == did:
-                    continue
-                if envelope_overlap_swept(
-                    drone.position,
-                    goal,
-                    obs,
-                    obs,
-                    margin=self.margin,
-                    b_extends_below=DOWNWASH_ROUTE_CLEARANCE,
-                ):
-                    count += 1
-            return count
-
-        def goal_squatted(did: int) -> int:
-            """1 when a parked drone sits on this drone's target.
-
-            Such a drone would only fly across and then hover-wait at the
-            far end; releasing drones with free goals first walks squat
-            chains (formation permutations) in topological order instead.
-            """
-            goal = list(self._drones_by_id[did].target)
-            for obs_id, obs in parked_positions:
-                if obs_id != did and envelope_overlap(
-                    obs, goal, margin=self.margin
-                ):
-                    return 1
-            return 0
-
-        waiting.sort(
-            key=lambda did: (
-                -self._drones_by_id[did].target[2],
-                goal_squatted(did),
-                blocked_count(did),
-                did,
-            )
-        )
-
-        for did in waiting:
-            if len(movers) >= MAX_CONCURRENT_MOVERS:
-                break
-            candidate = self._drones_by_id[did]
-            if all(
-                horizontal_distance(candidate.position, m.position)
-                >= RELEASE_DISTANCE
-                for m in translating
-            ):
-                self._released.add(did)
-                movers.append(candidate)
-                translating.append(candidate)
 
     # ── failure helpers ──────────────────────────────────────────────────
 
@@ -1085,24 +1054,16 @@ class PathSolver:
 
             step_num += 1
 
-            # Phase 0 — dispatch gate: release waiting drones for this step
-            self._update_dispatch()
-
             prev_positions: Dict[int, List[float]] = {
                 d.drone_id: list(d.position) for d in self.drones
             }
-            # Waiting (not yet released) drones behave like arrived ones for
-            # this step: they hold in place, are never chosen to yield (their
-            # hold *is* the safe state) and never attempt detours.
             arrived_ids: Set[int] = {
-                d.drone_id
-                for d in self.drones
-                if d.arrived or d.drone_id not in self._released
+                d.drone_id for d in self.drones if d.arrived
             }
 
-            # Phase 1 — propose moves (released drones only): each drone
-            # follows its planned route around the currently parked drones,
-            # planning or re-planning it lazily.
+            # Phase 1 — propose moves: each drone follows its planned route
+            # around the currently parked (arrived) drones, planning or
+            # re-planning it lazily.
             self._escaped_this_step = set()
             statics = [
                 list(d.position) for d in self.drones if d.drone_id in arrived_ids
@@ -1141,9 +1102,9 @@ class PathSolver:
                 ):
                     continue
                 # While the drone's goal is still occupied by another drone
-                # a detour achieves nothing — hold (length-free) so the
-                # dispatch gate's boost chain can move the squatter away.
-                # Bounded by SQUAT_WAIT_LIMIT: mutual squats need a detour.
+                # a detour achieves nothing — hold (length-free) until the
+                # squatter flies off toward its own target. Bounded by
+                # SQUAT_WAIT_LIMIT: mutual squats need a detour.
                 goal = list(drone.target)
                 if self._consecutive_holds[did] < SQUAT_WAIT_LIMIT and any(
                     other.drone_id != did

@@ -1,23 +1,20 @@
-"""Tests for the solver's dispatch gate (staggered, altitude-first release).
+"""Tests for the solver's release policy (simultaneous, cluster-coordinated).
 
-Rules under test (see ``solver`` module docstring):
+The former dispatch gate (hard cap of 5 concurrent movers, 5 m horizontal
+release distance, altitude-first staggered departure) was removed: forcing
+members of a coherent group to depart separately created more close
+encounters than it prevented. Rules under test now:
 
-* never more than ``MAX_CONCURRENT_MOVERS`` drones moving in one step;
-* a waiting drone is released only when every active mover is at least
-  ``RELEASE_DISTANCE`` away — so nearby drones depart staggered while far
-  apart drones fly concurrently;
-* release priority is highest start altitude first;
-* a waiting drone parked on a mover's target is boosted out instead of
-  deadlocking the plan.
+* every drone departs at the very first step — no cap, no stagger;
+* a formation translating as a unit moves in lockstep, so all relative
+  separations are preserved exactly and nobody ever holds;
+* conflicting motions are still sequenced per step by the collision-cluster
+  admission, so crossing scenarios remain collision-free by construction.
 """
 
 from __future__ import annotations
 
-from flockwave.server.ext.path_planner.solver import (
-    MAX_CONCURRENT_MOVERS,
-    RELEASE_DISTANCE,
-    PathSolver,
-)
+from flockwave.server.ext.path_planner.solver import PathSolver
 
 
 def _moving_ids_per_step(result):
@@ -34,96 +31,64 @@ def _moving_ids_per_step(result):
     return moving
 
 
-def test_mover_cap_is_never_exceeded() -> None:
-    # Ten independent parallel lanes (6 m apart, beyond RELEASE_DISTANCE):
-    # without the cap all ten would fly at once.
+def test_everyone_departs_at_step_one() -> None:
+    # Ten parallel lanes 6 m apart: all ten fly at once from the start.
     n = 10
     initials = [(i * 6.0, 0.0, 10.0) for i in range(n)]
     targets = [(i * 6.0, 15.0, 10.0) for i in range(n)]
     result = PathSolver(initials, targets, seed=1).solve()
     assert result.success
-    per_step = _moving_ids_per_step(result)
-    assert max(len(ids) for ids in per_step) <= MAX_CONCURRENT_MOVERS
-    # The cap should actually bite in this scenario.
-    assert any(len(ids) == MAX_CONCURRENT_MOVERS for ids in per_step)
+    assert _moving_ids_per_step(result)[0] == set(range(n))
 
 
-def test_far_apart_drones_fly_concurrently() -> None:
-    initials = [(0.0, 0.0, 10.0), (20.0, 0.0, 6.0)]
-    targets = [(0.0, 10.0, 10.0), (20.0, 10.0, 6.0)]
-    result = PathSolver(initials, targets, seed=1).solve()
-    assert result.success
-    first_movers = _moving_ids_per_step(result)[0]
-    assert first_movers == {0, 1}
-
-
-def test_nearby_lower_drone_departs_staggered() -> None:
-    # Same start altitude, 2 m apart: drone 0 wins the tie and departs;
-    # drone 1 must wait until drone 0 has pulled RELEASE_DISTANCE away.
-    initials = [(0.0, 0.0, 10.0), (0.0, 2.0, 10.0)]
-    targets = [(20.0, 0.0, 10.0), (0.0, 2.0, 10.0), ]
-    targets[1] = (20.0, 2.0, 10.0)
-    result = PathSolver(initials, targets, seed=1).solve()
-    assert result.success
-
-    departure_step = {}
-    for step_index, moving in enumerate(_moving_ids_per_step(result)):
-        for did in moving:
-            departure_step.setdefault(did, step_index)
-    assert departure_step[0] == 0
-    # Drone 0 travels 1 m/step along x; distance to drone 1 is sqrt(x²+4),
-    # which reaches 5 m only after ceil(sqrt(21)) = 5 steps.
-    assert departure_step[1] >= 5
-    # At drone 1's departure, every prior mover really was far enough away.
-    release_positions = result.steps[departure_step[1]].positions
-    dx = release_positions[0][0] - release_positions[1][0]
-    dy = release_positions[0][1] - release_positions[1][1]
-    dz = release_positions[0][2] - release_positions[1][2]
-    assert (dx * dx + dy * dy + dz * dz) ** 0.5 >= RELEASE_DISTANCE
-
-
-def test_higher_drone_departs_first() -> None:
-    # Two drones close together at different altitudes: the higher one goes
-    # first even though it has the *smaller* drone id disadvantage reversed.
-    initials = [(0.0, 0.0, 6.0), (0.0, 2.0, 12.0)]
-    targets = [(20.0, 0.0, 6.0), (20.0, 2.0, 12.0)]
-    result = PathSolver(initials, targets, seed=1).solve()
-    assert result.success
-    first_movers = _moving_ids_per_step(result)[0]
-    assert first_movers == {1}
-
-
-def test_higher_destination_departs_first() -> None:
-    # Priority is the DESTINATION altitude: from the same hover altitude,
-    # the drone bound for the upper formation slot leaves first so the
-    # lower-bound drone never flies in under an unfilled upper slot.
-    initials = [(0.0, 0.0, 10.0), (0.0, 2.0, 10.0)]
-    targets = [(20.0, 0.0, 8.0), (20.0, 2.0, 14.0)]
-    result = PathSolver(initials, targets).solve()
-    assert result.success
-    first_movers = _moving_ids_per_step(result)[0]
-    assert first_movers == {1}
-
-
-def test_waiting_drone_on_target_is_boosted_not_deadlocked() -> None:
-    # Drone 1 (lower, waiting) sits exactly on drone 0's target while being
-    # within RELEASE_DISTANCE of drone 0 — without the boost this would be a
-    # guaranteed stagnation failure.
-    initials = [(0.0, 0.0, 10.0), (4.0, 0.0, 9.0)]
-    targets = [(4.0, 0.0, 10.0), (4.0, 6.0, 9.0)]
-    result = PathSolver(initials, targets, seed=1).solve()
-    assert result.success
-
-
-def test_all_waiting_drones_eventually_arrive() -> None:
-    # Dense same-altitude line (2 m apart, all within RELEASE_DISTANCE of
-    # their neighbours) shifting sideways: heavy staggering, but everyone
-    # must still make it.
+def test_dense_formation_translates_in_lockstep() -> None:
+    # Dense same-altitude line (2 m apart) shifting sideways: the whole
+    # formation moves as a unit — separations never shrink, nobody holds,
+    # and the transition takes exactly the straight-line number of steps.
     n = 8
     initials = [(i * 2.0, 0.0, 10.0) for i in range(n)]
     targets = [(i * 2.0, 8.0, 10.0) for i in range(n)]
     result = PathSolver(initials, targets, seed=3).solve()
     assert result.success
+    assert result.total_steps == 8
+    for step in result.steps:
+        xs = sorted(step.positions[i][0] for i in range(n))
+        gaps = [round(xs[i + 1] - xs[i], 6) for i in range(n - 1)]
+        assert all(gap >= 2.0 - 1e-6 for gap in gaps)
     final = result.steps[-1].positions
     for i in range(n):
         assert final[i] == [i * 2.0, 8.0, 10.0]
+
+
+def test_close_drones_at_different_altitudes_fly_together() -> None:
+    # 2 m apart horizontally, 6 m apart vertically: both fly immediately —
+    # no release-distance rule holds the lower one back any more.
+    initials = [(0.0, 0.0, 6.0), (0.0, 2.0, 12.0)]
+    targets = [(20.0, 0.0, 6.0), (20.0, 2.0, 12.0)]
+    result = PathSolver(initials, targets, seed=1).solve()
+    assert result.success
+    assert _moving_ids_per_step(result)[0] == {0, 1}
+    assert result.total_steps == 20
+
+
+def test_drone_parked_on_anothers_target_resolves() -> None:
+    # Drone 1 starts exactly on drone 0's target. Both released at once:
+    # drone 1 flies off toward its own target and drone 0 follows in.
+    initials = [(0.0, 0.0, 10.0), (4.0, 0.0, 9.0)]
+    targets = [(4.0, 0.0, 10.0), (4.0, 6.0, 9.0)]
+    result = PathSolver(initials, targets, seed=1).solve()
+    assert result.success
+    final = result.steps[-1].positions
+    assert final[0] == [4.0, 0.0, 10.0]
+    assert final[1] == [4.0, 6.0, 9.0]
+
+
+def test_crossing_paths_remain_collision_free() -> None:
+    # Two drones swapping sides through a common corridor: simultaneous
+    # release must still be sequenced safely by the cluster admission.
+    initials = [(0.0, 0.0, 10.0), (10.0, 0.6, 10.0)]
+    targets = [(10.0, 0.0, 10.0), (0.0, 0.6, 10.0)]
+    result = PathSolver(initials, targets, seed=1).solve()
+    assert result.success
+    # Every recorded step is verified collision-free by construction.
+    assert all(rec.verified for rec in result.steps)

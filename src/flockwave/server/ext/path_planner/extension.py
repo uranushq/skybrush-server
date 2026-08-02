@@ -20,23 +20,33 @@ Formation-phase flow (``phases`` present)::
       ▼
     ground
 
-Two downwash-aware operational rules apply inside every solver segment:
+Inside every solver segment all drones depart **simultaneously** and are
+coordinated per step through collision clusters (see ``solver``): drones
+whose motions interact are sequenced within their cluster, everyone else
+flies unimpeded — a formation translating as a unit moves in lockstep with
+its relative separations preserved. One downwash-aware operational rule
+remains:
 
-* **Dispatch gate** (see ``solver``): drones depart staggered, highest
-  destination altitude first — never more than 5 moving at once, and a
-  drone only departs once every active mover is ≥ 5 m away horizontally.
 * **Staged stack entry** (:func:`_stack_entry_plan`): a drone whose target
-  sits within 4 m under another drone approaches 4 m below its target and
-  climbs the final stretch vertically at a constant 0.5 m/s, after the
+  sits within 2.5 m under another drone approaches 2.5 m below its target
+  and climbs the final stretch vertically at a constant 0.5 m/s, after the
   drones above it have settled.
+
+Per-phase **clusters** move as rigid groups: drones listed in a phase's
+``clusters`` field (``[["drone-1", "drone-2"], ...]``) are pinned to their
+straight lines for that transition and fly in lockstep, preserving the
+group's shape en route. Groups whose members all share the *same
+displacement vector* (a formation block translated as a unit between
+phases) are detected and clustered **automatically** when their straight
+corridors are clear; explicit ``clusters`` entries always win.
 
 A phase may pin selected drones to **user-defined fixed paths** via
 ``fixedPaths`` (``[{"droneId": "drone-3", "path": [{x, y, z}, ...]}]``):
 during the transition *into* that phase the drone follows the waypoints
 verbatim (the last waypoint must equal its phase target) while the solver
-routes everyone else around it. Fixed-path drones skip the dispatch gate
-and the staged stack entry — the drawn path is trusted as the user's
-intent — but the final verification gate still checks the result.
+routes everyone else around it. Fixed-path drones skip the staged stack
+entry — the drawn path is trusted as the user's intent — but the final
+verification gate still checks the result.
 
 Safety contract (fail-loudly)
 -----------------------------
@@ -94,8 +104,14 @@ from .collision_volume import (
     PLANNING_MARGIN,
     describe_collision_envelope,
     envelope_overlap,
+    envelope_overlap_swept,
 )
-from .solver import PathSolver, SolverResult, StepRecord
+from .solver import (
+    DOWNWASH_ROUTE_CLEARANCE,
+    PathSolver,
+    SolverResult,
+    StepRecord,
+)
 from .validators import (
     SEVERITY_ERROR,
     ValidationContext,
@@ -141,8 +157,8 @@ DEFAULT_GRID_SPACING = 2.0
 # below its target and enters the last stretch as a pure vertical climb at a
 # constant STACK_CLIMB_SPEED — only after every stacked drone above it has
 # settled at its own target.
-STACK_VERTICAL_GAP = 4.0
-STACK_APPROACH_OFFSET = 4.0
+STACK_VERTICAL_GAP = 2.5
+STACK_APPROACH_OFFSET = 2.5
 STACK_XY_TOLERANCE = GUARANTEED_XY_CLEARANCE
 STACK_CLIMB_SPEED = 0.5
 
@@ -355,6 +371,10 @@ def _validate_phases(phases, *, num_drones: int):
         if error is not None:
             return error
 
+        error = _validate_phase_clusters(phase, phase_index, num_drones)
+        if error is not None:
+            return error
+
     return None
 
 
@@ -469,6 +489,152 @@ def _validate_phase_fixed_paths(
                 400,
             )
     return None
+
+
+def _validate_phase_clusters(phase: dict, phase_index: int, num_drones: int):
+    """Validate the optional ``clusters`` block of one phase.
+
+    Shape: ``[["drone-1", "drone-2"], ...]`` — each inner list is a rigid
+    group flown in lockstep on straight lines during the transition into
+    this phase. A drone may belong to at most one cluster and must not also
+    carry a ``fixedPaths`` entry (the pin already implies the behavior).
+    """
+    clusters = phase.get("clusters")
+    if clusters is None:
+        return None
+    prefix = f"'phases[{phase_index}].clusters"
+    if not isinstance(clusters, list):
+        return jsonify({"error": f"{prefix}' must be an array of arrays"}), 400
+
+    fixed = phase.get("fixedPaths", phase.get("fixed_paths")) or []
+    fixed_ids = set()
+    for entry in fixed:
+        if isinstance(entry, dict):
+            index = _drone_index_from_id(entry.get("droneId", entry.get("id")))
+            if index is not None:
+                fixed_ids.add(index)
+
+    seen: set[int] = set()
+    for cluster_index, cluster in enumerate(clusters):
+        if not isinstance(cluster, list) or not cluster:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"{prefix}[{cluster_index}]' must be a non-empty "
+                            "array of drone ids"
+                        )
+                    }
+                ),
+                400,
+            )
+        for drone_id in cluster:
+            index = _drone_index_from_id(drone_id)
+            if index is None or not (0 <= index < num_drones):
+                return (
+                    jsonify(
+                        {
+                            "error": (
+                                f"{prefix}[{cluster_index}]' contains an "
+                                f"unknown drone id {drone_id!r}"
+                            )
+                        }
+                    ),
+                    400,
+                )
+            if index in seen:
+                return (
+                    jsonify(
+                        {
+                            "error": (
+                                f"{prefix}' lists drone-{index + 1} in more "
+                                "than one cluster"
+                            )
+                        }
+                    ),
+                    400,
+                )
+            if index in fixed_ids:
+                return (
+                    jsonify(
+                        {
+                            "error": (
+                                f"{prefix}' lists drone-{index + 1} which "
+                                "also has a fixedPaths entry — use one or "
+                                "the other"
+                            )
+                        }
+                    ),
+                    400,
+                )
+            seen.add(index)
+    return None
+
+
+def _phase_cluster_indices(phase: dict, num_drones: int) -> list[set[int]]:
+    """Parse a validated phase's ``clusters`` into index sets."""
+    clusters = phase.get("clusters") or []
+    result: list[set[int]] = []
+    for cluster in clusters:
+        indices = {
+            index
+            for index in (_drone_index_from_id(d) for d in cluster)
+            if index is not None and 0 <= index < num_drones
+        }
+        if indices:
+            result.append(indices)
+    return result
+
+
+def _detect_rigid_groups(
+    current_positions: Sequence[tuple[float, float, float]],
+    targets: Sequence[tuple[float, float, float]],
+    *,
+    excluded: set[int],
+    static_positions: Sequence[Sequence[float]],
+) -> dict[int, list[tuple[float, float, float]]]:
+    """Find formation blocks translated as a unit and pin them to lockstep.
+
+    Groups drones by identical displacement vector (mm resolution). A group
+    of two or more whose straight corridors all clear the parked drones
+    (including the vertical downwash pads) flies as a rigid cluster: every
+    member is pinned to its straight line, so the block translates in
+    lockstep with its internal geometry frozen — no member ever weaves
+    through the group. Blocked corridors fall back to normal planning.
+    """
+    groups: dict[tuple[int, int, int], list[int]] = {}
+    for i, (pos, tgt) in enumerate(zip(current_positions, targets)):
+        if i in excluded:
+            continue
+        d = (tgt[0] - pos[0], tgt[1] - pos[1], tgt[2] - pos[2])
+        if abs(d[0]) < 1e-9 and abs(d[1]) < 1e-9 and abs(d[2]) < 1e-9:
+            continue
+        key = (round(d[0] * 1000), round(d[1] * 1000), round(d[2] * 1000))
+        groups.setdefault(key, []).append(i)
+
+    pinned: dict[int, list[tuple[float, float, float]]] = {}
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        corridors_clear = all(
+            not any(
+                envelope_overlap_swept(
+                    list(current_positions[i]),
+                    list(targets[i]),
+                    list(obs),
+                    list(obs),
+                    margin=PLANNING_MARGIN,
+                    b_extends_below=DOWNWASH_ROUTE_CLEARANCE,
+                    b_extends_above=DOWNWASH_ROUTE_CLEARANCE,
+                )
+                for obs in static_positions
+            )
+            for i in members
+        )
+        if corridors_clear:
+            for i in members:
+                pinned[i] = [tuple(targets[i])]
+    return pinned
 
 
 def _phase_fixed_routes(
@@ -640,6 +806,15 @@ def _find_clearance_violations(
 
 
 def _spacing_error_response(violations: list[dict]):
+    if log:
+        summary = "; ".join(
+            f"{v['label']}: {v['first']}~{v['second']} delta={v['delta']}"
+            for v in violations[:10]
+        )
+        log.warning(
+            f"path-planner request rejected — formation points too close "
+            f"({len(violations)} violation(s)): {summary}"
+        )
     return (
         jsonify(
             {
@@ -681,6 +856,14 @@ def _altitude_floor_error(groups: list[tuple[str, Sequence]], min_z: float):
                 violations.append({"label": label, "index": i, "z": z})
     if not violations:
         return None
+    if log:
+        summary = "; ".join(
+            f"{v['label']}[{v['index']}] z={v['z']}" for v in violations[:10]
+        )
+        log.warning(
+            f"path-planner request rejected — waypoints below altitude floor "
+            f"{min_z} m ({len(violations)} violation(s)): {summary}"
+        )
     return (
         jsonify(
             {
@@ -1109,15 +1292,38 @@ def _plan_formation_phases(
         straight to their real target along it during the approach stage.
         """
         # Exempt from the staged entry: drones already parked on their
-        # target (no re-entry dip) and user-pinned fixed paths (the drawn
-        # path IS the entry). Must be known *before* the stack analysis —
-        # otherwise an all-pinned column could still fail its collapse check.
+        # target (no re-entry dip) and pinned drones — user fixed paths,
+        # user clusters and auto-detected rigid groups (the pinned line IS
+        # the entry). Must be known *before* the stack analysis — otherwise
+        # an all-pinned column could still fail its collapse check.
         stationary = {
             i
             for i in range(len(targets))
             if Drone.distance(current_positions[i], targets[i]) < 1e-9
         }
-        exempt = stationary | set(fixed_routes or ())
+        combined_fixed = {
+            did: route
+            for did, route in (fixed_routes or {}).items()
+            if did not in stationary
+        }
+
+        # Automatic rigid-group clustering: formation blocks that translate
+        # as a unit between the phases fly in lockstep on straight lines.
+        auto_pinned = _detect_rigid_groups(
+            [tuple(p) for p in current_positions],
+            [tuple(t) for t in targets],
+            excluded=stationary | set(combined_fixed),
+            static_positions=[current_positions[i] for i in stationary],
+        )
+        if auto_pinned:
+            combined_fixed.update(auto_pinned)
+            if log:
+                log.info(
+                    f"segment '{label}': auto-clustered rigid group(s) "
+                    f"{[f'drone-{i + 1}' for i in sorted(auto_pinned)]}"
+                )
+
+        exempt = stationary | set(combined_fixed)
 
         try:
             approach_targets, climb_waves = _stack_entry_plan(
@@ -1134,12 +1340,7 @@ def _plan_formation_phases(
             label,
             stage_step_size=step_size,
             constant_speed=False,
-            fixed_routes={
-                did: route
-                for did, route in (fixed_routes or {}).items()
-                if did not in stationary
-            }
-            or None,
+            fixed_routes=combined_fixed or None,
         )
         climb_step = STACK_CLIMB_SPEED * duration_sec
         for wave_index, wave in enumerate(climb_waves):
@@ -1164,7 +1365,14 @@ def _plan_formation_phases(
         targets = _phase_targets(phase, num_drones)
         target_yaws = _phase_target_yaws(phase, num_drones)
 
-        run_segment(targets, name, fixed_routes=_phase_fixed_routes(phase, num_drones) or None)
+        # Pinned routes for this transition: explicit fixedPaths plus every
+        # member of an explicit cluster (pinned to its straight line).
+        pinned_routes = _phase_fixed_routes(phase, num_drones)
+        for cluster in _phase_cluster_indices(phase, num_drones):
+            for index in cluster:
+                pinned_routes.setdefault(index, [targets[index]])
+
+        run_segment(targets, name, fixed_routes=pinned_routes or None)
         arrival_step = combined_steps[-1].step
 
         hold_ms = int(phase.get("holdMs", 0))
@@ -1470,6 +1678,11 @@ async def _handle_path_delivery(body: dict):
         validation_payload["params"] = dict(uav_params)
         blocking = [i for i in issues if i.severity == SEVERITY_ERROR]
         if blocking:
+            if log:
+                log.warning(
+                    "path-planner request rejected — validation failed: "
+                    + "; ".join(str(i.message) for i in blocking[:10])
+                )
             return (
                 jsonify(
                     {
@@ -1762,6 +1975,11 @@ async def plan():
 
         blocking = [i for i in issues if i.severity == SEVERITY_ERROR]
         if blocking:
+            if log:
+                log.warning(
+                    "path-planner request rejected — validation failed: "
+                    + "; ".join(str(i.message) for i in blocking[:10])
+                )
             return (
                 jsonify(
                     {

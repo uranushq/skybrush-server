@@ -80,45 +80,46 @@ def test_normalize_vec3_array_orders_by_show_drone_id() -> None:
 
 
 def test_stack_entry_plan_detects_column() -> None:
-    targets = [(0.0, 0.0, 8.0), (0.0, 0.0, 5.0), (10.0, 0.0, 5.0)]
+    targets = [(0.0, 0.0, 8.0), (0.0, 0.0, 6.0), (10.0, 0.0, 6.0)]
     approach, waves = _stack_entry_plan(targets, min_z=0.0)
     assert approach[0] == (0.0, 0.0, 8.0)  # top of the stack: normal entry
-    assert approach[1] == (0.0, 0.0, 5.0 - STACK_APPROACH_OFFSET)
-    assert approach[2] == (10.0, 0.0, 5.0)  # horizontally far: untouched
+    assert approach[1] == (0.0, 0.0, 6.0 - STACK_APPROACH_OFFSET)
+    assert approach[2] == (10.0, 0.0, 6.0)  # horizontally far: untouched
     assert waves == [[1]]
 
 
 def test_stack_entry_plan_ignores_wide_vertical_gaps() -> None:
-    targets = [(0.0, 0.0, 9.0), (0.0, 0.0, 4.5)]  # gap 4.5 m > 4 m
+    targets = [(0.0, 0.0, 9.0), (0.0, 0.0, 6.0)]  # gap 3.0 m > 2.5 m
     approach, waves = _stack_entry_plan(targets, min_z=0.0)
     assert approach == [tuple(t) for t in targets]
     assert waves == []
 
 
 def test_stack_entry_plan_three_deep_column_climbs_top_first() -> None:
-    targets = [(0.0, 0.0, 9.0), (0.0, 0.0, 6.0), (0.0, 0.0, 3.0)]
-    approach, waves = _stack_entry_plan(targets, min_z=0.0)
-    assert approach[1] == (0.0, 0.0, 2.0)
-    assert approach[2] == (0.0, 0.0, 0.0)  # clamped at min_z
+    targets = [(0.0, 0.0, 9.0), (0.0, 0.0, 7.0), (0.0, 0.0, 5.0)]
+    approach, waves = _stack_entry_plan(targets, min_z=3.0)
+    assert approach[1] == (0.0, 0.0, 4.5)
+    assert approach[2] == (0.0, 0.0, 3.0)  # clamped at min_z
     assert waves == [[1], [2]]  # drone above always settles first
 
 
 def test_stack_entry_plan_fails_loudly_when_approaches_collapse() -> None:
-    targets = [(0.0, 0.0, 8.0), (0.0, 0.0, 6.0), (0.0, 0.0, 4.0)]
+    targets = [(0.0, 0.0, 6.0), (0.0, 0.0, 4.5), (0.0, 0.0, 3.0)]
     with pytest.raises(PlanningError):
-        _stack_entry_plan(targets, min_z=2.0)
+        _stack_entry_plan(targets, min_z=2.5)
 
 
 def test_stacked_phase_enters_from_below_at_constant_speed() -> None:
-    # Drone 1 already sits at the stack top; drone 2 must approach 4 m below
-    # its target and climb the last stretch vertically at STACK_CLIMB_SPEED.
+    # Drone 1 already sits at the stack top; drone 2 must approach 2.5 m
+    # below its target and climb the last stretch vertically at
+    # STACK_CLIMB_SPEED.
     start = [(0.0, 0.0, 10.0), (8.0, 0.0, 10.0)]
     phases = [
         {
             "name": "stack",
             "points": [
                 {"x": 0.0, "y": 0.0, "z": 10.0},
-                {"x": 0.0, "y": 0.0, "z": 7.0},
+                {"x": 0.0, "y": 0.0, "z": 8.0},
             ],
         }
     ]
@@ -139,7 +140,7 @@ def test_stacked_phase_enters_from_below_at_constant_speed() -> None:
         i for i, rec in enumerate(result.steps) if rec.constant_speed
     )
     before_climb = result.steps[first_climb_index - 1].positions[1]
-    assert before_climb == [0.0, 0.0, 7.0 - STACK_APPROACH_OFFSET]
+    assert before_climb == [0.0, 0.0, 8.0 - STACK_APPROACH_OFFSET]
 
     previous = before_climb
     for rec in climb_steps:
@@ -151,4 +152,4 @@ def test_stacked_phase_enters_from_below_at_constant_speed() -> None:
         assert rec.positions[0] == [0.0, 0.0, 10.0]
         previous = pos
 
-    assert result.steps[-1].positions[1] == [0.0, 0.0, 7.0]
+    assert result.steps[-1].positions[1] == [0.0, 0.0, 8.0]

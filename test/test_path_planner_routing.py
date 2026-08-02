@@ -32,10 +32,31 @@ def _length(path):
     )
 
 
-def test_blocked_drone_routes_near_optimally_over_parked_grid() -> None:
-    # A 5x5 parked grid (2 m spacing) sits across the straight line. The old
-    # greedy random-detour crawl produced ~26 m for this 16 m crossing; the
-    # planner must fly a tight climb-over (theoretical optimum ≈ 17.7 m).
+def _enters_downwash_column(path, obstacles, clearance=2.5) -> bool:
+    """Whether any path point sits in an obstacle's padded vertical column.
+
+    The column spans ``clearance`` above and below the parked drone (plus
+    the envelope) within its XY footprint — routes must pass laterally
+    (>= 0.7 m in XY) or keep the full vertical clearance.
+    """
+    for p in path:
+        for obs in obstacles:
+            if (
+                abs(p[0] - obs[0]) < 0.7 - 1e-9
+                and abs(p[1] - obs[1]) < 0.7 - 1e-9
+                and -(0.5 + clearance) < p[2] - obs[2] < 0.5 + clearance
+            ):
+                # start/goal legitimately near own row ends are excluded by
+                # construction in these scenarios
+                return True
+    return False
+
+
+def test_blocked_drone_routes_near_optimally_around_parked_grid() -> None:
+    # A 5x5 parked grid (2 m spacing) sits across the straight line. The
+    # planner must fly a tight route (the 2.5 m vertical clearance makes the
+    # lateral dodge around the grid edge cheaper than a 3 m climb) without
+    # ever entering any parked drone's padded vertical column.
     parked = [(2.0 * (i % 5), 2.0 * (i // 5), 10.0) for i in range(25)]
     initials = parked + [(-4.0, 4.0, 10.0)]
     targets = parked + [(12.0, 4.0, 10.0)]
@@ -43,18 +64,16 @@ def test_blocked_drone_routes_near_optimally_over_parked_grid() -> None:
     assert result.success
 
     path = _drone_path(result, 25)
-    assert _length(path) < 20.0
+    assert _length(path) < 24.0
     z_values = [p[2] for p in path]
     assert min(z_values) >= 10.0 - 1e-9  # never dips below its cruise level
-    assert max(z_values) > 10.5  # actually climbs over the grid
-    # no backtracking: x progress is monotonic on the way across
-    x_values = [p[0] for p in path]
-    assert all(b >= a - 1e-9 for a, b in zip(x_values, x_values[1:]))
+    assert not _enters_downwash_column(path, parked)
 
 
-def test_route_climbs_over_never_under_a_parked_drone() -> None:
+def test_route_never_skims_over_or_under_a_parked_drone() -> None:
     # One parked drone dead on the straight line at the same altitude: the
-    # downwash rule forbids passing underneath, so the route must go over.
+    # route must keep the 2.5 m vertical clearance — passing laterally or
+    # high, never skimming right above or below the parked drone.
     initials = [(0.0, 0.0, 10.0), (5.0, 0.0, 10.0)]
     targets = [(10.0, 0.0, 10.0), (5.0, 0.0, 10.0)]
     result = PathSolver(initials, targets).solve()
@@ -62,7 +81,8 @@ def test_route_climbs_over_never_under_a_parked_drone() -> None:
 
     path = _drone_path(result, 0)
     assert min(p[2] for p in path) >= 10.0 - 1e-9
-    assert max(p[2] for p in path) > 10.5
+    assert not _enters_downwash_column(path, [(5.0, 0.0, 10.0)])
+    assert _length(path) < 14.0  # tight dodge, no wandering
 
 
 def test_symmetric_square_rotation_resolves() -> None:
