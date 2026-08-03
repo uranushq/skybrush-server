@@ -2,6 +2,17 @@ __all__ = ("schema",)
 
 schema = {
     "properties": {
+        "active": {
+            "title": "Fleet active",
+            "type": "boolean",
+            "description": (
+                "Whether the virtual drone fleet is active. When false, no "
+                "virtual UAVs are registered. Can also be toggled via the REST API."
+            ),
+            "default": True,
+            "format": "checkbox",
+            "propertyOrder": 50,
+        },
         "add_noise": {
             "title": "Add noise",
             "type": "boolean",
@@ -57,6 +68,15 @@ schema = {
             "type": "number",
             "description": "Orientation of the virtual UAVs on the ground, in degrees relative to North",
             "default": 59,
+        },
+        "route": {
+            "type": "string",
+            "title": "URL root",
+            "description": (
+                "URL prefix where the virtual UAV control endpoints are mounted "
+                "within the HTTP namespace of the server"
+            ),
+            "default": "/api/v1/virtual-uavs",
         },
         "origin": {
             "title": "Origin",
