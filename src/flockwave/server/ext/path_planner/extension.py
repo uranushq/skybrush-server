@@ -66,6 +66,7 @@ import re
 from contextlib import ExitStack
 from copy import deepcopy
 from json import dumps
+from time import perf_counter, time as wall_time
 from logging import Logger
 from math import ceil, sqrt
 from pathlib import Path
@@ -100,8 +101,10 @@ from .output import (
 )
 from .collision_volume import (
     GUARANTEED_XY_CLEARANCE,
+    HARD_MIN_SEPARATION,
     PLANNED_XY_CLEARANCE,
     PLANNING_MARGIN,
+    clamp_separation,
     describe_collision_envelope,
     envelope_overlap,
     envelope_overlap_swept,
@@ -161,6 +164,22 @@ STACK_VERTICAL_GAP = 2.5
 STACK_APPROACH_OFFSET = 2.5
 STACK_XY_TOLERANCE = GUARANTEED_XY_CLEARANCE
 STACK_CLIMB_SPEED = 0.5
+
+
+# 진행 중인 계획 작업의 실시간 상태. 워커 스레드가 갱신하고
+# GET /path-planner/progress 가 읽는다 (단일 작업 가정, 원자적 dict 갱신).
+_progress_state: dict = {"active": False}
+
+
+def _progress_update(**updates) -> None:
+    """Merge a progress update; bumps segment bookkeeping on label change."""
+    segment = updates.get("segment")
+    if segment is not None and segment != _progress_state.get("segment"):
+        _progress_state["segment_index"] = (
+            _progress_state.get("segment_index", 0) + 1
+        )
+        _progress_state["segment_started_at"] = wall_time()
+    _progress_state.update(updates)
 
 
 class PlanningError(Exception):
@@ -592,6 +611,7 @@ def _detect_rigid_groups(
     *,
     excluded: set[int],
     static_positions: Sequence[Sequence[float]],
+    separation: float = HARD_MIN_SEPARATION,
 ) -> dict[int, list[tuple[float, float, float]]]:
     """Find formation blocks translated as a unit and pin them to lockstep.
 
@@ -624,6 +644,7 @@ def _detect_rigid_groups(
                     list(obs),
                     list(obs),
                     margin=PLANNING_MARGIN,
+                    separation=separation,
                     b_extends_below=DOWNWASH_ROUTE_CLEARANCE,
                     b_extends_above=DOWNWASH_ROUTE_CLEARANCE,
                 )
@@ -782,6 +803,7 @@ def _yaw_lists_match(current_yaws: list[float], target_yaws: list[float]) -> boo
 def _find_clearance_violations(
     label: str,
     points: Sequence[Sequence[float]],
+    separation: float = HARD_MIN_SEPARATION,
 ) -> list[dict]:
     """Pairs of points closer than the planner's inflated envelope allows."""
     pairs: list[dict] = []
@@ -789,7 +811,9 @@ def _find_clearance_violations(
         for j in range(i + 1, len(points)):
             a = points[i]
             b = points[j]
-            if envelope_overlap(a, b, margin=PLANNING_MARGIN):
+            if envelope_overlap(
+                a, b, margin=PLANNING_MARGIN, separation=separation
+            ):
                 pairs.append(
                     {
                         "label": label,
@@ -805,14 +829,16 @@ def _find_clearance_violations(
     return pairs
 
 
-def _spacing_error_response(violations: list[dict]):
+def _spacing_error_response(
+    violations: list[dict], separation: float = HARD_MIN_SEPARATION
+):
     if log:
         summary = "; ".join(
             f"{v['label']}: {v['first']}~{v['second']} delta={v['delta']}"
             for v in violations[:10]
         )
         log.warning(
-            f"path-planner request rejected — formation points too close "
+            f"path-planner request rejected -- formation points too close "
             f"({len(violations)} violation(s)): {summary}"
         )
     return (
@@ -822,7 +848,9 @@ def _spacing_error_response(violations: list[dict]):
                 "code": "FORMATION_SPACING_TOO_CLOSE",
                 "details": {
                     "collision_envelope": describe_collision_envelope(),
-                    "required_xy_clearance": PLANNED_XY_CLEARANCE,
+                    "required_separation": separation,
+                    "required_xy_clearance": separation,
+                    "hard_min_separation": HARD_MIN_SEPARATION,
                     "violations": violations,
                 },
             }
@@ -831,13 +859,16 @@ def _spacing_error_response(violations: list[dict]):
     )
 
 
-def _validate_point_group_spacing(groups: list[tuple[str, Sequence]]):
-    """422 response when any labelled point set violates the clearance."""
+def _validate_point_group_spacing(
+    groups: list[tuple[str, Sequence]],
+    separation: float = HARD_MIN_SEPARATION,
+):
+    """422 response when any labelled point set violates the separation."""
     violations: list[dict] = []
     for label, points in groups:
-        violations.extend(_find_clearance_violations(label, points))
+        violations.extend(_find_clearance_violations(label, points, separation))
     if violations:
-        return _spacing_error_response(violations)
+        return _spacing_error_response(violations, separation)
     return None
 
 
@@ -861,7 +892,7 @@ def _altitude_floor_error(groups: list[tuple[str, Sequence]], min_z: float):
             f"{v['label']}[{v['index']}] z={v['z']}" for v in violations[:10]
         )
         log.warning(
-            f"path-planner request rejected — waypoints below altitude floor "
+            f"path-planner request rejected -- waypoints below altitude floor "
             f"{min_z} m ({len(violations)} violation(s)): {summary}"
         )
     return (
@@ -961,105 +992,123 @@ def _stack_entry_plan(
     *,
     min_z: float,
     exempt: Optional[set[int]] = None,
+    xy_tolerance: float = STACK_XY_TOLERANCE,
 ) -> tuple[list[tuple[float, float, float]], list[list[int]]]:
     """Split entry into a stacked formation into approach + climb waves.
 
-    Detects vertical stacks in *targets*: drones whose horizontal offset is
-    below :data:`STACK_XY_TOLERANCE` form a column; within a column, a drone
-    sitting within :data:`STACK_VERTICAL_GAP` below the drone above it needs
-    the staged entry.
+    A drone needs the staged entry iff another drone's target sits
+    *directly above* its own target: horizontal offsets below the tolerance
+    on BOTH axes and a vertical gap of at most :data:`STACK_VERTICAL_GAP`.
+    Only these true above/below pairs form the stacking relation — large
+    flat formations (e.g. an image wall where every drone shares one x
+    plane) must NOT be chained sideways into one giant "column" through
+    lateral neighbours, which is what the previous connected-component
+    analysis did.
 
     Drones in *exempt* (user-pinned fixed paths, drones already parked on
     their target) never receive a staged entry: their approach point stays
-    their real target and they join no climb wave. They still count for the
-    column ordering, so a non-exempt drone below them stages normally.
+    their real target and they join no climb wave. They still count as
+    "above" for the wave ordering, so a non-exempt drone below them stages
+    normally.
 
     Returns ``(approach_targets, climb_waves)``. ``approach_targets`` equals
     *targets* except for stacked lower drones, which stop
     :data:`STACK_APPROACH_OFFSET` below their real target (never below
-    *min_z*). ``climb_waves[k]`` lists the drone indices that perform their
-    final vertical climb in wave ``k`` — ordered so that drones higher in a
-    column always settle before anyone climbs underneath them.
+    *min_z*). ``climb_waves[k]`` lists the drone indices whose longest
+    stacked-above chain has length ``k`` — drones higher in a stack always
+    settle before anyone climbs underneath them.
 
-    Raises :class:`PlanningError` when altitude clamping squashes two
-    approach points of the same column together (no safe staged entry
-    exists).
+    Raises :class:`PlanningError` when altitude clamping squashes the
+    approach points of a true above/below pair together (no safe staged
+    entry exists for that vertical line).
     """
     n = len(targets)
     exempt = exempt or set()
     approach: list[tuple[float, float, float]] = [tuple(t) for t in targets]
-    waves: dict[int, list[int]] = {}
 
-    # Connected components under horizontal proximity.
-    adjacency: dict[int, set[int]] = {i: set() for i in range(n)}
+    # True vertical stacking pairs only: aboves[j] = drones directly above j.
+    aboves: dict[int, list[int]] = {j: [] for j in range(n)}
     for i in range(n):
-        for j in range(i + 1, n):
-            dx = targets[i][0] - targets[j][0]
-            dy = targets[i][1] - targets[j][1]
-            if sqrt(dx * dx + dy * dy) < STACK_XY_TOLERANCE:
-                adjacency[i].add(j)
-                adjacency[j].add(i)
+        for j in range(n):
+            if i == j:
+                continue
+            if abs(targets[i][0] - targets[j][0]) >= xy_tolerance:
+                continue
+            if abs(targets[i][1] - targets[j][1]) >= xy_tolerance:
+                continue
+            dz = targets[i][2] - targets[j][2]
+            if 0 < dz <= STACK_VERTICAL_GAP:
+                aboves[j].append(i)
 
-    unvisited = set(range(n))
-    while unvisited:
-        frontier = [unvisited.pop()]
-        component = set(frontier)
-        while frontier:
-            node = frontier.pop()
-            for neighbour in adjacency[node]:
-                if neighbour in component:
-                    continue
-                component.add(neighbour)
-                frontier.append(neighbour)
-        unvisited -= component
-        if len(component) < 2:
-            continue
+    # Longest stacked-above chain per drone (strict z ordering -> acyclic).
+    depth_memo: dict[int, int] = {}
 
-        order = sorted(component, key=lambda i: -targets[i][2])
+    def depth_of(j: int) -> int:
+        cached = depth_memo.get(j)
+        if cached is not None:
+            return cached
         depth = 0
-        for above, below in zip(order, order[1:]):
-            if targets[above][2] - targets[below][2] <= STACK_VERTICAL_GAP:
-                depth += 1
-            else:
-                depth = 0  # gap break: this drone is the top of a new stack
-            if depth > 0 and below not in exempt:
-                x, y, z = targets[below]
-                approach[below] = (x, y, max(min_z, z - STACK_APPROACH_OFFSET))
-                waves.setdefault(depth, []).append(below)
+        for i in aboves[j]:
+            depth = max(depth, depth_of(i) + 1)
+        depth_memo[j] = depth
+        return depth
 
-        for above, below in zip(order, order[1:]):
-            if approach[above][2] - approach[below][2] < 1e-6 and (
-                approach[above] != targets[above] or approach[below] != targets[below]
+    waves: dict[int, list[int]] = {}
+    for j in range(n):
+        if j in exempt or not aboves[j]:
+            continue
+        x, y, z = targets[j]
+        approach[j] = (x, y, max(min_z, z - STACK_APPROACH_OFFSET))
+        waves.setdefault(depth_of(j), []).append(j)
+
+    # Lift cascade (bottom-up): min_z clamping can compress the approach
+    # gaps of a vertical chain below the separation. Raise each staged
+    # approach so it stays at least ``xy_tolerance`` (the separation) above
+    # the approach of the drone directly below it — capped at the drone's
+    # own target, which always suffices when targets respect the altitude
+    # floor and the separation.
+    for j in sorted(range(n), key=lambda k: targets[k][2]):
+        for i in aboves[j]:
+            if approach[i] == targets[i]:
+                continue  # not staged: its target already clears by >= sep
+            needed = approach[j][2] + xy_tolerance
+            if approach[i][2] < needed:
+                x, y, z = targets[i]
+                approach[i] = (x, y, min(z, needed))
+
+    # Collapse check per true pair: the upper drone's approach must stay
+    # above the lower drone's approach on their shared vertical line even
+    # after the lift cascade (only possible when a target itself violates
+    # the altitude floor), otherwise the staged entry cannot be flown.
+    for j in range(n):
+        for i in aboves[j]:
+            if approach[i][2] - approach[j][2] < xy_tolerance - 1e-6 and (
+                approach[i] != targets[i] or approach[j] != targets[j]
             ):
-                # Full column diagnostics: which targets were grouped into
-                # this vertical stack (horizontal offset < STACK_XY_TOLERANCE)
-                # and where their staged approach points ended up.
-                column = [
+                pair = [
                     {
-                        "drone": f"drone-{i + 1}",
-                        "target": [round(v, 3) for v in targets[i]],
-                        "approach": [round(v, 3) for v in approach[i]],
+                        "drone": f"drone-{k + 1}",
+                        "target": [round(v, 3) for v in targets[k]],
+                        "approach": [round(v, 3) for v in approach[k]],
                     }
-                    for i in order
+                    for k in (i, j)
                 ]
                 if log:
                     log.warning(
-                        "staged stack entry failed: drones "
-                        f"{[i + 1 for i in order]} form one vertical column "
-                        f"(XY offsets < {STACK_XY_TOLERANCE:.2f} m); "
-                        f"min_z={min_z} m clamps the approach points of "
-                        f"drone-{above + 1} and drone-{below + 1} together. "
-                        f"column={column}"
+                        "staged stack entry failed: drone-%d sits directly "
+                        "above drone-%d but min_z=%s m clamps their "
+                        "approach points together. pair=%s"
+                        % (i + 1, j + 1, min_z, pair)
                     )
                 raise PlanningError(
                     "staged stack entry is impossible: approach points for "
-                    f"drones {above + 1} and {below + 1} collapse at the "
+                    f"drones {i + 1} and {j + 1} collapse at the "
                     "minimum altitude; raise the formation or min_alt",
                     details={
-                        "drones": [f"drone-{above + 1}", f"drone-{below + 1}"],
-                        "column": column,
+                        "drones": [f"drone-{i + 1}", f"drone-{j + 1}"],
+                        "pair": pair,
                         "min_z": min_z,
-                        "stack_xy_tolerance": STACK_XY_TOLERANCE,
+                        "stack_xy_tolerance": xy_tolerance,
                         "stack_approach_offset": STACK_APPROACH_OFFSET,
                     },
                 )
@@ -1137,6 +1186,8 @@ def _extend_with_solver_run(
     label: str,
     constant_speed: bool = False,
     fixed_routes: Optional[dict[int, list[tuple[float, float, float]]]] = None,
+    min_separation: float = HARD_MIN_SEPARATION,
+    report_progress: bool = True,
 ) -> list[tuple[float, float, float]]:
     """Run one solver segment and append its steps to the combined timeline.
 
@@ -1149,15 +1200,63 @@ def _extend_with_solver_run(
     caller never sees a partial path.
     """
     num_drones = len(current_positions)
+
+    # 실시간 진행률: 5스텝마다 잔여 총거리로 세그먼트 내 진행도를 계산해
+    # 전역 진행 상태에 반영한다 (그리디 계산이 어디까지 왔는지 노출).
+    on_step = None
+    if report_progress:
+        target_list = [tuple(t) for t in targets]
+        initial_remaining = sum(
+            Drone.distance(p, t)
+            for p, t in zip(current_positions, target_list)
+        )
+        _progress_update(
+            segment=label,
+            step=0,
+            percent=0.0,
+            remaining_m=round(initial_remaining, 1),
+            initial_remaining_m=round(initial_remaining, 1),
+        )
+        step_counter = {"count": 0}
+
+        def on_step(record):
+            step_counter["count"] += 1
+            if step_counter["count"] % 5:
+                return
+            remaining = sum(
+                Drone.distance(record.positions[i], target_list[i])
+                for i in range(num_drones)
+            )
+            fraction = (
+                1.0 - remaining / initial_remaining
+                if initial_remaining > 1e-9
+                else 1.0
+            )
+            _progress_update(
+                segment=label,
+                step=record.step,
+                remaining_m=round(remaining, 1),
+                percent=round(max(0.0, min(1.0, fraction)) * 100.0, 1),
+            )
+
     solver = PathSolver(
         initials=current_positions,
         targets=list(targets),
         step_size=step_size,
         seed=seed,
+        on_step=on_step,
         min_z=min_z,
         fixed_routes=fixed_routes,
+        min_separation=min_separation,
     )
+    started_at = perf_counter()
     result = solver.solve()
+    if log:
+        log.info(
+            f"segment '{label}': {'solved' if result.success else 'FAILED'} "
+            f"in {perf_counter() - started_at:.1f}s "
+            f"({result.total_steps} steps, {num_drones} drones)"
+        )
     if not result.success:
         details = {
             "segment": label,
@@ -1210,6 +1309,7 @@ def _plan_formation_phases(
     initial_yaws: list[float] | None = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
     staging_targets: Optional[list[tuple[float, float, float]]] = None,
+    min_separation: float = HARD_MIN_SEPARATION,
 ) -> tuple[SolverResult, list[dict]]:
     """Plan synced formation phases with collision avoidance between phases.
 
@@ -1222,6 +1322,7 @@ def _plan_formation_phases(
     Raises :class:`PlanningError` on any unsolvable segment.
     """
     num_drones = len(start_positions)
+    min_separation = clamp_separation(min_separation)
     duration_sec = duration_ms / 1000.0
     current_positions = [
         tuple(float(v) for v in point) for point in start_positions
@@ -1276,6 +1377,7 @@ def _plan_formation_phases(
             label=label,
             constant_speed=constant_speed,
             fixed_routes=fixed_routes,
+            min_separation=min_separation,
         )
         segment_counter += 1
 
@@ -1314,6 +1416,7 @@ def _plan_formation_phases(
             [tuple(t) for t in targets],
             excluded=stationary | set(combined_fixed),
             static_positions=[current_positions[i] for i in stationary],
+            separation=min_separation,
         )
         if auto_pinned:
             combined_fixed.update(auto_pinned)
@@ -1327,7 +1430,10 @@ def _plan_formation_phases(
 
         try:
             approach_targets, climb_waves = _stack_entry_plan(
-                targets, min_z=min_z, exempt=exempt
+                targets,
+                min_z=min_z,
+                exempt=exempt,
+                xy_tolerance=min_separation,
             )
         except PlanningError as exc:
             exc.details = {**exc.details, "segment": label}
@@ -1545,7 +1651,9 @@ def _limit_failure_response(exc: Exception, validation_payload: dict):
     )
 
 
-def _build_and_verify_shows(build_fn, smoothing: float):
+def _build_and_verify_shows(
+    build_fn, smoothing: float, separation: float = HARD_MIN_SEPARATION
+):
     """Build show dicts and run the final verification gate (sync, threaded).
 
     ``build_fn(smoothing)`` must return the show dicts. When the smoothed
@@ -1555,12 +1663,12 @@ def _build_and_verify_shows(build_fn, smoothing: float):
     Returns ``(show_dicts, violations, applied_smoothing)``.
     """
     show_dicts = build_fn(smoothing)
-    violations = verify_show_dicts(show_dicts)
+    violations = verify_show_dicts(show_dicts, separation=separation)
     if not violations:
         return show_dicts, [], smoothing
     if smoothing > 0.0:
         fallback_dicts = build_fn(0.0)
-        fallback_violations = verify_show_dicts(fallback_dicts)
+        fallback_violations = verify_show_dicts(fallback_dicts, separation=separation)
         if not fallback_violations:
             return fallback_dicts, [], 0.0
         return fallback_dicts, fallback_violations, 0.0
@@ -1625,6 +1733,12 @@ async def _handle_path_delivery(body: dict):
     smoothing = float(body.get("velocity_smoothing", velocity_smoothing))
     if not (0.0 <= smoothing <= 1.0):
         return jsonify({"error": "'velocity_smoothing' must be between 0 and 1"}), 400
+    # Delivery paths honour the same separation floor as generated plans;
+    # requests may raise it, never lower it (silently clamped up here since
+    # the delivery UI has no separation field yet).
+    min_separation = clamp_separation(
+        body.get("min_separation", body.get("min_spacing", HARD_MIN_SEPARATION))
+    )
     takeoff_speed = float(body.get("takeoff_speed", DEFAULT_TAKEOFF_SPEED_M_S))
     landing_speed = float(body.get("landing_speed", DEFAULT_LANDING_SPEED_M_S))
     if takeoff_speed <= 0 or landing_speed <= 0:
@@ -1680,7 +1794,7 @@ async def _handle_path_delivery(body: dict):
         if blocking:
             if log:
                 log.warning(
-                    "path-planner request rejected — validation failed: "
+                    "path-planner request rejected -- validation failed: "
                     + "; ".join(str(i.message) for i in blocking[:10])
                 )
             return (
@@ -1715,7 +1829,7 @@ async def _handle_path_delivery(body: dict):
 
     try:
         show_dicts, violations, applied_smoothing = await to_thread.run_sync(
-            lambda: _build_and_verify_shows(build, smoothing)
+            lambda: _build_and_verify_shows(build, smoothing, min_separation)
         )
     except TrajectoryLimitError as exc:
         return _limit_failure_response(exc, validation_payload)
@@ -1769,6 +1883,35 @@ async def _handle_path_delivery(body: dict):
 
 
 # ── REST endpoint ────────────────────────────────────────────────────────
+
+
+@blueprint.route("/progress", methods=["GET"])
+async def planning_progress():
+    """Live progress of the current planning job.
+
+    The frontend polls this while a plan request is in flight to show how
+    far the greedy computation has gotten: current segment, step count,
+    remaining fleet distance, per-segment percent and an ETA extrapolated
+    from the segment's progress rate.
+    """
+    snapshot = dict(_progress_state)
+    now = wall_time()
+    started_at = snapshot.get("started_at")
+    if started_at:
+        snapshot["elapsed_sec"] = round(now - started_at, 1)
+    segment_started_at = snapshot.get("segment_started_at")
+    percent = snapshot.get("percent")
+    if (
+        segment_started_at
+        and isinstance(percent, (int, float))
+        and percent > 3.0
+    ):
+        segment_elapsed = now - segment_started_at
+        snapshot["segment_elapsed_sec"] = round(segment_elapsed, 1)
+        snapshot["segment_eta_sec"] = round(
+            segment_elapsed * (100.0 - percent) / percent, 1
+        )
+    return jsonify(snapshot)
 
 
 @blueprint.route("/plan", methods=["POST"])
@@ -1872,6 +2015,34 @@ async def plan():
     if not (0.0 <= smoothing <= 1.0):
         return jsonify({"error": "'velocity_smoothing' must be between 0 and 1"}), 400
 
+    # Minimum inter-drone separation (per-axis / Chebyshev). Adjustable per
+    # request but NEVER below the hard floor — requests trying to lower it
+    # are rejected loudly instead of being clamped silently.
+    raw_separation = body.get("min_separation", body.get("min_spacing"))
+    if raw_separation is None:
+        min_separation = HARD_MIN_SEPARATION
+    else:
+        try:
+            min_separation = float(raw_separation)
+        except (TypeError, ValueError):
+            return jsonify({"error": "'min_separation' must be a number"}), 400
+        if min_separation < HARD_MIN_SEPARATION:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"'min_separation' of {min_separation} m is below "
+                            f"the hard operational floor of "
+                            f"{HARD_MIN_SEPARATION} m and cannot be lowered"
+                        ),
+                        "code": "SEPARATION_BELOW_HARD_FLOOR",
+                        "hard_min_separation": HARD_MIN_SEPARATION,
+                    }
+                ),
+                400,
+            )
+    min_separation = clamp_separation(min_separation)
+
     # Staging parameters: hover altitude above each drone's ground position
     # and the grid spacing. ``initial_altitude`` is accepted as a legacy
     # alias for the staging altitude.
@@ -1898,13 +2069,14 @@ async def plan():
             ),
             400,
         )
-    if grid_spacing < PLANNED_XY_CLEARANCE:
+    if grid_spacing < min_separation:
         return (
             jsonify(
                 {
                     "error": (
                         f"'grid_spacing' of {grid_spacing} m is below the "
-                        f"required clearance of {PLANNED_XY_CLEARANCE:.2f} m"
+                        f"required minimum separation of "
+                        f"{min_separation:.2f} m"
                     )
                 }
             ),
@@ -1977,7 +2149,7 @@ async def plan():
         if blocking:
             if log:
                 log.warning(
-                    "path-planner request rejected — validation failed: "
+                    "path-planner request rejected -- validation failed: "
                     + "; ".join(str(i.message) for i in blocking[:10])
                 )
             return (
@@ -2018,6 +2190,9 @@ async def plan():
     spacing_groups: list[tuple[str, Sequence]] = []
     floor_groups: list[tuple[str, Sequence]] = []
     if uses_phases:
+        # Initial ground positions must respect the separation too — the
+        # drones sit there together before takeoff.
+        spacing_groups.append(("initial-ground", ground_positions))
         spacing_groups.append(("staging-hover", hover_positions))
         floor_groups.append(("staging-hover", hover_positions))
         if staging_targets is not None:
@@ -2041,7 +2216,7 @@ async def plan():
         floor_groups.append(("initial", initial))
         floor_groups.append(("target", target))
 
-    spacing_error = _validate_point_group_spacing(spacing_groups)
+    spacing_error = _validate_point_group_spacing(spacing_groups, min_separation)
     if spacing_error is not None:
         return spacing_error
     floor_error = _altitude_floor_error(floor_groups, min_z)
@@ -2072,6 +2247,7 @@ async def plan():
                 initial_yaws=initial_yaws,
                 max_yaw_rate_deg_s=max_yaw_rate_deg_s,
                 staging_targets=staging_targets,
+                min_separation=min_separation,
             )
         solver = PathSolver(
             initials=[tuple(p) for p in initial],
@@ -2079,6 +2255,7 @@ async def plan():
             step_size=step_size,
             seed=seed,
             min_z=min_z,
+            min_separation=min_separation,
         )
         result = solver.solve()
         if not result.success:
@@ -2094,12 +2271,34 @@ async def plan():
             )
         return result, []
 
+    _progress_state.clear()
+    _progress_state.update(
+        {
+            "active": True,
+            "started_at": wall_time(),
+            "num_drones": len(initial),
+            "mode": "formation_phases" if uses_phases else "point_to_point",
+            "phases_total": len(phases) if uses_phases else 1,
+            "segment": None,
+            "segment_index": 0,
+            "finished": None,
+        }
+    )
+
+    planning_started_at = perf_counter()
     try:
         result, phase_summaries = await to_thread.run_sync(run_planning)
     except PlanningError as exc:
+        _progress_update(active=False, finished="failure", message=str(exc))
         if log:
             log.warning(f"Path planning failed: {exc}")
         return _planning_failure_response(exc, validation_payload)
+    planning_sec = round(perf_counter() - planning_started_at, 2)
+    if log:
+        log.info(
+            f"path-planner: solved {len(initial)} drones in {planning_sec}s "
+            f"({result.total_steps} steps total)"
+        )
 
     # --- build the shows once, verify, and only then save/upload -----------
     def build(smoothing_value: float):
@@ -2117,22 +2316,32 @@ async def plan():
             geofence=body.get("geofence"),
         )
 
+    _progress_update(segment="build+verify", percent=None, step=None)
+    verify_started_at = perf_counter()
     try:
         show_dicts, violations, applied_smoothing = await to_thread.run_sync(
-            lambda: _build_and_verify_shows(build, smoothing)
+            lambda: _build_and_verify_shows(build, smoothing, min_separation)
         )
     except TrajectoryLimitError as exc:
+        _progress_update(active=False, finished="failure", message=str(exc))
         if log:
             log.warning(f"Trajectory limit exceeded: {exc}")
         return _limit_failure_response(exc, validation_payload)
+    build_verify_sec = round(perf_counter() - verify_started_at, 2)
+    if log:
+        log.info(f"path-planner: build+verify took {build_verify_sec}s")
 
     if violations:
+        _progress_update(
+            active=False, finished="failure", message="verification rejected"
+        )
         if log:
             log.error(
                 f"Verification gate rejected the generated show "
                 f"({len(violations)} violation(s))"
             )
         return _verification_failure_response(violations, validation_payload)
+    _progress_update(active=False, finished="success")
 
     # --- response scaffolding ----------------------------------------------
     output = build_output(result, duration_ms)
@@ -2140,12 +2349,19 @@ async def plan():
     output["total_steps"] = result.total_steps
     output["validation"] = validation_payload
     output["verification"] = {"checked": True, "violations": 0}
+    output["spacing"] = {
+        "min_separation": min_separation,
+        "hard_min_separation": HARD_MIN_SEPARATION,
+        "semantics": "per-axis (Chebyshev)",
+    }
     output["smoothing"] = {"requested": smoothing, "applied": applied_smoothing}
     output["timing"] = {
         "duration_ms": duration_ms,
         "cruise_speed": cruise_speed,
         "takeoff_speed": takeoff_speed,
         "landing_speed": landing_speed,
+        "planning_sec": planning_sec,
+        "build_verify_sec": build_verify_sec,
     }
     if takeoff_time_adjusted:
         output["adjustments"] = {"takeoff_time": takeoff_time}

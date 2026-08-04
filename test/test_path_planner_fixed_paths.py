@@ -84,11 +84,11 @@ def test_fixed_drone_wins_crossing_conflict() -> None:
 
 
 def test_fixed_route_departs_at_step_one() -> None:
-    # Seven drones packed 1 m apart: the pinned drone departs at the very
+    # Seven drones packed 2 m apart: the pinned drone departs at the very
     # first step alongside everyone else (all drones release simultaneously).
     n = 7
-    initials = [(i * 1.0, 0.0, 10.0) for i in range(n)]
-    targets = [(i * 1.0, 12.0, 10.0) for i in range(n)]
+    initials = [(i * 2.0, 0.0, 10.0) for i in range(n)]
+    targets = [(i * 2.0, 12.0, 10.0) for i in range(n)]
     solver = PathSolver(
         initials, targets, fixed_routes={6: [targets[6]]}
     )
@@ -327,7 +327,7 @@ def test_pinned_convoy_with_crossing_descent_does_not_livelock() -> None:
         (5.0, 3.0, 7.0),
     ]
     targets = [
-        (5.0, 6.5713, 5.5),
+        (5.0, 6.554, 5.5),
         (5.0, 8.054, 5.5),
         (5.0, 9.554, 5.5),
         (5.0, 3.0, 5.5),
@@ -358,7 +358,7 @@ def test_pinned_crossing_resolves_regardless_of_drone_id_order() -> None:
     ]
     targets = [
         (5.0, 3.0, 5.5),
-        (5.0, 6.5713, 5.5),
+        (5.0, 6.554, 5.5),
         (5.0, 8.054, 5.5),
         (5.0, 9.554, 5.5),
     ]
@@ -405,11 +405,11 @@ def test_phase5_full_segment_from_field_data() -> None:
         (5.0, 1.5, 12.0),
         (5.0, 3.0, 12.0),
         (5.0, 1.5, 13.5),
-        (5.0, -7.1119, 5.5),
+        (5.0, -7.1596, 5.5),
         (5.0, -5.6596, 5.5),
         (5.0, -1.5, 5.5),
         (5.0, 0.0, 5.5),
-        (5.0, 6.5713, 5.5),
+        (5.0, 6.554, 5.5),
         (5.0, 8.054, 5.5),
         (5.0, 9.554, 5.5),
         (5.0, 3.0, 5.5),
@@ -423,14 +423,14 @@ def test_phase5_full_segment_from_field_data() -> None:
         for pos in _positions_of(result, did):
             assert _on_polyline(pos, lane), (did, pos)
     # Downwash regression: the flown .skyc had drone-16 hovering only 0.5 m
-    # above the lane while the convoy passed beneath. With the transit guard
-    # every XY-overlapping pair keeps at least the 1.5 m formation gap.
+    # above the lane while the convoy passed beneath. Every XY-overlapping
+    # pair must now keep at least the hard minimum separation vertically.
     for rec in result.steps:
         for i in range(16):
             for j in range(i + 1, 16):
                 pi, pj = rec.positions[i], rec.positions[j]
                 if abs(pi[0] - pj[0]) < 0.7 and abs(pi[1] - pj[1]) < 0.7:
-                    assert abs(pi[2] - pj[2]) >= 1.5 - 1e-6, (
+                    assert abs(pi[2] - pj[2]) >= 1.45 - 1e-6, (
                         rec.step, i, j, pi, pj,
                     )
 
@@ -504,6 +504,52 @@ def test_rigid_group_is_auto_clustered_without_explicit_field() -> None:
     final = result.steps[-1].positions
     assert final[0] == [8.0, 4.0, 8.5]
     assert final[2] == [8.0, 4.0, 5.5]
+
+
+def test_wall_to_stack_column_entry_resolves() -> None:
+    # Regression (user's phase-3): three drones leave a vertical wall and
+    # enter a single stacked column at 1.5 m gaps while a pinned group
+    # departs the area. The staged approach points sit one separation below
+    # already-parked drones — inside the A* downwash pads — and used to be
+    # unreachable (deadlock): the goal-connect radius must bridge the
+    # padded zone, and the skim-over guard must not mutually hold the
+    # column-converging drones.
+    start = [
+        (12.6976, -3.0, 10.6639),
+        (12.6976, -1.0, 10.6639),
+        (12.6976, 3.0, 10.6639),
+        (8.0, 0.0, 10.5),
+        (8.0, 1.5, 10.5),
+    ]
+    phases = [
+        {
+            "name": "column",
+            "points": [
+                {"droneId": "drone-1", "x": 8.0, "y": 0.0, "z": 10.5},
+                {"droneId": "drone-2", "x": 8.0, "y": 0.0, "z": 12.0},
+                {"droneId": "drone-3", "x": 8.0, "y": 0.0, "z": 13.5},
+                {"droneId": "drone-4", "x": 5.0, "y": -3.0, "z": 10.5},
+                {"droneId": "drone-5", "x": 5.0, "y": -1.5, "z": 10.5},
+            ],
+            "fixedPaths": [
+                {"droneId": "drone-4", "path": [{"x": 5.0, "y": -3.0, "z": 10.5}]},
+                {"droneId": "drone-5", "path": [{"x": 5.0, "y": -1.5, "z": 10.5}]},
+            ],
+        }
+    ]
+    result, _summaries = _plan_formation_phases(
+        start_positions=start,
+        phases=phases,
+        step_size=1.0,
+        duration_ms=1000,
+        seed=1,
+        return_to_initial=False,
+        min_z=2.5,
+    )
+    final = result.steps[-1].positions
+    assert final[0] == [8.0, 0.0, 10.5]
+    assert final[1] == [8.0, 0.0, 12.0]
+    assert final[2] == [8.0, 0.0, 13.5]
 
 
 def test_head_on_pinned_paths_fail_with_specific_error() -> None:

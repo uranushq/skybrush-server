@@ -72,9 +72,9 @@ from math import floor
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from .collision_volume import (
-    ENVELOPE_XY_HALF,
-    ENVELOPE_Z_HEIGHT,
+    HARD_MIN_SEPARATION,
     PLANNING_MARGIN,
+    clamp_separation,
     envelope_overlap,
     envelope_overlap_swept,
 )
@@ -120,7 +120,11 @@ ASTAR_XY_HEADROOM_STEPS = 8
 ASTAR_UP_HEADROOM_STEPS = 8
 ASTAR_DOWN_HEADROOM_STEPS = 2
 # A node this close to the goal may connect to it directly (if clear).
-ASTAR_GOAL_CONNECT_STEPS = 1.5
+# Must be generous enough that goals sitting INSIDE a parked drone's padded
+# downwash zone (e.g. staged stack approach points, one separation below
+# the drone above) stay reachable: the connect edge is checked with the
+# plain separation windows, without the downwash pads.
+ASTAR_GOAL_CONNECT_STEPS = 2.5
 # Ascending edges are discounted and descending edges surcharged, so a
 # blocked drone prefers climbing *over* an obstacle to sidestepping around
 # it laterally — and never gains from dive-and-return zigzags
@@ -136,12 +140,6 @@ ASTAR_DOWNWARD_PENALTY = 0.5
 # asymmetric z window in the swept envelope test.
 DOWNWASH_ROUTE_CLEARANCE = 2.5
 
-# Minimum vertical gap (meters) kept while hovering or travelling directly
-# above another drone's active horizontal route (the "skim-over" guard).
-# Matches the tightest vertical stacking used in formations: crossing
-# traffic may pass under a drone at the formation gap, but never at the
-# bare envelope distance (the 0.5 m passes observed in flown shows).
-TRANSIT_VERTICAL_GAP = 1.5
 # Edges passing within PROXIMITY_EXTRA of a parked drone's (margin-inflated)
 # envelope cost this fraction extra — wide/over routes beat tight squeezes.
 ASTAR_PROXIMITY_SURCHARGE = 0.3
@@ -217,12 +215,15 @@ class PathSolver:
         min_z: float = 0.0,
         margin: float = PLANNING_MARGIN,
         fixed_routes: Optional[Dict[int, List[Vec3]]] = None,
+        min_separation: float = HARD_MIN_SEPARATION,
     ) -> None:
         assert len(initials) == len(targets), "initial and target counts must match"
         self.step_size = step_size
         self.on_step = on_step
         self.min_z = float(min_z)
         self.margin = float(margin)
+        # Per-axis minimum separation; can never go below the hard floor.
+        self.separation = clamp_separation(min_separation)
         # ``seed`` is accepted for API compatibility; the solver is fully
         # deterministic and uses no randomness.
         del seed
@@ -280,17 +281,16 @@ class PathSolver:
                     self._fixed_ids.add(did)
 
         # Broad-phase cell size: two drones can only interact within one
-        # envelope reach plus one step of motion on each side.
-        pair_reach = max(
-            2.0 * (ENVELOPE_XY_HALF + self.margin),
-            ENVELOPE_Z_HEIGHT + 2.0 * self.margin,
-        )
+        # separation window plus one step of motion on each side.
+        pair_reach = self.separation + 2.0 * self.margin
         self._cell_size = pair_reach + 2.0 * step_size
 
     # ── collision detection ──────────────────────────────────────────────
 
     def _overlap(self, a: List[float], b: List[float]) -> bool:
-        return envelope_overlap(a, b, margin=self.margin)
+        return envelope_overlap(
+            a, b, margin=self.margin, separation=self.separation
+        )
 
     def _swept_overlap(
         self,
@@ -299,7 +299,14 @@ class PathSolver:
         prev_b: List[float],
         next_b: List[float],
     ) -> bool:
-        return envelope_overlap_swept(prev_a, next_a, prev_b, next_b, margin=self.margin)
+        return envelope_overlap_swept(
+            prev_a,
+            next_a,
+            prev_b,
+            next_b,
+            margin=self.margin,
+            separation=self.separation,
+        )
 
     def _candidate_pairs(
         self, prev: Dict[int, List[float]], proposed: Dict[int, List[float]]
@@ -314,8 +321,8 @@ class PathSolver:
         regardless of the cell size.
         """
         cell = self._cell_size
-        inflate_xy = ENVELOPE_XY_HALF + self.margin
-        inflate_z = ENVELOPE_Z_HEIGHT / 2.0 + self.margin
+        inflate_xy = self.separation / 2.0 + self.margin
+        inflate_z = self.separation / 2.0 + self.margin
         buckets: Dict[Tuple[int, int, int], List[int]] = {}
         for did, next_pos in proposed.items():
             prev_pos = prev[did]
@@ -436,6 +443,7 @@ class PathSolver:
                         prev[x],
                         prev[x],
                         margin=self.margin,
+                        separation=self.separation,
                     ):
                         blocks[x] += 1
 
@@ -529,6 +537,7 @@ class PathSolver:
                 obs,
                 obs,
                 margin=checked_margin,
+                separation=self.separation,
                 b_extends_below=pad,
                 b_extends_above=pad,
             ):
@@ -566,12 +575,15 @@ class PathSolver:
         # blocked — e.g. a staged stack climb, which the greedy pursuit
         # handles). Don't burn the search budget on either.
         for obs in statics:
-            if envelope_overlap(obs, list(goal), margin=self.margin):
+            if envelope_overlap(
+                obs, list(goal), margin=self.margin, separation=self.separation
+            ):
                 return None
             if envelope_overlap(
                 list(start),
                 obs,
                 margin=self.margin,
+                separation=self.separation,
                 b_extends_below=DOWNWASH_ROUTE_CLEARANCE,
                 b_extends_above=DOWNWASH_ROUTE_CLEARANCE,
             ):
@@ -596,8 +608,8 @@ class PathSolver:
 
         # Only obstacles whose (downwash-extended, margin-inflated) envelope
         # can reach into the search box matter for this plan.
-        xy_reach = 2.0 * (ENVELOPE_XY_HALF + proximity_margin)
-        z_reach = ENVELOPE_Z_HEIGHT + 2.0 * proximity_margin
+        xy_reach = self.separation + 2.0 * proximity_margin
+        z_reach = self.separation + 2.0 * proximity_margin
         statics = [
             obs
             for obs in statics
@@ -807,15 +819,15 @@ class PathSolver:
     def _downwash_hold_back(self, drone: Drone, candidate: List[float]) -> bool:
         """Whether this drone should wait instead of taking its next step.
 
-        Blocks steps into the *skim-over zone*: a position hovering between
-        the envelope height and :data:`TRANSIT_VERTICAL_GAP` above another
-        drone's remaining horizontal route. Descending to 0.5 m above a lane
-        that crossing traffic is about to use — the pattern behind the
-        observed near-misses — is refused; the drone waits higher until the
-        traffic has passed. Same-altitude conflicts are untouched (the
-        envelope collision rules own those), co-flowing drones (same XY
-        direction, e.g. a convoy or a rigid cluster) are exempt, and purely
-        vertical movers neither trigger the guard nor block each other.
+        Blocks steps into the *skim-over zone*: a position hovering just
+        above the separation window over another drone's remaining
+        horizontal route (up to one meter beyond the downwash clearance).
+        Descending right above a lane that crossing traffic is about to use
+        is refused; the drone waits higher until the traffic has passed.
+        Same-altitude conflicts are untouched (the separation collision
+        rules own those), co-flowing drones (same XY direction, e.g. a
+        convoy or a rigid cluster) are exempt, and purely vertical movers
+        neither trigger the guard nor block each other.
         """
         if candidate == drone.position:
             return False
@@ -831,12 +843,16 @@ class PathSolver:
             edge_norm = (ex * ex + ey * ey) ** 0.5
             if edge_norm < 1e-9:
                 continue  # hovering or purely vertical mover
+            if edge_norm < 2.0 * self.step_size:
+                continue  # almost arrived: blocking on it only livelocks
             dz = candidate[2] - other.position[2]
-            if not (
-                ENVELOPE_Z_HEIGHT - 1e-9
-                <= dz
-                < TRANSIT_VERTICAL_GAP - 1e-9
-            ):
+            # Narrow band just above the separation window: the separation
+            # rules already forbid anything closer, and a wider band makes
+            # drones converging into a shared column (staged stack
+            # approaches travel with ~one-separation vertical offsets)
+            # mutually hold each other forever.
+            zone_hi = self.separation + 1.0
+            if not (self.separation - 1e-9 <= dz < zone_hi - 1e-9):
                 continue  # not in the skim-over zone above this drone
             if my_norm > 1e-9:
                 dot = (my_dx * ex + my_dy * ey) / (my_norm * edge_norm)
@@ -850,6 +866,7 @@ class PathSolver:
                 candidate,
                 candidate,
                 margin=self.margin,
+                separation=self.separation,
             ):
                 return True
         return False
@@ -969,6 +986,7 @@ class PathSolver:
                     other.position,
                     other.position,
                     margin=self.margin,
+                    separation=self.separation,
                 )
             ]
             if blockers:
@@ -1006,7 +1024,7 @@ class PathSolver:
             )
             reason = (
                 f"user-pinned straight path is blocked: {pairs}. A pinned "
-                "drone can never detour — move the blocking drone's position "
+                "drone can never detour -- move the blocking drone's position "
                 "or unpin the blocked drone"
             )
         return reason, conflicts
@@ -1109,7 +1127,10 @@ class PathSolver:
                 if self._consecutive_holds[did] < SQUAT_WAIT_LIMIT and any(
                     other.drone_id != did
                     and envelope_overlap(
-                        other.position, goal, margin=self.margin
+                        other.position,
+                        goal,
+                        margin=self.margin,
+                        separation=self.separation,
                     )
                     for other in self.drones
                 ):
@@ -1203,7 +1224,7 @@ class PathSolver:
                     return self._failure(
                         step_num,
                         f"no progress for {STAGNATION_WINDOW} consecutive "
-                        "steps — the formation is deadlocked",
+                        "steps -- the formation is deadlocked",
                     )
 
         if not all(d.arrived for d in self.drones):

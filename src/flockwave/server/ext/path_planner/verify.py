@@ -16,8 +16,8 @@ from math import floor
 from typing import Dict, List, Sequence, Tuple
 
 from .collision_volume import (
-    ENVELOPE_XY_HALF,
-    ENVELOPE_Z_HEIGHT,
+    HARD_MIN_SEPARATION,
+    clamp_separation,
     envelope_overlap,
 )
 
@@ -102,6 +102,7 @@ def verify_trajectories(
     trajectories: List[List[list]],
     *,
     margin: float = 0.0,
+    separation: float = HARD_MIN_SEPARATION,
     max_violations: int = 20,
 ) -> List[dict]:
     """Check every drone pair over the whole show timeline.
@@ -120,8 +121,9 @@ def verify_trajectories(
     if end_time <= 0:
         return []
 
-    pair_reach_xy = 2.0 * (ENVELOPE_XY_HALF + margin)
-    pair_reach_z = ENVELOPE_Z_HEIGHT + 2.0 * margin
+    separation = clamp_separation(separation)
+    pair_reach_xy = separation + 2.0 * margin
+    pair_reach_z = separation + 2.0 * margin
     min_reach = min(pair_reach_xy, pair_reach_z)
 
     max_speed = _max_speed_estimate(trajectories)
@@ -173,7 +175,12 @@ def verify_trajectories(
                         continue
                     if (i, j) in reported:
                         continue
-                    if envelope_overlap(positions[i], positions[j], margin=margin):
+                    if envelope_overlap(
+                        positions[i],
+                        positions[j],
+                        margin=margin,
+                        separation=separation,
+                    ):
                         reported.add((i, j))
                         violations.append(
                             {
@@ -193,12 +200,19 @@ def verify_trajectories(
 
 
 def verify_show_dicts(
-    show_dicts: List[dict], *, margin: float = 0.0, max_violations: int = 20
+    show_dicts: List[dict],
+    *,
+    margin: float = 0.0,
+    separation: float = HARD_MIN_SEPARATION,
+    max_violations: int = 20,
 ) -> List[dict]:
     """Convenience wrapper: verify the trajectories inside show dicts."""
     trajectories = [
         (show.get("trajectory") or {}).get("points") or [] for show in show_dicts
     ]
     return verify_trajectories(
-        trajectories, margin=margin, max_violations=max_violations
+        trajectories,
+        margin=margin,
+        separation=separation,
+        max_violations=max_violations,
     )

@@ -14,6 +14,7 @@ from flockwave.server.ext.path_planner.collision_volume import (
     ENVELOPE_XY_HALF,
     ENVELOPE_Z_HEIGHT,
     GUARANTEED_XY_CLEARANCE,
+    HARD_MIN_SEPARATION,
     PLANNED_XY_CLEARANCE,
     WAKE_ANGLE_DEG,
     WAKE_LENGTH,
@@ -62,9 +63,11 @@ def test_yaw_invariance_diagonal_equals_axis() -> None:
 
 
 def test_separated_when_far_on_z() -> None:
+    # Vertical separation must reach the hard minimum separation (1.5 m);
+    # the bare physical envelope height is no longer enough.
     a = [0.0, 0.0, 10.0]
-    b = [0.0, 0.0, 10.0 + ENVELOPE_Z_HEIGHT + 0.01]
-    assert not volumes_overlap(a, b)
+    assert volumes_overlap(a, [0.0, 0.0, 10.0 + ENVELOPE_Z_HEIGHT + 0.01])
+    assert not volumes_overlap(a, [0.0, 0.0, 10.0 + HARD_MIN_SEPARATION])
 
 
 def test_wake_overlap_when_offset_below() -> None:
@@ -76,25 +79,40 @@ def test_wake_overlap_when_offset_below() -> None:
 
 
 def test_wake_clears_when_far_below() -> None:
-    theta = math.radians(WAKE_ANGLE_DEG)
-    wake_dz = WAKE_LENGTH * math.cos(theta)
-    half_z = BODY_SIZE_Z * 0.5
-    # Body-body needs 2*half_z; the (short) wake may or may not extend past
-    # the body, so the required clearance is whichever reach is larger.
-    clearance = max(2.0 * half_z, half_z + wake_dz + WAKE_RADIUS) + 0.01
+    # The separation floor dominates every physical reach: 1.5 m below is
+    # exactly the boundary and must clear; a hair less must not.
     a = [0.0, 0.0, 10.0]
-    b = [0.0, 0.0, 10.0 - clearance]
-    assert not volumes_overlap(a, b)
+    assert not volumes_overlap(a, [0.0, 0.0, 10.0 - HARD_MIN_SEPARATION])
+    assert volumes_overlap(a, [0.0, 0.0, 10.0 - HARD_MIN_SEPARATION + 0.01])
 
 
 def test_tight_formation_spacing_is_allowed() -> None:
-    """Policy minimum spacing is 0.7 m; 0.75 m on either axis must clear."""
-    assert GUARANTEED_XY_CLEARANCE == 0.7
-    assert PLANNED_XY_CLEARANCE == 0.7
-    assert not volumes_overlap([0.0, 0.0, 10.0], [0.75, 0.0, 10.0])
-    assert not volumes_overlap([0.0, 0.0, 10.0], [0.0, 0.75, 10.0])
-    assert not volumes_overlap([0.0, 0.0, 10.0], [0.7, 0.0, 10.0])
-    assert volumes_overlap([0.0, 0.0, 10.0], [0.69, 0.0, 10.0])
+    """Policy minimum separation is 1.45 m on every axis (Chebyshev)."""
+    assert GUARANTEED_XY_CLEARANCE == HARD_MIN_SEPARATION == 1.45
+    assert PLANNED_XY_CLEARANCE == 1.45
+    assert not volumes_overlap([0.0, 0.0, 10.0], [1.5, 0.0, 10.0])
+    assert not volumes_overlap([0.0, 0.0, 10.0], [0.0, 1.5, 10.0])
+    assert not volumes_overlap([0.0, 0.0, 10.0], [1.45, 0.0, 10.0])
+    assert volumes_overlap([0.0, 0.0, 10.0], [1.44, 0.0, 10.0])
+    # Diagonal: both axes under the separation is still a conflict...
+    assert volumes_overlap([0.0, 0.0, 10.0], [1.4, 1.4, 10.0])
+    # ...and the floor can never be lowered via the parameter.
+    assert volumes_overlap(
+        [0.0, 0.0, 10.0], [1.0, 0.0, 10.0]
+    )  # default separation
+    from flockwave.server.ext.path_planner.collision_volume import (
+        envelope_overlap,
+    )
+
+    assert envelope_overlap(
+        [0.0, 0.0, 10.0], [1.0, 0.0, 10.0], separation=0.5
+    ), "requesting a separation below the floor must not weaken the check"
+    assert not envelope_overlap(
+        [0.0, 0.0, 10.0], [2.0, 0.0, 10.0], separation=2.0
+    )
+    assert envelope_overlap(
+        [0.0, 0.0, 10.0], [1.9, 0.0, 10.0], separation=2.0
+    ), "raised separations must tighten the check"
 
 
 def test_margin_inflates_envelope() -> None:
