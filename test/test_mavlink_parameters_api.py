@@ -57,14 +57,19 @@ def test_parameter_list_errors() -> None:
     assert errors == [{"uav": "2", "error": "unsupported"}]
 
 
-def _mock_app_with_uav(uav: MAVLinkUAV, uav_id: str = "drone-1") -> MagicMock:
+def _mock_app_with_uavs(uavs: dict[str, MAVLinkUAV]) -> MagicMock:
     registry = MagicMock()
-    registry.ids_by_type.return_value = [uav_id]
-    registry.find_by_id.return_value = uav
+    registry.ids_by_type.return_value = list(uavs)
+    registry.contains.side_effect = lambda uav_id: uav_id in uavs
+    registry.find_by_id.side_effect = lambda uav_id: uavs[uav_id]
 
     app = MagicMock()
     app.object_registry = registry
     return app
+
+
+def _mock_app_with_uav(uav: MAVLinkUAV, uav_id: str = "drone-1") -> MagicMock:
+    return _mock_app_with_uavs({uav_id: uav})
 
 
 @pytest.mark.trio
@@ -104,6 +109,7 @@ async def test_read_parameter_lists_returns_207_on_failure() -> None:
 async def test_read_parameter_lists_returns_404_when_empty() -> None:
     registry = MagicMock()
     registry.ids_by_type.return_value = []
+    registry.contains.return_value = False
     registry.find_by_id.return_value = None
     app = MagicMock()
     app.object_registry = registry
@@ -113,3 +119,42 @@ async def test_read_parameter_lists_returns_404_when_empty() -> None:
 
     assert status == 404
     assert payload["error"] == "No MAVLink UAVs available"
+
+
+@pytest.mark.trio
+async def test_read_parameter_lists_skips_unknown_ids() -> None:
+    uav = AsyncMock(spec=MAVLinkUAV)
+    uav.get_all_parameters.return_value = [
+        {"name": "FOO", "value": 1.0, "type": "REAL32", "default": None},
+    ]
+    app = _mock_app_with_uav(uav, uav_id="17")
+
+    with overridden(mavlink_api, app=app, log=None):
+        payload, status = await mavlink_api.read_parameter_lists(
+            requested_ids=["0", "17"]
+        )
+
+    assert status == 200
+    assert payload["skipped"] == ["0"]
+    assert "17" in payload["results"]
+
+
+@pytest.mark.trio
+async def test_read_parameter_lists_downloads_all_requested_uavs() -> None:
+    uav_a = AsyncMock(spec=MAVLinkUAV)
+    uav_a.get_all_parameters.return_value = [
+        {"name": "FOO", "value": 1.0, "type": "REAL32", "default": None},
+    ]
+    uav_b = AsyncMock(spec=MAVLinkUAV)
+    uav_b.get_all_parameters.return_value = [
+        {"name": "BAR", "value": 2.0, "type": "REAL32", "default": None},
+    ]
+    app = _mock_app_with_uavs({"a": uav_a, "b": uav_b})
+
+    with overridden(mavlink_api, app=app, log=None):
+        payload, status = await mavlink_api.read_parameter_lists()
+
+    assert status == 200
+    assert set(payload["results"]) == {"a", "b"}
+    assert payload["results"]["a"]["parameters"][0]["name"] == "FOO"
+    assert payload["results"]["b"]["parameters"][0]["name"] == "BAR"

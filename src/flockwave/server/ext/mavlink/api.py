@@ -45,6 +45,9 @@ def _resolve_mavlink_uavs(
         candidate_ids = requested_ids
 
     for uav_id in candidate_ids:
+        if not app.object_registry.contains(uav_id):
+            skipped.append(uav_id)
+            continue
         uav = app.object_registry.find_by_id(uav_id)
         if uav is None or not is_uav(uav):
             skipped.append(uav_id)
@@ -146,12 +149,28 @@ async def read_parameter_lists(
         )
 
     results: dict[str, dict[str, Any]] = {}
+    if log:
+        log.info(
+            "Downloading parameters from %s UAV(s): %s",
+            len(uavs),
+            ", ".join(uav_id for uav_id, _ in uavs),
+        )
+
     for uav_id, uav in uavs:
-        results[uav_id] = await read_all_parameters(uav)
-        if log and "error" not in results[uav_id]:
+        result = await read_all_parameters(uav)
+        results[uav_id] = result
+        if not log:
+            continue
+        if "error" in result:
+            log.warning(
+                "Failed to download parameters from %s: %s",
+                uav_id,
+                result["error"],
+            )
+        else:
             log.info(
                 "Downloaded %s parameters from %s",
-                results[uav_id].get("count", 0),
+                result.get("count", 0),
                 uav_id,
             )
 
