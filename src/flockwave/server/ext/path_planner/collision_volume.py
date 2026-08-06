@@ -17,15 +17,16 @@ circumscribes the model under any rotation, the check result does not depend
 on the commanded yaw of either drone — important now that shows carry yaw
 setpoints.
 
-Planning margin
----------------
-The solver checks the envelope inflated by :data:`PLANNING_MARGIN` on every
-side. The effective XY half-extent is capped so that
-:data:`MIN_FORMATION_XY_CLEARANCE` (0.7 m) is the plan-time center-to-center
-floor. Velocity smoothing (see ``converter``) re-times each drone along its
-own path with a bounded schedule deviation of at most ~15% of one solver
-step (natural-log profile); the final verification gate (see ``verify``)
-re-checks the smoothed trajectories with ``margin=0`` as a defense in depth.
+Separation policy
+-----------------
+All conflict checks use a per-axis (Chebyshev) separation window: two
+drones conflict unless they are at least the *separation* apart along at
+least one axis. The separation defaults to — and can never drop below —
+:data:`HARD_MIN_SEPARATION` (1.45 m); requests may raise it. Velocity
+smoothing (see ``converter``) re-times each drone along its own path with a
+bounded schedule deviation of at most ~15% of one solver step (natural-log
+profile); the final verification gate (see ``verify``) re-checks the
+smoothed trajectories with the same separation as a defense in depth.
 
 The swept-motion check (:func:`envelope_overlap_swept`) is **exact** for two
 drones moving linearly and simultaneously: per axis, the relative offset is
@@ -58,15 +59,44 @@ WAKE_LENGTH = 0.15
 WAKE_RADIUS = 0.03
 
 # Margin (meters, per side of each drone's envelope) used for all plan-time
-# collision checks. Kept at 0 so the policy minimum spacing
-# (:data:`MIN_FORMATION_XY_CLEARANCE`) is the effective plan-time clearance;
+# collision checks. Kept at 0 so the policy minimum separation
+# (:data:`HARD_MIN_SEPARATION`) is the effective plan-time clearance;
 # velocity-smoothing schedule error is small relative to that floor
 # (~0.15 * step_size per drone for the log profile).
 PLANNING_MARGIN = 0.0
 
-# Minimum center-to-center XY spacing enforced for formation endpoints,
-# staging grids and plan-time collision checks.
-MIN_FORMATION_XY_CLEARANCE = 0.7
+# ── minimum inter-drone separation ───────────────────────────────────────
+# Two drones must be at least this far apart (meters) along AT LEAST one
+# axis — i.e. the Chebyshev distance between any two drone centers must be
+# >= the separation, which also lower-bounds the Euclidean distance by the
+# same value. This is a HARD operational floor: a request may RAISE the
+# separation via `min_separation` but nothing may ever lower it below this
+# constant. Enforced at request validation (initial/staging/phase points),
+# throughout the solver and by the final verification gate.
+HARD_MIN_SEPARATION = 1.45
+
+# Boundary tolerance (meters) for the separation checks. 1.45 is not
+# exactly representable in binary floating point, so spacings that are
+# *nominally* exactly at the floor can land a hair under it after
+# arithmetic (e.g. 10 + 1.45 == 11.449999...). One micrometer of slack is
+# physically meaningless but makes boundary-exact formations deterministic.
+SEPARATION_EPS = 1e-6
+
+
+def clamp_separation(value) -> float:
+    """Coerce a requested separation to a float no smaller than the floor."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return HARD_MIN_SEPARATION
+    if parsed != parsed:  # NaN
+        return HARD_MIN_SEPARATION
+    return max(HARD_MIN_SEPARATION, parsed)
+
+
+# Backwards-compatible alias: the formation spacing floor now equals the
+# hard minimum separation on every axis.
+MIN_FORMATION_XY_CLEARANCE = HARD_MIN_SEPARATION
 
 # Legacy names used by the REST API / formation validator
 COLLISION_X = BODY_SIZE_X
@@ -155,21 +185,20 @@ def _horizontal_circumradius(components: tuple[AABB, ...]) -> float:
 _COMPONENT_AABBS = _component_aabbs_relative()
 _COMBINED_MIN_REL, _COMBINED_MAX_REL = _combined_aabb_relative(_COMPONENT_AABBS)
 
-# Yaw-invariant bounding envelope (see module docstring). The geometric
-# circumradius of body+wake is retained as an upper bound; the effective
-# half-extent is capped so center-to-center spacing of
-# :data:`MIN_FORMATION_XY_CLEARANCE` clears the check.
+# Yaw-invariant physical bounding envelope of one drone (body + wakes).
+# Purely descriptive since the separation floor took over the collision
+# windows — the floor (1.5 m) is far larger than the physical envelope.
 _GEOMETRIC_XY_HALF = _horizontal_circumradius(_COMPONENT_AABBS)
-ENVELOPE_XY_HALF = min(_GEOMETRIC_XY_HALF, MIN_FORMATION_XY_CLEARANCE / 2.0)
+ENVELOPE_XY_HALF = _GEOMETRIC_XY_HALF
 ENVELOPE_Z_MIN = _COMBINED_MIN_REL[2]
 ENVELOPE_Z_MAX = _COMBINED_MAX_REL[2]
 ENVELOPE_Z_HEIGHT = ENVELOPE_Z_MAX - ENVELOPE_Z_MIN
 
-# Center-to-center clearance guaranteed between any two drones whose
-# (margin-inflated) envelopes do not overlap. Axis-wise, hence also a lower
-# bound on the Euclidean distance.
-GUARANTEED_XY_CLEARANCE = 2.0 * ENVELOPE_XY_HALF
-PLANNED_XY_CLEARANCE = MIN_FORMATION_XY_CLEARANCE
+# Center-to-center clearance guaranteed between any two drones that pass
+# the overlap check at the default separation. Axis-wise (Chebyshev),
+# hence also a lower bound on the Euclidean distance.
+GUARANTEED_XY_CLEARANCE = HARD_MIN_SEPARATION
+PLANNED_XY_CLEARANCE = HARD_MIN_SEPARATION
 
 # Conservative "minimum distance" figure for show validation blocks
 # (e.g. the .skyc validation settings), floored to a 0.1 m grid.
@@ -181,25 +210,30 @@ def envelope_overlap(
     b: Sequence[float],
     *,
     margin: float = 0.0,
+    separation: float = HARD_MIN_SEPARATION,
     b_extends_below: float = 0.0,
     b_extends_above: float = 0.0,
 ) -> bool:
-    """Yaw-invariant envelope overlap check for two drones at *a* and *b*.
+    """Separation check for two drones at *a* and *b*.
 
-    ``margin`` inflates each drone's envelope on every side; pass
-    :data:`PLANNING_MARGIN` for plan-time checks and 0 for final verification.
-    ``b_extends_below`` / ``b_extends_above`` additionally extend *b*'s
-    envelope that many meters downward / upward — used by route planning to
-    treat a parked drone's downwash column (and the wash-inflicting zone
-    right above it) as blocked.
+    The drones conflict unless they are at least ``separation`` meters
+    apart along at least one axis (``separation`` is clamped to the hard
+    floor :data:`HARD_MIN_SEPARATION`; boundary-exact spacings pass).
+    ``margin`` inflates the window on every side; ``b_extends_below`` /
+    ``b_extends_above`` additionally extend *b*'s conflict zone that many
+    meters downward / upward — used by route planning to treat a parked
+    drone's downwash column (and the wash-inflicting zone right above it)
+    as blocked.
     """
-    if abs(a[0] - b[0]) >= 2.0 * (ENVELOPE_XY_HALF + margin):
+    window = (
+        max(separation, HARD_MIN_SEPARATION) + 2.0 * margin - SEPARATION_EPS
+    )
+    if abs(a[0] - b[0]) >= window:
         return False
-    if abs(a[1] - b[1]) >= 2.0 * (ENVELOPE_XY_HALF + margin):
+    if abs(a[1] - b[1]) >= window:
         return False
-    z_window = ENVELOPE_Z_HEIGHT + 2.0 * margin
     dz = a[2] - b[2]
-    return -(z_window + b_extends_below) < dz < z_window + b_extends_above
+    return -(window + b_extends_below) < dz < window + b_extends_above
 
 
 def _axis_overlap_interval(
@@ -221,25 +255,27 @@ def envelope_overlap_swept(
     b1: Sequence[float],
     *,
     margin: float = 0.0,
+    separation: float = HARD_MIN_SEPARATION,
     b_extends_below: float = 0.0,
     b_extends_above: float = 0.0,
 ) -> bool:
-    """Exact overlap check while both drones move linearly from t=0 to t=1.
+    """Exact separation check while both drones move linearly from t=0 to 1.
 
-    The relative offset on each axis is linear in time, so the overlap window
-    per axis is solved in closed form; a collision exists iff the three
-    windows intersect. No sampling, no tunneling. ``b_extends_below`` /
-    ``b_extends_above`` extend *b*'s envelope downward / upward (see
+    The relative offset on each axis is linear in time, so the conflict
+    window per axis is solved in closed form; a conflict exists iff the
+    three windows intersect. No sampling, no tunneling. ``b_extends_below``
+    / ``b_extends_above`` extend *b*'s conflict zone downward / upward (see
     :func:`envelope_overlap`), making the z window asymmetric.
     """
-    xy_window = 2.0 * (ENVELOPE_XY_HALF + margin)
-    z_window = ENVELOPE_Z_HEIGHT + 2.0 * margin
+    window = (
+        max(separation, HARD_MIN_SEPARATION) + 2.0 * margin - SEPARATION_EPS
+    )
     lo = 0.0
     hi = 1.0
     for axis, lo_bound, hi_bound in (
-        (0, -xy_window, xy_window),
-        (1, -xy_window, xy_window),
-        (2, -(z_window + b_extends_below), z_window + b_extends_above),
+        (0, -window, window),
+        (1, -window, window),
+        (2, -(window + b_extends_below), window + b_extends_above),
     ):
         c = a0[axis] - b0[axis]
         d = (a1[axis] - a0[axis]) - (b1[axis] - b0[axis])
@@ -308,6 +344,11 @@ def describe_collision_envelope() -> dict[str, float | dict[str, float] | list]:
             "planning_margin": PLANNING_MARGIN,
             "guaranteed_xy_clearance": GUARANTEED_XY_CLEARANCE,
             "planned_xy_clearance": PLANNED_XY_CLEARANCE,
+        },
+        "separation": {
+            "hard_min": HARD_MIN_SEPARATION,
+            "semantics": "per-axis (Chebyshev): pairs must differ by at "
+            "least the separation on x, y or z",
         },
         # Kept for backward compatibility with older clients
         "x": COLLISION_X,

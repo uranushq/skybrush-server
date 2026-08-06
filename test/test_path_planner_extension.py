@@ -103,8 +103,67 @@ def test_stack_entry_plan_three_deep_column_climbs_top_first() -> None:
     assert waves == [[1], [2]]  # drone above always settles first
 
 
-def test_stack_entry_plan_fails_loudly_when_approaches_collapse() -> None:
+def test_stack_entry_side_by_side_pairs_do_not_collapse() -> None:
+    # Regression (image-wall field failure): two columns standing side by
+    # side (lateral gap 1.455 m) must not be chained into one "column"; the
+    # equal approach altitudes of their lower members are NOT a collapse
+    # because they are on different vertical lines.
+    targets = [
+        (0.0, 0.0, 10.0),
+        (0.0, 0.0, 8.8),
+        (0.0, 1.455, 10.0),
+        (0.0, 1.455, 8.8),
+    ]
+    approach, waves = _stack_entry_plan(targets, min_z=2.5, xy_tolerance=1.45)
+    assert approach[0] == targets[0]
+    assert approach[2] == targets[2]
+    assert approach[1][2] == 8.8 - STACK_APPROACH_OFFSET
+    assert approach[3][2] == 8.8 - STACK_APPROACH_OFFSET
+    assert waves == [[1, 3]]
+
+
+def test_stack_entry_image_wall_plane_passes() -> None:
+    # A 9x8 vertical image wall (all x = 0, lateral gaps 1.5 m, vertical
+    # gaps 1.455 m): every column stages independently, approaches inside a
+    # column stay strictly ordered, and no false collapse is raised.
+    targets = []
+    for row in range(8):
+        for col in range(9):
+            targets.append((0.0, -6.0 + col * 1.5, 5.0 + row * 1.455))
+    approach, waves = _stack_entry_plan(targets, min_z=2.5, xy_tolerance=1.45)
+    # Top row untouched; every lower row staged.
+    for col in range(9):
+        top = 7 * 9 + col
+        assert approach[top] == targets[top]
+    for row in range(7):
+        for col in range(9):
+            index = row * 9 + col
+            assert approach[index][2] == max(
+                2.5, targets[index][2] - STACK_APPROACH_OFFSET
+            )
+    # Within one column the approach altitudes stay strictly increasing.
+    for col in range(9):
+        zs = [approach[row * 9 + col][2] for row in range(8)]
+        assert all(b - a > 1e-9 for a, b in zip(zs, zs[1:]))
+    assert len(waves) == 7  # one wave per stacked depth
+
+
+def test_stack_entry_clamped_approaches_are_lifted_apart() -> None:
+    # min_z clamping compresses the lower approaches of a chain; the lift
+    # cascade must restore at least one separation of vertical gap between
+    # staged approaches (bottom 2.5, middle lifted to 2.5 + 1.45).
     targets = [(0.0, 0.0, 6.0), (0.0, 0.0, 4.5), (0.0, 0.0, 3.0)]
+    approach, _waves = _stack_entry_plan(targets, min_z=2.5)
+    assert approach[2][2] == 2.5
+    assert approach[1][2] == pytest.approx(2.5 + 1.45)
+    assert approach[0] == targets[0]  # top of the chain: no staging
+
+
+def test_stack_entry_plan_fails_loudly_when_approaches_collapse() -> None:
+    # Targets that themselves violate the vertical separation (0.8 m gap)
+    # cannot be staged: even after the lift cascade the approaches stay
+    # closer than the separation and the plan must fail loudly.
+    targets = [(0.0, 0.0, 4.0), (0.0, 0.0, 2.8), (0.0, 0.0, 2.0)]
     with pytest.raises(PlanningError):
         _stack_entry_plan(targets, min_z=2.5)
 
