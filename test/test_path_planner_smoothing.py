@@ -1,4 +1,4 @@
-"""Tests for the exp-in / log-out velocity smoothing profile.
+"""Tests for the exp-in / plateau / log-out (trapezoid) velocity profile.
 
 Covers the invariants the collision-safety contract depends on:
 
@@ -6,8 +6,9 @@ Covers the invariants the collision-safety contract depends on:
   covered exactly (``arc(1) == L``);
 * the schedule deviation of any eased segment stays within the documented
   bound (what the minimum separation absorbs; ``verify`` is the real backstop);
-* the speed follows an exponential ease-in / logarithmic ease-out curve and
-  endpoint speeds match;
+* the speed accelerates along an exponential ramp, holds a CONSTANT plateau
+  (no pointy apex), then decelerates along a logarithmic ramp; endpoint
+  speeds match;
 * smoothing-exempt (``constant_times``) segments stay exactly linear.
 """
 
@@ -19,53 +20,58 @@ from flockwave.server.ext.path_planner.collision_volume import (
     MIN_FORMATION_XY_CLEARANCE,
 )
 from flockwave.server.ext.path_planner.converter import (
-    _EASE_PEAK_FACTOR,
-    _LOG_SUBDIVISIONS,
-    _MAX_THICKNESS,
-    _bump,
+    DEFAULT_PROFILE_EXP,
+    DEFAULT_PROFILE_LOG,
+    _RAMP_HALF_MAX,
+    _RAMP_HALF_MIN,
+    _THICKNESS_MAX,
+    _THICKNESS_MIN,
+    _clamp_thickness,
     _ease_in_exp,
     _ease_out_log,
+    _ease_peak_factor,
     _log_profile,
     _log_profile_peak,
-    _thickness_from_smoothing,
+    _ramp_from_smoothing,
     apply_velocity_smoothing,
 )
 
-# Worst-case per-drone schedule deviation fraction the exp-in/log-out profile
-# produces at the maximum thickness (the exponential ease-in lags an
-# accelerating segment by ~23% of its length at k = 2).
+# Worst-case per-drone schedule deviation fraction of the trapezoid profile at
+# full smoothing (ramp 0.4 per side): the accel ramp lags the constant-speed
+# schedule by ~17% of the segment length at the ramp/plateau boundary.
 MAX_DEVIATION_FRACTION = 0.25
 
-# Thickness used by the profile-shape tests (full smoothing).
-_K = _thickness_from_smoothing(1.0)
+# Ramp fraction and curvatures used by the profile-shape tests (full smoothing).
+_RAMP = _ramp_from_smoothing(1.0)
+_KE = DEFAULT_PROFILE_EXP
+_KL = DEFAULT_PROFILE_LOG
 
 
-def _deviation(v0: float, v1: float, length: float, dt: float, k: float) -> float:
-    _, arc = _log_profile(v0, v1, length, dt, k)
-    return max(
-        abs(arc(i / 200.0) / length - i / 200.0) for i in range(201)
-    )
+def _deviation(v0: float, v1: float, length: float, dt: float) -> float:
+    _, arc = _log_profile(v0, v1, length, dt, _KE, _KL, _RAMP)
+    return max(abs(arc(i / 200.0) / length - i / 200.0) for i in range(201))
 
 
 def test_profile_covers_length_exactly() -> None:
     for v0, v1 in ((0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (0.3, 1.0)):
-        _, arc = _log_profile(v0, v1, 1.0, 1.0, _K)
-        assert math.isclose(arc(1.0), 1.0, rel_tol=1e-4)
+        _, arc = _log_profile(v0, v1, 1.0, 1.0, _KE, _KL, _RAMP)
+        assert math.isclose(arc(1.0), 1.0, rel_tol=1e-9)
         assert arc(0.0) == 0.0
 
 
-def test_bump_area_is_half_for_every_thickness() -> None:
-    # E and L are inverse functions, so the bump area is exactly 1/2 for all k,
-    # which is what makes arc(1) == length independent of the thickness.
-    for k in (_thickness_from_smoothing(s) for s in (0.05, 0.25, 0.5, 1.0)):
-        _, arc = _log_profile(0.0, 0.0, 1.0, 1.0, k)
-        # rest-to-rest arc(1) == length regardless of k
-        assert math.isclose(arc(1.0), 1.0, rel_tol=1e-4)
+def test_length_is_exact_for_every_curvature_and_ramp() -> None:
+    # vc is solved in closed form so arc(1) == length regardless of the
+    # curvature knobs or ramp fraction.
+    for ke in (0.05, 0.5, 2.0, 4.0):
+        for kl in (0.05, 1.0, 4.0):
+            for ramp in (_RAMP_HALF_MIN, 0.25, _RAMP_HALF_MAX):
+                _, arc = _log_profile(0.0, 0.4, 1.0, 1.0, ke, kl, ramp)
+                assert math.isclose(arc(1.0), 1.0, rel_tol=1e-9)
 
 
 def test_schedule_deviation_stays_below_contract_bound() -> None:
     for v0, v1 in ((0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (0.5, 1.0), (0.0, 0.5)):
-        assert _deviation(v0, v1, 1.0, 1.0, _K) <= MAX_DEVIATION_FRACTION
+        assert _deviation(v0, v1, 1.0, 1.0) <= MAX_DEVIATION_FRACTION
 
 
 def test_deviation_bound_fits_minimum_separation() -> None:
@@ -76,20 +82,38 @@ def test_deviation_bound_fits_minimum_separation() -> None:
 
 
 def test_endpoint_speeds_match() -> None:
-    speed, _ = _log_profile(0.2, 1.0, 1.0, 1.0, _K)
+    speed, _ = _log_profile(0.2, 1.0, 1.0, 1.0, _KE, _KL, _RAMP)
     assert math.isclose(speed(0.0), 0.2, abs_tol=1e-9)
     assert math.isclose(speed(1.0), 1.0, abs_tol=1e-9)
 
 
+def test_plateau_is_constant_with_no_apex() -> None:
+    # The defining property of the trapezoid: between the two ramps the speed
+    # is EXACTLY constant, and that plateau is also the profile's maximum —
+    # there is no pointy apex above it.
+    speed, _ = _log_profile(0.0, 0.0, 1.0, 1.0, _KE, _KL, _RAMP)
+    vc = speed(0.5)
+    for i in range(101):
+        tau = _RAMP + (1.0 - 2.0 * _RAMP) * i / 100.0
+        assert math.isclose(speed(tau), vc, rel_tol=1e-12)
+    peak = max(speed(i / 400.0) for i in range(401))
+    assert math.isclose(peak, vc, rel_tol=1e-9)
+
+
 def test_rest_to_rest_peak_factor() -> None:
-    peak = _log_profile_peak(0.0, 0.0, 1.0, 1.0, _K)
-    assert math.isclose(peak, _EASE_PEAK_FACTOR, rel_tol=1e-3)
-    assert math.isclose(_EASE_PEAK_FACTOR, 2.0, rel_tol=1e-9)
+    # Rest-to-rest peak = plateau speed = 1 / (1 - ramp) for equal curvatures
+    # (E and L are inverses, so their mean areas are complementary).
+    peak = _log_profile_peak(0.0, 0.0, 1.0, 1.0, _KE, _KL, _RAMP)
+    factor = _ease_peak_factor(1.0, _KE, _KL)
+    assert math.isclose(peak, factor, rel_tol=1e-9)
+    assert math.isclose(factor, 1.0 / (1.0 - _RAMP), rel_tol=1e-9)
+    assert factor < 2.0  # gentler than the old pointy profile
+    assert _ease_peak_factor(0.0, _KE, _KL) == 1.0  # no easing -> constant
 
 
 def test_ease_bases_are_inverses_and_monotonic() -> None:
     # E(u) is a convex ease-in, L(u) a concave ease-out, and L = E^{-1}.
-    for k in (_thickness_from_smoothing(s) for s in (0.1, 0.5, 1.0)):
+    for k in (0.1, 1.0, 2.0, 4.0):
         assert math.isclose(_ease_in_exp(0.0, k), 0.0, abs_tol=1e-12)
         assert math.isclose(_ease_in_exp(1.0, k), 1.0, abs_tol=1e-12)
         assert math.isclose(_ease_out_log(0.0, k), 0.0, abs_tol=1e-12)
@@ -99,16 +123,28 @@ def test_ease_bases_are_inverses_and_monotonic() -> None:
             assert math.isclose(_ease_out_log(_ease_in_exp(u, k), k), u, abs_tol=1e-9)
 
 
-def test_bump_is_exp_rising_then_log_falling() -> None:
-    # Peak at the midpoint, zero at both ends, and the exponential rise stays
-    # BELOW the linear ramp (convex, gentle start) on the first half.
-    assert math.isclose(_bump(0.0, _K), 0.0, abs_tol=1e-12)
-    assert math.isclose(_bump(1.0, _K), 0.0, abs_tol=1e-12)
-    assert math.isclose(_bump(0.5, _K), 1.0, abs_tol=1e-9)
-    # convex exponential rise: value at τ=0.25 is below the linear 0.5
-    assert _bump(0.25, _K) < 0.5
-    # concave log fall: value at τ=0.75 is above the linear 0.5
-    assert _bump(0.75, _K) > 0.5
+def test_ramps_are_exp_shaped_then_log_shaped() -> None:
+    # Accel ramp is convex (below the linear chord: gentle start); decel ramp
+    # is the mirrored concave log (gentle finish).
+    speed, _ = _log_profile(0.0, 0.0, 1.0, 1.0, _KE, _KL, _RAMP)
+    vc = speed(0.5)
+    # halfway up the accel ramp the exp curve is below the linear chord
+    assert speed(_RAMP * 0.5) < 0.5 * vc
+    # halfway down the decel ramp the log curve is above the linear chord
+    assert speed(1.0 - _RAMP * 0.5) > 0.5 * vc
+
+
+def test_independent_curvatures_shape_each_ramp() -> None:
+    # Sharpening only the exp curvature changes the accel ramp but leaves the
+    # decel ramp identical (and vice versa the plateau still covers length).
+    gentle, _ = _log_profile(0.0, 0.0, 1.0, 1.0, 0.5, _KL, _RAMP)
+    sharp, _ = _log_profile(0.0, 0.0, 1.0, 1.0, 4.0, _KL, _RAMP)
+    # same plateau (area constraint with same mean is not required — plateau
+    # differs slightly), but the normalized accel shapes must differ
+    assert not math.isclose(
+        gentle(_RAMP * 0.5) / gentle(0.5), sharp(_RAMP * 0.5) / sharp(0.5),
+        rel_tol=1e-3,
+    )
 
 
 def _hold(t: float, pos) -> list:
@@ -117,8 +153,9 @@ def _hold(t: float, pos) -> list:
 
 def test_eased_segment_is_subdivided_and_exempt_segment_stays_linear() -> None:
     # One 4 m dash between two holds, followed by a marked constant-speed
-    # climb: the dash gets subdivided, the climb keeps a single linear
-    # segment with no control points.
+    # climb: the dash gets subdivided into the 5 trapezoid pieces (2 accel,
+    # 1 plateau, 2 decel), the climb keeps a single linear segment with no
+    # control points.
     points = [
         _hold(0.0, [0.0, 0.0, 10.0]),
         _hold(4.0, [4.0, 0.0, 10.0]),
@@ -128,7 +165,7 @@ def test_eased_segment_is_subdivided_and_exempt_segment_stays_linear() -> None:
     smoothed = apply_velocity_smoothing(points, 1.0, constant_times={8.0})
 
     dash_knots = [p for p in smoothed if 0.0 < p[0] <= 4.0]
-    assert len(dash_knots) == _LOG_SUBDIVISIONS
+    assert len(dash_knots) == 5
     assert all(p[2] for p in dash_knots)  # every piece carries controls
 
     climb = [p for p in smoothed if p[0] == 8.0]
@@ -150,7 +187,14 @@ def test_knot_times_and_endpoints_are_preserved() -> None:
         assert matches and matches[0][1] == original[1]
 
 
-def test_thickness_mapping_is_monotonic_and_bounded() -> None:
-    assert _thickness_from_smoothing(0.0) > 0.0  # never exactly zero (no div/0)
-    assert _thickness_from_smoothing(1.0) == _MAX_THICKNESS
-    assert _thickness_from_smoothing(0.5) < _thickness_from_smoothing(1.0)
+def test_ramp_mapping_is_monotonic_and_bounded() -> None:
+    assert _ramp_from_smoothing(0.0) == _RAMP_HALF_MIN
+    assert _ramp_from_smoothing(1.0) == _RAMP_HALF_MAX
+    assert _ramp_from_smoothing(0.5) < _ramp_from_smoothing(1.0)
+    assert _RAMP_HALF_MAX < 0.5  # both ramps + plateau must fit the segment
+
+
+def test_thickness_clamp() -> None:
+    assert _clamp_thickness(0.0) == _THICKNESS_MIN
+    assert _clamp_thickness(999.0) == _THICKNESS_MAX
+    assert _clamp_thickness(2.0) == 2.0

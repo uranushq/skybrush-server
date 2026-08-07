@@ -84,50 +84,66 @@ DEFAULT_VELOCITY_SMOOTHING = 1.0
 # near-collinear pass-through and cruise speed is preserved.
 CORNER_ANGLE_THRESHOLD_DEG = 5.0
 
-# ── exp-in / log-out velocity profile ────────────────────────────────────
-# Eased segments follow an *asymmetric* speed curve: the drone accelerates out
-# of a knot along an EXPONENTIAL ease-in (gentle initial jerk that builds up)
-# and decelerates into the next along a LOGARITHMIC ease-out (quick at first,
-# gentle final approach). A single "thickness" parameter k > 0 controls where
-# the acceleration is concentrated:
+# ── exp-in / plateau / log-out velocity profile ──────────────────────────
+# Eased segments follow a *trapezoid* speed curve: the drone accelerates out
+# of a knot along an EXPONENTIAL ease-in ramp, holds a CONSTANT plateau
+# speed, then decelerates into the next knot along a LOGARITHMIC ease-out
+# ramp. There is no pointy apex — the middle of every eased segment cruises
+# at a constant speed vc:
 #
-#     v(τ) = v0·(1−τ) + v1·τ + C·B(τ; k),          τ = t / dt ∈ [0, 1]
+#     v(τ) = v0 + (vc − v0)·E(τ/a; k_e)        τ ∈ [0, a]      (exp ramp)
+#          = vc                                 τ ∈ [a, 1−b]    (plateau)
+#          = v1 + (vc − v1)·L((1−τ)/b; k_l)    τ ∈ [1−b, 1]    (log ramp)
 #
-#     B(τ; k) = E(2τ; k)         for τ ≤ ½   (exponential rise)
-#             = L(2(1−τ); k)     for τ ≥ ½   (logarithmic fall)
 #     E(u; k) = (e^{k·u} − 1)/(e^{k} − 1)          # convex ease-in, 0→1
 #     L(u; k) = ln(1 + (e^{k} − 1)·u)/k            # concave ease-out, 0→1
 #
-# E and L are inverse functions, so the bump area ∫₀¹ B dτ = ½ *for every k*.
-# That makes the bump coefficient  C = 2·v_avg − (v0 + v1)  (v_avg = length/dt)
-# independent of k and pins arc(1) == length exactly — knot times never move,
-# which is what bounds the schedule deviation the planning margin absorbs.
-# The rest-to-rest peak sits at τ = ½ where B = 1, so v_peak = C = 2·v_avg
-# regardless of k (see ``_EASE_PEAK_FACTOR``). The curve is rendered as
-# ``_LOG_SUBDIVISIONS`` cubic Bézier pieces whose knots sample the profile
-# with matching speeds (C¹ continuous).
-
-# Bézier pieces per eased segment when rendering the profile.
-_LOG_SUBDIVISIONS = 4
-
-# Thickness (k) is scaled linearly from the smoothing knob in [0, 1]. k → 0
-# degenerates to a linear (triangular) speed ramp; larger k concentrates the
-# acceleration nearer the segment centre (sharper exp-in / log-out curvature).
+# ``a`` / ``b`` are the ramp fractions (set by the smoothing knob) and
+# ``k_e`` / ``k_l`` are independent curvature ("thickness") knobs for the
+# acceleration and deceleration ramps. The plateau speed vc is solved in
+# closed form so the segment still covers exactly its length in its
+# duration — knot times never move, which is what bounds the schedule
+# deviation the planning margin absorbs:
 #
-# The upper bound caps how far an eased segment can lag its constant-speed
-# schedule: the exponential ease-in makes an accelerating segment lag by
-# ~18% (k→0) up to ~23% (k=2) of the segment length. Even the worst-case
-# mutual approach of two oppositely-deviating drones (2 × 0.23 × step) stays
-# far inside HARD_MIN_SEPARATION (1.45 m) for the default 1 m step, and the
-# ``verify`` gate re-checks the real trajectories regardless — so this is a
-# quality/headroom bound, not the safety guarantee itself.
-_MAX_THICKNESS = 2.0
-_MIN_THICKNESS = 1e-3
+#     vc = (v_avg − a·v0·(1−Iₑ) − b·v1·(1−Iₗ)) / (a·Iₑ + (1−a−b) + b·Iₗ)
+#
+# where Iₑ = ∫₀¹E, Iₗ = ∫₀¹L (closed forms below; Iₑ(k) + Iₗ(k) = 1 for
+# equal k since E and L are inverses). Because knot speeds never exceed the
+# segment cruise speed, vc ≥ v_avg and the rest-to-rest "peak" is the
+# plateau itself: vc = v_avg / (1 − a·(1−Iₑ) − b·(1−Iₗ)) — e.g. ≈ 1.67× at
+# full smoothing with k_e = k_l (vs 2.0× for the old pointy profile). The
+# curve renders as C¹ cubic Bézier pieces whose knots sit exactly on the
+# ramp boundaries, so the plateau is a genuinely linear constant-speed run.
+
+# Ramp fraction of the segment per side, scaled by the smoothing knob:
+# smoothing 0 → no easing at all (handled upstream), >0 → each ramp takes
+# between _RAMP_HALF_MIN and _RAMP_HALF_MAX of the segment. The worst-case
+# schedule lag (end of the accel ramp, full smoothing, k = 2) is
+# a·(v_avg − vc·Iₑ) ≈ 17% of one solver step — inside the planning margin,
+# and the ``verify`` gate re-checks the real trajectories regardless.
+_RAMP_HALF_MIN = 0.10
+_RAMP_HALF_MAX = 0.40
+
+# Curvature (thickness) bounds for the exp/log ramps, user-adjustable per
+# ramp. k → 0 degenerates to a linear ramp; larger k concentrates the
+# acceleration nearer the plateau (sharper curvature).
+_THICKNESS_MIN = 0.05
+_THICKNESS_MAX = 4.0
+
+# Default ramp curvatures (match the old profile's k at full smoothing).
+DEFAULT_PROFILE_EXP = 2.0
+DEFAULT_PROFILE_LOG = 2.0
 
 
-def _thickness_from_smoothing(smoothing: float) -> float:
-    """Map the smoothing knob in [0, 1] to the profile thickness ``k > 0``."""
-    return max(_MIN_THICKNESS, min(1.0, max(0.0, smoothing)) * _MAX_THICKNESS)
+def _ramp_from_smoothing(smoothing: float) -> float:
+    """Map the smoothing knob in (0, 1] to the per-side ramp fraction."""
+    s = min(1.0, max(0.0, smoothing))
+    return _RAMP_HALF_MIN + s * (_RAMP_HALF_MAX - _RAMP_HALF_MIN)
+
+
+def _clamp_thickness(k: float) -> float:
+    """Clamp a ramp curvature knob into the supported range."""
+    return max(_THICKNESS_MIN, min(_THICKNESS_MAX, k))
 
 
 def _ease_in_exp(u: float, k: float) -> float:
@@ -140,75 +156,109 @@ def _ease_out_log(u: float, k: float) -> float:
     return math.log1p(math.expm1(k) * u) / k
 
 
-def _bump(tau: float, k: float) -> float:
-    """Asymmetric speed bump: exp rise on [0, ½], log fall on [½, 1].
-
-    Zero at both ends, peak 1 at τ = ½; E and L are inverses so ∫₀¹ B dτ = ½.
-    """
-    if tau <= 0.5:
-        return _ease_in_exp(2.0 * tau, k)
-    return _ease_out_log(2.0 * (1.0 - tau), k)
+def _ease_in_exp_integral(x: float, k: float) -> float:
+    """``∫₀^x E(u; k) du`` in closed form."""
+    return (math.expm1(k * x) / k - x) / math.expm1(k)
 
 
-def _simpson(fn, lo: float, hi: float, intervals: int) -> float:
-    """Composite Simpson quadrature (deterministic, no dependencies)."""
-    h = (hi - lo) / intervals
-    total = fn(lo) + fn(hi)
-    for i in range(1, intervals):
-        total += fn(lo + i * h) * (4.0 if i % 2 else 2.0)
-    return total * h / 3.0
+def _ease_out_log_integral(x: float, k: float) -> float:
+    """``∫₀^x L(u; k) du`` in closed form."""
+    c = math.expm1(k)
+    cx = c * x
+    return ((1.0 + cx) * math.log1p(cx) / c - x) / k
 
 
-def _bump_integral(tau: float, k: float) -> float:
-    """``∫₀^τ B(u; k) du`` (deterministic Simpson quadrature).
-
-    Integrated over the two smooth halves separately so the kink at τ = ½ never
-    falls inside a Simpson panel (which would lose accuracy).
-    """
-    if tau <= 0.0:
-        return 0.0
-    if tau <= 0.5:
-        return _simpson(lambda u: _bump(u, k), 0.0, tau, 64)
-    first = _simpson(lambda u: _bump(u, k), 0.0, 0.5, 64)
-    return first + _simpson(lambda u: _bump(u, k), 0.5, tau, 64)
+def _plateau_speed(
+    v0: float, v1: float, avg: float, ramp: float, k_exp: float, k_log: float
+) -> float:
+    """Closed-form plateau speed vc making the profile cover ``avg`` exactly."""
+    a = b = ramp
+    ie = _ease_in_exp_integral(1.0, k_exp)
+    il = _ease_out_log_integral(1.0, k_log)
+    denom = a * ie + (1.0 - a - b) + b * il
+    return (avg - a * v0 * (1.0 - ie) - b * v1 * (1.0 - il)) / denom
 
 
-def _log_profile(v0: float, v1: float, length: float, dt: float, k: float):
-    """Speed and arc-length functions of one eased segment.
+def _log_profile(
+    v0: float,
+    v1: float,
+    length: float,
+    dt: float,
+    k_exp: float,
+    k_log: float,
+    ramp: float,
+):
+    """Speed and arc-length functions of one eased (trapezoid) segment.
 
     Returns ``(speed, arc)`` callables over normalized time ``τ ∈ [0, 1]``;
-    ``arc(1) == length`` exactly (the bump area is ½ for every k), so knot
-    times are preserved.
+    ``arc(1) == length`` exactly (vc is solved for it in closed form), so
+    knot times are preserved.
     """
     avg = length / dt
-    c = 2.0 * avg - (v0 + v1)
+    a = b = ramp
+    vc = _plateau_speed(v0, v1, avg, ramp, k_exp, k_log)
+    ie = _ease_in_exp_integral(1.0, k_exp)
+    il = _ease_out_log_integral(1.0, k_log)
+    area_a = a * (v0 + (vc - v0) * ie)  # distance fraction of the accel ramp
 
     def speed(tau: float) -> float:
-        return v0 * (1.0 - tau) + v1 * tau + c * _bump(tau, k)
+        if tau <= 0.0:
+            return v0
+        if tau < a:
+            return v0 + (vc - v0) * _ease_in_exp(tau / a, k_exp)
+        if tau <= 1.0 - b:
+            return vc
+        if tau < 1.0:
+            return v1 + (vc - v1) * _ease_out_log((1.0 - tau) / b, k_log)
+        return v1
 
     def arc(tau: float) -> float:
-        return (
-            v0 * (tau - 0.5 * tau * tau)
-            + v1 * (0.5 * tau * tau)
-            + c * _bump_integral(tau, k)
-        ) * dt
+        if tau <= 0.0:
+            return 0.0
+        if tau >= 1.0:
+            return length
+        if tau < a:
+            s = v0 * tau + (vc - v0) * a * _ease_in_exp_integral(tau / a, k_exp)
+        elif tau <= 1.0 - b:
+            s = area_a + vc * (tau - a)
+        else:
+            s = (
+                area_a
+                + vc * (1.0 - a - b)
+                + v1 * (tau - (1.0 - b))
+                + (vc - v1)
+                * b
+                * (il - _ease_out_log_integral((1.0 - tau) / b, k_log))
+            )
+        return s * dt
 
     return speed, arc
 
 
 def _log_profile_peak(
-    v0: float, v1: float, length: float, dt: float, k: float, samples: int = 32
+    v0: float,
+    v1: float,
+    length: float,
+    dt: float,
+    k_exp: float,
+    k_log: float,
+    ramp: float,
 ) -> float:
-    """Peak speed of the profile (dense deterministic sampling)."""
-    speed, _ = _log_profile(v0, v1, length, dt, k)
-    return max(speed(i / samples) for i in range(samples + 1))
+    """Peak speed of the profile (the ramps are monotone → closed form)."""
+    vc = _plateau_speed(v0, v1, length / dt, ramp, k_exp, k_log)
+    return max(abs(v0), abs(v1), abs(vc))
 
 
-# Peak/average speed ratio of a rest-to-rest eased segment. The bump peaks at
-# τ = ½ where B = 1, so v_peak = C = 2·v_avg — independent of the thickness k.
-# Used to size takeoff/landing durations so their *peak* vertical speed matches
-# the configured speed.
-_EASE_PEAK_FACTOR = 2.0
+def _ease_peak_factor(smoothing: float, k_exp: float, k_log: float) -> float:
+    """Peak/average speed ratio of a rest-to-rest eased segment.
+
+    The rest-to-rest peak is the plateau speed, 1 / (1 − a·(1−Iₑ) − b·(1−Iₗ)).
+    Used to size takeoff/landing durations so their *peak* vertical speed
+    matches the configured speed.
+    """
+    if smoothing <= 0.0:
+        return 1.0
+    return _plateau_speed(0.0, 0.0, 1.0, _ramp_from_smoothing(smoothing), k_exp, k_log)
 
 
 class TrajectoryLimitError(ValueError):
@@ -234,30 +284,38 @@ def duration_ms_for_cruise_speed(step_size: float, cruise_speed_m_s: float) -> i
 
 
 def _vertical_segment_duration(
-    altitude_delta: float, speed: float, smoothing: float
+    altitude_delta: float,
+    speed: float,
+    smoothing: float,
+    k_exp: float = DEFAULT_PROFILE_EXP,
+    k_log: float = DEFAULT_PROFILE_LOG,
 ) -> float:
     """Duration of a vertical climb/descent so its *peak* speed equals *speed*.
 
     With easing enabled the segment starts and ends at rest, which makes the
-    peak speed ``_EASE_PEAK_FACTOR`` × the average (2.0 for the exp-in/log-out
-    profile) — so the segment must take that much longer for the same peak.
-    Without easing the motion is constant-speed.
+    peak (= plateau) speed ``_ease_peak_factor(...)`` × the average — so the
+    segment must take that much longer for the same peak. Without easing the
+    motion is constant-speed.
     """
     if altitude_delta <= 0:
         return 0.0
-    factor = _EASE_PEAK_FACTOR if smoothing > 0 else 1.0
+    factor = _ease_peak_factor(smoothing, k_exp, k_log)
     return round(factor * altitude_delta / speed, 4)
 
 
 def vertical_transit_duration_sec(
-    altitude_delta: float, speed: float, smoothing: float
+    altitude_delta: float,
+    speed: float,
+    smoothing: float,
+    k_exp: float = DEFAULT_PROFILE_EXP,
+    k_log: float = DEFAULT_PROFILE_LOG,
 ) -> float:
     """Public alias of :func:`_vertical_segment_duration`.
 
     Used by the extension to report the actual takeoff duration (and hence
     the absolute show-timeline offset of every solver step) to API clients.
     """
-    return _vertical_segment_duration(altitude_delta, speed, smoothing)
+    return _vertical_segment_duration(altitude_delta, speed, smoothing, k_exp, k_log)
 
 
 def _takeoff_landing_profile(
@@ -268,6 +326,8 @@ def _takeoff_landing_profile(
     takeoff_speed: float,
     landing_speed: float,
     smoothing: float,
+    k_exp: float = DEFAULT_PROFILE_EXP,
+    k_log: float = DEFAULT_PROFILE_LOG,
 ) -> tuple[float, float, float, float]:
     """Shared takeoff/landing math for the trajectory and yaw builders.
 
@@ -277,9 +337,9 @@ def _takeoff_landing_profile(
     landing_alt = max(0.0, last_pos[2] - ground_end_z)
     return (
         takeoff_alt,
-        _vertical_segment_duration(takeoff_alt, takeoff_speed, smoothing),
+        _vertical_segment_duration(takeoff_alt, takeoff_speed, smoothing, k_exp, k_log),
         landing_alt,
-        _vertical_segment_duration(landing_alt, landing_speed, smoothing),
+        _vertical_segment_duration(landing_alt, landing_speed, smoothing, k_exp, k_log),
     )
 
 
@@ -291,6 +351,8 @@ def solver_result_to_trajectory_dicts(
     landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
     velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
     ground_positions: Optional[Sequence[Sequence[float]]] = None,
+    profile_exp: float = DEFAULT_PROFILE_EXP,
+    profile_log: float = DEFAULT_PROFILE_LOG,
 ) -> List[dict]:
     """Convert a *SolverResult* into a list of Skybrush trajectory dicts.
 
@@ -373,6 +435,8 @@ def solver_result_to_trajectory_dicts(
                 takeoff_speed,
                 landing_speed,
                 velocity_smoothing,
+                profile_exp,
+                profile_log,
             )
         )
 
@@ -410,7 +474,11 @@ def solver_result_to_trajectory_dicts(
         }
         optimised = _collapse_stationary(points)
         smoothed = apply_velocity_smoothing(
-            optimised, velocity_smoothing, constant_times=constant_times
+            optimised,
+            velocity_smoothing,
+            constant_times=constant_times,
+            profile_exp=profile_exp,
+            profile_log=profile_log,
         )
 
         trajectories.append(
@@ -534,6 +602,8 @@ def build_yaw_control_dict(
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
     velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING,
     ground_positions: Optional[Sequence[Sequence[float]]] = None,
+    profile_exp: float = DEFAULT_PROFILE_EXP,
+    profile_log: float = DEFAULT_PROFILE_LOG,
 ) -> dict[str, Any] | None:
     """Build a Skybrush ``yawControl`` block for one drone.
 
@@ -569,6 +639,8 @@ def build_yaw_control_dict(
         takeoff_speed,
         landing_speed,
         velocity_smoothing,
+        profile_exp,
+        profile_log,
     )
 
     setpoints: list[list[float]] = []
@@ -725,6 +797,8 @@ def build_show_dicts(
     landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
     ground_positions: Optional[Sequence[Sequence[float]]] = None,
     geofence: Optional[dict] = None,
+    profile_exp: float = DEFAULT_PROFILE_EXP,
+    profile_log: float = DEFAULT_PROFILE_LOG,
 ) -> List[dict]:
     """Build a list of full *show specification* dicts (one per drone).
 
@@ -753,6 +827,8 @@ def build_show_dicts(
         landing_speed=landing_speed,
         velocity_smoothing=velocity_smoothing,
         ground_positions=ground_positions,
+        profile_exp=profile_exp,
+        profile_log=profile_log,
     )
     shows: List[dict] = []
 
@@ -781,6 +857,8 @@ def build_show_dicts(
             max_yaw_rate_deg_s=max_yaw_rate_deg_s,
             velocity_smoothing=velocity_smoothing,
             ground_positions=ground_positions,
+            profile_exp=profile_exp,
+            profile_log=profile_log,
         )
         if yaw_control is not None:
             show_dict["yawControl"] = yaw_control
@@ -797,6 +875,8 @@ def _delivery_drone_to_trajectory_dict(
     *,
     takeoff_speed: float = DEFAULT_TAKEOFF_SPEED_M_S,
     landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
+    profile_exp: float = DEFAULT_PROFILE_EXP,
+    profile_log: float = DEFAULT_PROFILE_LOG,
 ) -> dict:
     """Convert one pre-built delivery drone (``{initial_position, path}``) into a
     Skybrush trajectory dict.
@@ -854,6 +934,8 @@ def _delivery_drone_to_trajectory_dict(
             takeoff_speed,
             landing_speed,
             velocity_smoothing,
+            profile_exp,
+            profile_log,
         )
     )
     if takeoff_alt > 0:
@@ -874,7 +956,11 @@ def _delivery_drone_to_trajectory_dict(
     # synchronized schedule to preserve; merging collinear runs is allowed
     # here and the verification gate checks the final result anyway.
     smoothed = apply_velocity_smoothing(
-        optimised, velocity_smoothing, merge_collinear=True
+        optimised,
+        velocity_smoothing,
+        merge_collinear=True,
+        profile_exp=profile_exp,
+        profile_log=profile_log,
     )
 
     return {"version": 1, "takeoffTime": takeoff_time, "points": smoothed}
@@ -890,6 +976,8 @@ def build_delivery_show_dicts(
     takeoff_speed: float = DEFAULT_TAKEOFF_SPEED_M_S,
     landing_speed: float = DEFAULT_LANDING_SPEED_M_S,
     geofence: Optional[dict] = None,
+    profile_exp: float = DEFAULT_PROFILE_EXP,
+    profile_log: float = DEFAULT_PROFILE_LOG,
 ) -> List[dict]:
     """Build per-drone show dicts from a pre-built delivery ``drones`` payload.
 
@@ -908,6 +996,8 @@ def build_delivery_show_dicts(
             velocity_smoothing,
             takeoff_speed=takeoff_speed,
             landing_speed=landing_speed,
+            profile_exp=profile_exp,
+            profile_log=profile_log,
         )
         init = drone.get("initial_position") or [0.0, 0.0, 0.0]
         ground_z = float(drone.get("ground_z", 0.0))
@@ -1076,6 +1166,8 @@ def apply_velocity_smoothing(
     max_velocity_xy: float = MAX_VELOCITY_XY,
     max_velocity_z: float = MAX_VELOCITY_Z,
     constant_times: Optional[set] = None,
+    profile_exp: float = DEFAULT_PROFILE_EXP,
+    profile_log: float = DEFAULT_PROFILE_LOG,
 ) -> List[list]:
     """Give the trajectory a smooth speed profile without changing its path.
 
@@ -1084,13 +1176,14 @@ def apply_velocity_smoothing(
     travelled at constant speed — the speed jumps from 0 to cruise instantly
     at every segment boundary, which is the "inertia" jerk the drone feels.
 
-    Each accelerating/decelerating segment is re-timed along an **exponential
-    ease-in / logarithmic ease-out speed profile** (see the ``_log_profile``
-    block) whose thickness is set by ``smoothing`` and rendered as
-    ``_LOG_SUBDIVISIONS`` cubic Bézier pieces whose control points lie *on
-    the straight line* between the segment endpoints, so the geometric path
-    is unchanged; only the speed along it changes. Segments cruising at
-    constant speed on both ends stay single linear segments.
+    Each accelerating/decelerating segment is re-timed along a **trapezoid
+    speed profile** — exponential ease-in ramp, constant plateau, logarithmic
+    ease-out ramp (see the ``_log_profile`` block). The ramp fraction is set
+    by ``smoothing`` and the two ramp curvatures by ``profile_exp`` /
+    ``profile_log``. The curve renders as cubic Bézier pieces whose control
+    points lie *on the straight line* between the segment endpoints, so the
+    geometric path is unchanged; only the speed along it changes. Segments
+    cruising at constant speed on both ends stay single linear segments.
 
     Per-waypoint target speed at the shared keyframe between two segments:
 
@@ -1119,7 +1212,9 @@ def apply_velocity_smoothing(
     if len(points) < 2:
         return points
     smoothing = min(1.0, max(0.0, smoothing))
-    thickness = _thickness_from_smoothing(smoothing)
+    k_exp = _clamp_thickness(profile_exp)
+    k_log = _clamp_thickness(profile_log)
+    ramp = _ramp_from_smoothing(smoothing)
 
     if merge_collinear and smoothing > 0.0:
         points = _merge_collinear_runs(points)
@@ -1221,7 +1316,8 @@ def apply_velocity_smoothing(
             if not needs_easing(k):
                 continue
             peak = _log_profile_peak(
-                speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k], thickness
+                speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k],
+                k_exp, k_log, ramp,
             )
             if peak <= seg_limit[k] * (1.0 + 1e-9):
                 continue
@@ -1249,14 +1345,18 @@ def apply_velocity_smoothing(
         if not needs_easing(k):
             continue
         peak = _log_profile_peak(
-            speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k], thickness
+            speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k],
+            k_exp, k_log, ramp,
         )
         if peak > seg_limit[k] * (1.0 + 1e-6):
             return points
 
-    # Render: eased segments become _LOG_SUBDIVISIONS C¹-continuous cubic
-    # Bézier pieces sampling the log profile; everything else stays a single
-    # linear segment. Knot times of the original keyframes never move.
+    # Render: eased segments become C¹-continuous cubic Bézier pieces whose
+    # knots sit exactly on the ramp boundaries — one ramp is two pieces, the
+    # plateau is a single constant-speed (effectively linear) piece — so the
+    # trapezoid's flat middle is preserved exactly. Everything else stays a
+    # single linear segment. Knot times of the original keyframes never move.
+    sub_taus = [ramp * 0.5, ramp, 1.0 - ramp, 1.0 - ramp * 0.5, 1.0]
     out: List[list] = [list(points[0])]
     for k in range(1, n):
         end_time = points[k][0]
@@ -1269,14 +1369,14 @@ def apply_velocity_smoothing(
         a = points[k - 1][1]
         t0 = points[k - 1][0]
         speed, arc = _log_profile(
-            speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k], thickness
+            speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k],
+            k_exp, k_log, ramp,
         )
         prev_tau = 0.0
         prev_arc = 0.0
         prev_speed = speed_at[k - 1]
-        for i in range(1, _LOG_SUBDIVISIONS + 1):
-            tau = i / _LOG_SUBDIVISIONS
-            last = i == _LOG_SUBDIVISIONS
+        for i, tau in enumerate(sub_taus):
+            last = i == len(sub_taus) - 1
             s = seg_len[k] if last else min(seg_len[k], max(prev_arc, arc(tau)))
             v = speed_at[k] if last else max(0.0, speed(tau))
             sub_len = s - prev_arc

@@ -82,9 +82,13 @@ from .converter import (
     DEFAULT_CRUISE_SPEED_M_S,
     DEFAULT_LANDING_SPEED_M_S,
     DEFAULT_MAX_YAW_RATE_DEG_S,
+    DEFAULT_PROFILE_EXP,
+    DEFAULT_PROFILE_LOG,
     DEFAULT_TAKEOFF_SPEED_M_S,
     DEFAULT_VELOCITY_SMOOTHING,
     TrajectoryLimitError,
+    _THICKNESS_MAX,
+    _THICKNESS_MIN,
     build_delivery_show_dicts,
     build_show_dicts,
     duration_ms_for_cruise_speed,
@@ -139,6 +143,39 @@ log: Optional[Logger] = None
 # path. Set from the extension configuration in `run()` so it can be adjusted
 # from the server config UI; used as the default in `plan()`.
 velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING
+
+
+def _parse_profile_knobs(body: dict):
+    """Parse the optional exp/log ramp-curvature knobs of the velocity profile.
+
+    Returns ``(profile_exp, profile_log, error_response)`` where the error
+    response is ``None`` on success.
+    """
+    try:
+        k_exp = float(body.get("profile_exp", DEFAULT_PROFILE_EXP))
+        k_log = float(body.get("profile_log", DEFAULT_PROFILE_LOG))
+    except (TypeError, ValueError):
+        return (
+            None,
+            None,
+            (jsonify({"error": "'profile_exp'/'profile_log' must be numbers"}), 400),
+        )
+    for name, value in (("profile_exp", k_exp), ("profile_log", k_log)):
+        if not (_THICKNESS_MIN <= value <= _THICKNESS_MAX):
+            return (
+                None,
+                None,
+                (
+                    jsonify(
+                        {
+                            "error": f"'{name}' must be between "
+                            f"{_THICKNESS_MIN} and {_THICKNESS_MAX}"
+                        }
+                    ),
+                    400,
+                ),
+            )
+    return k_exp, k_log, None
 
 # Base directory for generated files; requests may only choose subdirectories
 # of this. Empty string means "parent of the server's working directory".
@@ -1733,6 +1770,9 @@ async def _handle_path_delivery(body: dict):
     smoothing = float(body.get("velocity_smoothing", velocity_smoothing))
     if not (0.0 <= smoothing <= 1.0):
         return jsonify({"error": "'velocity_smoothing' must be between 0 and 1"}), 400
+    profile_exp, profile_log, profile_err = _parse_profile_knobs(body)
+    if profile_err is not None:
+        return profile_err
     # Delivery paths honour the same separation floor as generated plans;
     # requests may raise it, never lower it (silently clamped up here since
     # the delivery UI has no separation field yet).
@@ -1825,6 +1865,8 @@ async def _handle_path_delivery(body: dict):
             takeoff_speed=takeoff_speed,
             landing_speed=landing_speed,
             geofence=body.get("geofence"),
+            profile_exp=profile_exp,
+            profile_log=profile_log,
         )
 
     try:
@@ -1843,7 +1885,12 @@ async def _handle_path_delivery(body: dict):
         "num_drones": len(show_dicts),
         "validation": validation_payload,
         "verification": {"checked": True, "violations": 0},
-        "smoothing": {"requested": smoothing, "applied": applied_smoothing},
+        "smoothing": {
+            "requested": smoothing,
+            "applied": applied_smoothing,
+            "profile_exp": profile_exp,
+            "profile_log": profile_log,
+        },
     }
     if takeoff_time_adjusted:
         output["adjustments"] = {"takeoff_time": takeoff_time}
@@ -2014,6 +2061,9 @@ async def plan():
         return jsonify({"error": "'max_yaw_rate_deg_s' must be > 0"}), 400
     if not (0.0 <= smoothing <= 1.0):
         return jsonify({"error": "'velocity_smoothing' must be between 0 and 1"}), 400
+    profile_exp, profile_log, profile_err = _parse_profile_knobs(body)
+    if profile_err is not None:
+        return profile_err
 
     # Minimum inter-drone separation (per-axis / Chebyshev). Adjustable per
     # request but NEVER below the hard floor — requests trying to lower it
@@ -2314,6 +2364,8 @@ async def plan():
             landing_speed=landing_speed,
             ground_positions=ground_positions,
             geofence=body.get("geofence"),
+            profile_exp=profile_exp,
+            profile_log=profile_log,
         )
 
     _progress_update(segment="build+verify", percent=None, step=None)
@@ -2354,7 +2406,12 @@ async def plan():
         "hard_min_separation": HARD_MIN_SEPARATION,
         "semantics": "per-axis (Chebyshev)",
     }
-    output["smoothing"] = {"requested": smoothing, "applied": applied_smoothing}
+    output["smoothing"] = {
+        "requested": smoothing,
+        "applied": applied_smoothing,
+        "profile_exp": profile_exp,
+        "profile_log": profile_log,
+    }
     output["timing"] = {
         "duration_ms": duration_ms,
         "cruise_speed": cruise_speed,
@@ -2372,7 +2429,8 @@ async def plan():
         # the offset is fleet-wide. Lets clients (e.g. the LED timeline)
         # place phase markers without re-deriving the takeoff profile.
         takeoff_duration_sec = vertical_transit_duration_sec(
-            staging_altitude, takeoff_speed, applied_smoothing
+            staging_altitude, takeoff_speed, applied_smoothing,
+            profile_exp, profile_log,
         )
         show_offset_sec = round(takeoff_time + takeoff_duration_sec, 4)
         for summary in phase_summaries:
