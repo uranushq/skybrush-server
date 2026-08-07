@@ -30,7 +30,6 @@ from quart import Blueprint, jsonify, request
 from trio import CancelScope, Event, Lock, open_nursery, sleep, sleep_forever
 
 from flockwave.server.registries.errors import RegistryFull
-from flockwave.server.utils import overridden
 
 from ..base import UAVExtension
 from .driver import VirtualUAV, VirtualUAVDriver
@@ -44,16 +43,32 @@ __all__ = ("construct", "dependencies", "description", "enhancers")
 
 blueprint = Blueprint("virtual_uavs", __name__)
 
-# Module-level globals injected at runtime via `overridden(globals(), ...)`.
+# Bound for the lifetime of the loaded extension (set in configure/teardown).
+# Do not rely on run()-scoped `overridden()` alone: Quart blueprints cannot be
+# unmounted, and HTTP requests may arrive before run() starts.
 ext: Optional["VirtualUAVProviderExtension"] = None
 app: Optional["SkybrushServer"] = None
 log: Optional[Logger] = None
 
 
 def _require_ext() -> "VirtualUAVProviderExtension":
-    if ext is None:
-        raise RuntimeError("Virtual UAV extension is not running")
-    return ext
+    if ext is not None:
+        return ext
+
+    # Fallback when module globals were cleared but the extension is still loaded
+    # (e.g. blueprint left registered after run() exited).
+    try:
+        from flockwave.server.ext.http_server.extension import ext_manager
+
+        if ext_manager is not None and ext_manager.is_loaded("virtual_uavs"):
+            return ext_manager._get_loaded_extension_by_name("virtual_uavs")
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Virtual UAV extension is not running. "
+        "Set EXTENSIONS.virtual_uavs.enabled to true and restart the server."
+    )
 
 
 @blueprint.route("/", methods=["GET"])
@@ -167,6 +182,8 @@ class VirtualUAVProviderExtension(UAVExtension[VirtualUAVDriver]):
         return VirtualUAVDriver()
 
     def configure(self, configuration):
+        global ext, app, log
+
         super().configure(configuration)
 
         assert self.app is not None
@@ -187,6 +204,20 @@ class VirtualUAVProviderExtension(UAVExtension[VirtualUAVDriver]):
             self._rebuild_uavs()
         else:
             self.uavs = []
+
+        # Expose this instance to REST handlers as soon as the extension loads.
+        ext = self
+        app = self.app
+        log = self.log
+
+    def teardown(self) -> None:
+        global ext, app, log
+
+        if ext is self:
+            ext = None
+            app = None
+            log = None
+        super().teardown()
 
     def configure_driver(self, driver: VirtualUAVDriver, configuration):
         # Set whether the virtual drones should be armed after boot
@@ -370,16 +401,21 @@ class VirtualUAVProviderExtension(UAVExtension[VirtualUAVDriver]):
                     await sleep(0.2)
 
     async def run(self):
+        global ext, app, log
+
         assert self.app is not None
+
+        # Keep REST handlers bound even if a previous run() context exited
+        # while the Quart blueprint remained registered.
+        ext = self
+        app = self.app
+        log = self.log
 
         route = self._configuration.get("route", "/api/v1/virtual-uavs")
         http_server = self.app.import_api("http_server")
         signals = self.app.import_api("signals")
 
         with ExitStack() as stack:
-            stack.enter_context(
-                overridden(globals(), ext=self, app=self.app, log=self.log)
-            )
             stack.enter_context(http_server.mounted(blueprint, path=route))
             stack.enter_context(
                 signals.use({"show:lights_updated": self._on_lights_updated})
