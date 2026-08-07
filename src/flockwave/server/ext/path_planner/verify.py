@@ -27,8 +27,11 @@ __all__ = ("verify_trajectories", "verify_show_dicts", "sample_trajectory_positi
 _MAX_SAMPLE_DT = 0.5
 _MIN_SAMPLE_DT = 0.02
 
-# Peak speed of a fully eased segment is 1.5× its average speed.
-_EASE_PEAK_FACTOR = 1.5
+# Peak speed of a fully eased (rest-to-rest) segment relative to its average
+# speed. The exp-in/log-out profile peaks at 2× the average (see
+# ``converter._EASE_PEAK_FACTOR``); the sampling interval must assume this
+# larger peak so a fast pass-through can never slip between two samples.
+_EASE_PEAK_FACTOR = 2.0
 
 
 def _bezier_point(

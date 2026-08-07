@@ -18,9 +18,11 @@ to the timing must keep each drone within a bounded distance of that nominal
 schedule:
 
 - Velocity smoothing eases the speed **per segment only** for solver output
-  (no collinear-run merging) along a natural-log profile, which bounds the
-  schedule deviation to at most ~15% of a single solver step — well below
-  the planning margin.
+  (no collinear-run merging) along an exponential-in / logarithmic-out
+  profile, which bounds the schedule deviation to at most ~23% of a single
+  solver step at the maximum thickness — its worst-case mutual approach stays
+  far inside the minimum separation, and the ``verify`` gate is the real
+  backstop.
 - Peak speeds of eased segments are computed in closed form and clamped to
   ``MAX_VELOCITY_XY`` / ``MAX_VELOCITY_Z``; if a trajectory cannot be eased
   within the limits it falls back to constant-speed motion, and if even the
@@ -82,39 +84,70 @@ DEFAULT_VELOCITY_SMOOTHING = 1.0
 # near-collinear pass-through and cruise speed is preserved.
 CORNER_ANGLE_THRESHOLD_DEG = 5.0
 
-# ── natural-log velocity profile ─────────────────────────────────────────
-# Eased segments follow a *natural-logarithm* speed curve:
+# ── exp-in / log-out velocity profile ────────────────────────────────────
+# Eased segments follow an *asymmetric* speed curve: the drone accelerates out
+# of a knot along an EXPONENTIAL ease-in (gentle initial jerk that builds up)
+# and decelerates into the next along a LOGARITHMIC ease-out (quick at first,
+# gentle final approach). A single "thickness" parameter k > 0 controls where
+# the acceleration is concentrated:
 #
-#     v(τ) = v0·w(1−τ) + v1·w(τ) + C·w(τ)·w(1−τ),   τ = t / dt ∈ [0, 1]
+#     v(τ) = v0·(1−τ) + v1·τ + C·B(τ; k),          τ = t / dt ∈ [0, 1]
 #
-# where w(τ) = ln(1 + (e−1)·τ) rises 0 → 1 along a natural-log arc (fast
-# pick-up, gentle approach), the first two terms pin the entry/exit speeds
-# and the symmetric log "bump" coefficient C is fixed in closed form so the
-# drone still covers exactly the segment length in the segment duration —
-# knot times never move, which is what bounds the schedule deviation the
-# planning margin has to absorb (≤ ~15% of one segment, see the test suite).
-# The curve is rendered as ``_LOG_SUBDIVISIONS`` cubic Bézier pieces whose
-# knots sample the profile with matching speeds (C¹ continuous).
-_LOG_BETA = math.e - 1.0
+#     B(τ; k) = E(2τ; k)         for τ ≤ ½   (exponential rise)
+#             = L(2(1−τ); k)     for τ ≥ ½   (logarithmic fall)
+#     E(u; k) = (e^{k·u} − 1)/(e^{k} − 1)          # convex ease-in, 0→1
+#     L(u; k) = ln(1 + (e^{k} − 1)·u)/k            # concave ease-out, 0→1
+#
+# E and L are inverse functions, so the bump area ∫₀¹ B dτ = ½ *for every k*.
+# That makes the bump coefficient  C = 2·v_avg − (v0 + v1)  (v_avg = length/dt)
+# independent of k and pins arc(1) == length exactly — knot times never move,
+# which is what bounds the schedule deviation the planning margin absorbs.
+# The rest-to-rest peak sits at τ = ½ where B = 1, so v_peak = C = 2·v_avg
+# regardless of k (see ``_EASE_PEAK_FACTOR``). The curve is rendered as
+# ``_LOG_SUBDIVISIONS`` cubic Bézier pieces whose knots sample the profile
+# with matching speeds (C¹ continuous).
 
-# Bézier pieces per eased segment when rendering the log profile.
+# Bézier pieces per eased segment when rendering the profile.
 _LOG_SUBDIVISIONS = 4
 
+# Thickness (k) is scaled linearly from the smoothing knob in [0, 1]. k → 0
+# degenerates to a linear (triangular) speed ramp; larger k concentrates the
+# acceleration nearer the segment centre (sharper exp-in / log-out curvature).
+#
+# The upper bound caps how far an eased segment can lag its constant-speed
+# schedule: the exponential ease-in makes an accelerating segment lag by
+# ~18% (k→0) up to ~23% (k=2) of the segment length. Even the worst-case
+# mutual approach of two oppositely-deviating drones (2 × 0.23 × step) stays
+# far inside HARD_MIN_SEPARATION (1.45 m) for the default 1 m step, and the
+# ``verify`` gate re-checks the real trajectories regardless — so this is a
+# quality/headroom bound, not the safety guarantee itself.
+_MAX_THICKNESS = 2.0
+_MIN_THICKNESS = 1e-3
 
-def _log_w(tau: float) -> float:
-    """Log ease basis: 0 → 1 with natural-log curvature (ln(1+β) == 1)."""
-    return math.log1p(_LOG_BETA * tau)
+
+def _thickness_from_smoothing(smoothing: float) -> float:
+    """Map the smoothing knob in [0, 1] to the profile thickness ``k > 0``."""
+    return max(_MIN_THICKNESS, min(1.0, max(0.0, smoothing)) * _MAX_THICKNESS)
 
 
-def _log_w_integral(tau: float) -> float:
-    """Closed form of ``∫₀^τ w(u) du``."""
-    x = 1.0 + _LOG_BETA * tau
-    return (x * math.log(x) - _LOG_BETA * tau) / _LOG_BETA
+def _ease_in_exp(u: float, k: float) -> float:
+    """Exponential ease-in basis: 0 → 1, convex (gentle start)."""
+    return math.expm1(k * u) / math.expm1(k)
 
 
-def _log_bump(tau: float) -> float:
-    """Symmetric log bump ``w(τ)·w(1−τ)`` — zero at both ends."""
-    return _log_w(tau) * _log_w(1.0 - tau)
+def _ease_out_log(u: float, k: float) -> float:
+    """Logarithmic ease-out basis: 0 → 1, concave (gentle finish)."""
+    return math.log1p(math.expm1(k) * u) / k
+
+
+def _bump(tau: float, k: float) -> float:
+    """Asymmetric speed bump: exp rise on [0, ½], log fall on [½, 1].
+
+    Zero at both ends, peak 1 at τ = ½; E and L are inverses so ∫₀¹ B dτ = ½.
+    """
+    if tau <= 0.5:
+        return _ease_in_exp(2.0 * tau, k)
+    return _ease_out_log(2.0 * (1.0 - tau), k)
 
 
 def _simpson(fn, lo: float, hi: float, intervals: int) -> float:
@@ -126,51 +159,56 @@ def _simpson(fn, lo: float, hi: float, intervals: int) -> float:
     return total * h / 3.0
 
 
-_LOG_W_AREA = _log_w_integral(1.0)  # = 1/(e−1)
-_LOG_BUMP_AREA = _simpson(_log_bump, 0.0, 1.0, 512)
+def _bump_integral(tau: float, k: float) -> float:
+    """``∫₀^τ B(u; k) du`` (deterministic Simpson quadrature).
 
-
-def _log_bump_integral(tau: float) -> float:
-    """``∫₀^τ w(u)·w(1−u) du`` (numeric; the integrand has no closed form)."""
+    Integrated over the two smooth halves separately so the kink at τ = ½ never
+    falls inside a Simpson panel (which would lose accuracy).
+    """
     if tau <= 0.0:
         return 0.0
-    return _simpson(_log_bump, 0.0, tau, 128)
+    if tau <= 0.5:
+        return _simpson(lambda u: _bump(u, k), 0.0, tau, 64)
+    first = _simpson(lambda u: _bump(u, k), 0.0, 0.5, 64)
+    return first + _simpson(lambda u: _bump(u, k), 0.5, tau, 64)
 
 
-def _log_profile(v0: float, v1: float, length: float, dt: float):
-    """Speed and arc-length functions of one log-eased segment.
+def _log_profile(v0: float, v1: float, length: float, dt: float, k: float):
+    """Speed and arc-length functions of one eased segment.
 
     Returns ``(speed, arc)`` callables over normalized time ``τ ∈ [0, 1]``;
-    ``arc(1) == length`` exactly, so knot times are preserved.
+    ``arc(1) == length`` exactly (the bump area is ½ for every k), so knot
+    times are preserved.
     """
     avg = length / dt
-    c = (avg - (v0 + v1) * _LOG_W_AREA) / _LOG_BUMP_AREA
+    c = 2.0 * avg - (v0 + v1)
 
     def speed(tau: float) -> float:
-        return v0 * _log_w(1.0 - tau) + v1 * _log_w(tau) + c * _log_bump(tau)
+        return v0 * (1.0 - tau) + v1 * tau + c * _bump(tau, k)
 
     def arc(tau: float) -> float:
         return (
-            v0 * (_LOG_W_AREA - _log_w_integral(1.0 - tau))
-            + v1 * _log_w_integral(tau)
-            + c * _log_bump_integral(tau)
+            v0 * (tau - 0.5 * tau * tau)
+            + v1 * (0.5 * tau * tau)
+            + c * _bump_integral(tau, k)
         ) * dt
 
     return speed, arc
 
 
 def _log_profile_peak(
-    v0: float, v1: float, length: float, dt: float, samples: int = 32
+    v0: float, v1: float, length: float, dt: float, k: float, samples: int = 32
 ) -> float:
-    """Peak speed of the log profile (dense deterministic sampling)."""
-    speed, _ = _log_profile(v0, v1, length, dt)
+    """Peak speed of the profile (dense deterministic sampling)."""
+    speed, _ = _log_profile(v0, v1, length, dt, k)
     return max(speed(i / samples) for i in range(samples + 1))
 
 
-# Peak/average speed ratio of a rest-to-rest log-eased segment (the bump is
-# symmetric, so the peak sits at τ = 0.5). Used to size takeoff/landing
-# durations so their *peak* vertical speed matches the configured speed.
-_EASE_PEAK_FACTOR = _log_bump(0.5) / _LOG_BUMP_AREA
+# Peak/average speed ratio of a rest-to-rest eased segment. The bump peaks at
+# τ = ½ where B = 1, so v_peak = C = 2·v_avg — independent of the thickness k.
+# Used to size takeoff/landing durations so their *peak* vertical speed matches
+# the configured speed.
+_EASE_PEAK_FACTOR = 2.0
 
 
 class TrajectoryLimitError(ValueError):
@@ -201,7 +239,7 @@ def _vertical_segment_duration(
     """Duration of a vertical climb/descent so its *peak* speed equals *speed*.
 
     With easing enabled the segment starts and ends at rest, which makes the
-    peak speed ``_EASE_PEAK_FACTOR`` × the average (≈1.49 for the log
+    peak speed ``_EASE_PEAK_FACTOR`` × the average (2.0 for the exp-in/log-out
     profile) — so the segment must take that much longer for the same peak.
     Without easing the motion is constant-speed.
     """
@@ -1046,8 +1084,9 @@ def apply_velocity_smoothing(
     travelled at constant speed — the speed jumps from 0 to cruise instantly
     at every segment boundary, which is the "inertia" jerk the drone feels.
 
-    Each accelerating/decelerating segment is re-timed along a **natural-log
-    speed profile** (see the ``_log_profile`` block) and rendered as
+    Each accelerating/decelerating segment is re-timed along an **exponential
+    ease-in / logarithmic ease-out speed profile** (see the ``_log_profile``
+    block) whose thickness is set by ``smoothing`` and rendered as
     ``_LOG_SUBDIVISIONS`` cubic Bézier pieces whose control points lie *on
     the straight line* between the segment endpoints, so the geometric path
     is unchanged; only the speed along it changes. Segments cruising at
@@ -1080,6 +1119,7 @@ def apply_velocity_smoothing(
     if len(points) < 2:
         return points
     smoothing = min(1.0, max(0.0, smoothing))
+    thickness = _thickness_from_smoothing(smoothing)
 
     if merge_collinear and smoothing > 0.0:
         points = _merge_collinear_runs(points)
@@ -1181,7 +1221,7 @@ def apply_velocity_smoothing(
             if not needs_easing(k):
                 continue
             peak = _log_profile_peak(
-                speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k]
+                speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k], thickness
             )
             if peak <= seg_limit[k] * (1.0 + 1e-9):
                 continue
@@ -1209,7 +1249,7 @@ def apply_velocity_smoothing(
         if not needs_easing(k):
             continue
         peak = _log_profile_peak(
-            speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k]
+            speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k], thickness
         )
         if peak > seg_limit[k] * (1.0 + 1e-6):
             return points
@@ -1229,7 +1269,7 @@ def apply_velocity_smoothing(
         a = points[k - 1][1]
         t0 = points[k - 1][0]
         speed, arc = _log_profile(
-            speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k]
+            speed_at[k - 1], speed_at[k], seg_len[k], seg_dt[k], thickness
         )
         prev_tau = 0.0
         prev_arc = 0.0
