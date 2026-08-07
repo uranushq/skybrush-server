@@ -13,12 +13,16 @@ from trio_util import periodic
 from flockwave.server.ext.base import Extension
 from flockwave.server.model.clock import Clock
 from flockwave.server.tasks import wait_for_dict_items, wait_until
+from flockwave.server.utils import overridden
 
+from . import api as show_api
+from .api import blueprint as show_api_blueprint
 from .clock import ClockSynchronizationHandler, ShowClock, ShowEndClock
 from .config import DroneShowConfiguration, LightConfiguration, StartMethod
 from .logging import ShowUploadLoggingMiddleware
+from .readiness import ShowStartReadiness, collect_show_start_readiness
 
-__all__ = ("construct", "dependencies", "description")
+__all__ = ("construct", "dependencies", "description", "schema")
 
 
 class DroneShowExtension(Extension):
@@ -67,11 +71,25 @@ class DroneShowExtension(Extension):
             "get_configuration": self._get_configuration,
             "get_last_uploaded_show_metadata": self._get_last_uploaded_show_metadata,
             "get_light_configuration": self._get_light_configuration,
+            "get_start_readiness": self.get_start_readiness,
         }
+
+    def get_start_readiness(self) -> ShowStartReadiness:
+        """Returns whether all mapped show UAVs have start time and authorization."""
+        assert self.app is not None
+        return collect_show_start_readiness(
+            self._config, find_uav=self.app.find_uav_by_id
+        )
 
     def handle_SHOW_CFG(self, message, sender, hub):
         return hub.create_response_or_notification(
             body={"configuration": self._config.json}, in_response_to=message
+        )
+
+    def handle_SHOW_READY(self, message, sender, hub):
+        """Returns start-time / authorization readiness for mapped show UAVs."""
+        return hub.create_response_or_notification(
+            body=dict(self.get_start_readiness()), in_response_to=message
         )
 
     def handle_SHOW_LIGHTS(self, message, sender, hub):
@@ -179,7 +197,11 @@ class DroneShowExtension(Extension):
             "SHOW-SETLIGHTS": self.handle_SHOW_SETLIGHTS,
             "SHOW-START": self.handle_SHOW_START,
             "X-SHOW-START": self.handle_SHOW_START,
+            # Experimental: not in the official Flockwave schema yet
+            "X-SHOW-READY": self.handle_SHOW_READY,
         }
+
+        api_route = configuration.get("api_route", "/api/v1/show")
 
         self._config.start_method = StartMethod(
             configuration.get("default_start_method", "rc")
@@ -213,6 +235,21 @@ class DroneShowExtension(Extension):
             self._show_tasks = CancellableTaskGroup(self._nursery)
 
             with ExitStack() as stack:
+                if api_route:
+                    http_server = app.import_api("http_server")
+                    stack.enter_context(
+                        overridden(
+                            show_api, get_start_readiness=self.get_start_readiness
+                        )
+                    )
+                    stack.enter_context(
+                        http_server.mounted(show_api_blueprint, path=api_route)
+                    )
+                    self.log.info(
+                        "Show REST API mounted at %s (GET /start-readiness)",
+                        api_route,
+                    )
+
                 stack.enter_context(
                     self._config.updated.connected_to(
                         self._on_config_updated,
@@ -488,7 +525,7 @@ class DroneShowExtension(Extension):
 
 
 construct = DroneShowExtension
-dependencies = ("clocks", "signals")
+dependencies = ("clocks", "http_server", "signals")
 description = "Support for managing drone shows"
 schema = {
     "properties": {
