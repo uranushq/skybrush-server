@@ -32,12 +32,15 @@ from trio import CancelScope, Event, Lock, open_nursery, sleep, sleep_forever
 from flockwave.server.registries.errors import RegistryFull
 
 from ..base import UAVExtension
+from ..show.config import DroneShowConfiguration
+from ..show.takeoff import TakeoffConfiguration
 from .driver import VirtualUAV, VirtualUAVDriver
 from .fw_upload import FIRMWARE_UPDATE_TARGET_ID
 from .placement import place_drones
 
 if TYPE_CHECKING:
     from flockwave.server.app import SkybrushServer
+    from flockwave.server.ext.show.types import ShowExtensionAPI
 
 __all__ = ("construct", "dependencies", "description", "enhancers")
 
@@ -293,6 +296,10 @@ class VirtualUAVProviderExtension(UAVExtension[VirtualUAVDriver]):
         for uav in self.uavs:
             uav.radiation_ext = radiation_ext
 
+        # Newly created drones should mirror the current show start configuration
+        # so /show/start-readiness can return ready=true for virtual fleets.
+        self._sync_scheduled_takeoff_from_show()
+
     def fleet_status(self) -> dict[str, Any]:
         """Return a JSON-serializable status snapshot of the fleet."""
         return {
@@ -418,7 +425,13 @@ class VirtualUAVProviderExtension(UAVExtension[VirtualUAVDriver]):
         with ExitStack() as stack:
             stack.enter_context(http_server.mounted(blueprint, path=route))
             stack.enter_context(
-                signals.use({"show:lights_updated": self._on_lights_updated})
+                signals.use(
+                    {
+                        "show:lights_updated": self._on_lights_updated,
+                        "show:config_updated": self._on_show_configuration_changed,
+                        "show:clock_changed": self._on_show_clock_changed,
+                    }
+                )
             )
             if self.log:
                 self.log.info(
@@ -426,6 +439,7 @@ class VirtualUAVProviderExtension(UAVExtension[VirtualUAVDriver]):
                     "(GET /, POST /enable, POST /disable, POST /count)",
                     route,
                 )
+            self._sync_scheduled_takeoff_from_show()
             await sleep_forever()
 
     @staticmethod
@@ -483,6 +497,44 @@ class VirtualUAVProviderExtension(UAVExtension[VirtualUAVDriver]):
 
         for uav in self.uavs:
             uav.set_led_color(color)
+
+    def _on_show_clock_changed(self, sender) -> None:
+        """Mirrors show-clock start-time changes onto virtual UAVs."""
+        self._sync_scheduled_takeoff_from_show()
+
+    def _on_show_configuration_changed(
+        self, sender, config: DroneShowConfiguration
+    ) -> None:
+        """Mirrors show start authorization/time onto virtual UAVs."""
+        self._sync_scheduled_takeoff_from_show(config.clone())
+
+    def _sync_scheduled_takeoff_from_show(
+        self, config: DroneShowConfiguration | None = None
+    ) -> None:
+        """Copy the current show takeoff configuration onto all virtual UAVs.
+
+        Virtual drones do not speak MAVLink, but the frontend readiness gate
+        still expects per-UAV ``scheduled_takeoff_time`` /
+        ``scheduled_takeoff_authorization_scope`` fields.
+        """
+        if not self.uavs or self.app is None:
+            return
+
+        try:
+            show_api: ShowExtensionAPI = self.app.import_api("show")
+            if config is None:
+                config = show_api.get_configuration()
+            clock = show_api.get_clock()
+            start_time = clock.start_time if clock is not None else None
+            takeoff_config = TakeoffConfiguration.from_show_config(config, start_time)
+        except Exception:
+            # Show extension may be unloaded, or tests may inject a mock app.
+            return
+
+        for uav in self.uavs:
+            if takeoff_config.should_update_takeoff_time:
+                uav.set_scheduled_takeoff_time(takeoff_config.takeoff_time)
+            uav.set_authorization_scope(takeoff_config.authorization_scope)
 
 
 construct = VirtualUAVProviderExtension

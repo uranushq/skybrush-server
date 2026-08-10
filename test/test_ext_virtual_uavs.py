@@ -5,6 +5,9 @@ from unittest.mock import MagicMock
 import pytest
 from flockwave.gps.vectors import GPSCoordinate
 
+from flockwave.server.ext.show.config import AuthorizationScope, StartMethod
+from flockwave.server.ext.show.extension import DroneShowExtension
+from flockwave.server.ext.show.readiness import collect_show_start_readiness
 from flockwave.server.ext.virtual_uavs.driver import VirtualUAVDriver, VirtualUAVState
 from flockwave.server.ext.virtual_uavs.extension import VirtualUAVProviderExtension
 
@@ -146,3 +149,68 @@ async def test_set_fleet_count_rejects_negative():
     ext = _configured_extension(count=1)
     with pytest.raises(ValueError, match="count must be >= 0"):
         await ext.set_fleet_count(-1)
+
+
+def test_virtual_uav_exposes_scheduled_takeoff_fields_for_readiness():
+    driver = VirtualUAVDriver()
+    uav = driver.create_uav("00", GPSCoordinate(lat=0, lon=0))
+
+    assert uav.supports_scheduled_takeoff is True
+    assert uav.scheduled_takeoff_time is None
+    assert uav.scheduled_takeoff_authorization_scope is AuthorizationScope.NONE
+
+    uav.set_scheduled_takeoff_time(1786066744)
+    uav.set_authorization_scope(AuthorizationScope.LIVE)
+
+    result = collect_show_start_readiness(
+        DroneShowExtension()._config,
+        find_uav=lambda uav_id: uav if uav_id == "00" else None,
+    )
+    # No mapped UAV IDs yet.
+    assert result["ready"] is False
+
+    config = DroneShowExtension()._config
+    config.update_from_json({"start": {"uavIds": ["00"], "method": "auto"}})
+    result = collect_show_start_readiness(config, find_uav=lambda uav_id: uav)
+    assert result["ready"] is True
+    assert result["uavs"]["00"]["hasStartTime"] is True
+    assert result["uavs"]["00"]["hasAuthorization"] is True
+
+
+def test_sync_scheduled_takeoff_from_show_updates_virtual_uavs():
+    ext = _configured_extension(count=2)
+
+    show_ext = DroneShowExtension()
+    show_ext._config.update_from_json(
+        {
+            "start": {
+                "uavIds": ["0", "1"],
+                "method": StartMethod.AUTO.value,
+                "authorized": True,
+                "authorizationScope": "live",
+                "time": 1786066744,
+                "clock": None,
+            }
+        }
+    )
+    show_ext._clock = MagicMock(start_time=1786066744)
+
+    show_api = MagicMock()
+    show_api.get_configuration.side_effect = show_ext._get_configuration
+    show_api.get_clock.return_value = show_ext._clock
+    ext.app.import_api.side_effect = lambda name: show_api
+
+    ext._sync_scheduled_takeoff_from_show()
+
+    for uav in ext.uavs:
+        assert uav.scheduled_takeoff_time == 1786066744
+        assert uav.scheduled_takeoff_authorization_scope is AuthorizationScope.LIVE
+
+    result = collect_show_start_readiness(
+        show_ext._config,
+        find_uav=lambda uav_id: next(
+            (uav for uav in ext.uavs if uav.id == uav_id), None
+        ),
+    )
+    assert result["ready"] is True
+    assert result["readyCount"] == 2

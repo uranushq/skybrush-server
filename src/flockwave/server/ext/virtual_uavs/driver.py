@@ -32,6 +32,7 @@ from flockwave.server.command_handlers import (
     create_version_command_handler,
 )
 from flockwave.server.errors import NotSupportedError
+from flockwave.server.ext.show.config import AuthorizationScope
 from flockwave.server.model.commands import (
     Progress,
     ProgressEventsWithSuspension,
@@ -101,6 +102,8 @@ class VirtualUAV(UAVBase):
     _position_xyz: Vector3D
     _position_flat: FlatEarthCoordinate
     _request_shutdown: Callable[[], None] | None
+    _scheduled_takeoff_authorization_scope: AuthorizationScope
+    _scheduled_takeoff_time: int | None
     _shutdown_reason: str | None
     _sleeping: bool
     _trajectory_transformation: FlatEarthToGPSCoordinateTransformation | None
@@ -195,6 +198,8 @@ class VirtualUAV(UAVBase):
         self._velocity_ned = VelocityNED()
 
         self._request_shutdown = None
+        self._scheduled_takeoff_authorization_scope = AuthorizationScope.NONE
+        self._scheduled_takeoff_time = None
         self._shutdown_reason = None
 
         self.boots_armed = False
@@ -218,6 +223,32 @@ class VirtualUAV(UAVBase):
     def armed(self, value: bool) -> None:
         self._armed = value
         self.ensure_error(FlockwaveErrorCode.DISARMED, present=not self._armed)
+
+    @property
+    def scheduled_takeoff_authorization_scope(self) -> AuthorizationScope:
+        """Returns the authorization scope for a scheduled takeoff."""
+        return self._scheduled_takeoff_authorization_scope
+
+    @property
+    def scheduled_takeoff_time(self) -> int | None:
+        """Returns the scheduled takeoff UNIX timestamp, or ``None`` if cleared."""
+        return self._scheduled_takeoff_time
+
+    @property
+    def supports_scheduled_takeoff(self) -> bool:
+        """Virtual UAVs always support scheduled takeoffs for readiness checks."""
+        return True
+
+    def set_authorization_scope(self, scope: AuthorizationScope) -> None:
+        """Sets the authorization scope for a scheduled takeoff."""
+        self._scheduled_takeoff_authorization_scope = scope
+
+    def set_scheduled_takeoff_time(self, seconds: int | None) -> None:
+        """Sets or clears the scheduled takeoff time as a UNIX timestamp."""
+        if seconds is None or seconds < 0:
+            self._scheduled_takeoff_time = None
+        else:
+            self._scheduled_takeoff_time = int(seconds)
 
     def arm_if_on_ground(self) -> bool:
         """Arms the virtual drone if it is standing on the ground.
