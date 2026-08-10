@@ -60,6 +60,14 @@ Algorithm
    Two fixed routes that conflict resolve by one holding; a permanent
    blockage trips the stagnation guard and fails loudly.
 
+7. **Lockstep groups** (formation blocks): the members of a group listed in
+   ``lockstep_groups`` advance together or all wait. Fixed routes pin a
+   block's *geometry*; this pins its *timing*, which is what actually keeps
+   the shape intact when the members' lanes clear at different moments —
+   without it the first drone whose lane opens slides away alone and the
+   block arrives strung out over several steps. Members that have already
+   arrived are parked and hold nobody back.
+
 The solver is fully deterministic; the ``seed`` parameter is kept for API
 compatibility but no randomness remains.
 """
@@ -215,6 +223,7 @@ class PathSolver:
         min_z: float = 0.0,
         margin: float = PLANNING_MARGIN,
         fixed_routes: Optional[Dict[int, List[Vec3]]] = None,
+        lockstep_groups: Optional[List[Set[int]]] = None,
         min_separation: float = HARD_MIN_SEPARATION,
     ) -> None:
         assert len(initials) == len(targets), "initial and target counts must match"
@@ -279,6 +288,17 @@ class PathSolver:
                 if not drone.arrived:
                     self._routes[did] = route
                     self._fixed_ids.add(did)
+
+        # Lockstep groups (see module docstring item 7): members advance
+        # together or not at all. Pinning a block to straight lines fixes
+        # its *geometry*; this fixes its *timing*, which is what keeps the
+        # shape intact en route when the members' lanes clear at different
+        # moments. Singletons carry no constraint and are dropped.
+        self._lockstep_groups: List[Set[int]] = []
+        for group in lockstep_groups or ():
+            members = {did for did in group if did in self._drones_by_id}
+            if len(members) > 1:
+                self._lockstep_groups.append(members)
 
         # Broad-phase cell size: two drones can only interact within one
         # separation window plus one step of motion on each side.
@@ -731,6 +751,49 @@ class PathSolver:
         route = self._routes.get(drone.drone_id)
         return route[0] if route else tuple(drone.target)
 
+    def _in_lane(self, lane_from, lane_to, point: List[float]) -> bool:
+        """Is *point* inside the separation window of a lane segment?"""
+        return envelope_overlap_swept(
+            list(lane_from),
+            list(lane_to),
+            list(point),
+            list(point),
+            margin=self.margin,
+            separation=self.separation,
+        )
+
+    def _squats_reserved_lane(self, drone: Drone, position: List[float]) -> bool:
+        """Would *drone* at *position* squat in a lane a pinned drone needs?
+
+        A pinned drone cannot detour, so the stretch of lane it still has to
+        fly is reserved, and the reservation shrinks as it advances. Only
+        drones **heading in to park there** — those whose own target sits in
+        that lane — are kept out; they wait at its edge until the pinned
+        drone is past their spot. That is what turns a bundle of crossing
+        fixed paths into an *order*: whoever has to vacate a spot flies
+        first, and whoever is bound for it waits.
+
+        Drones merely crossing a lane are deliberately untouched. A row
+        sliding along the very line another drone descends onto crosses it
+        constantly, and the per-step collision check already keeps those
+        apart; barring transit as well would deadlock such a row against
+        itself.
+        """
+        for other in self.drones:
+            did = other.drone_id
+            if (
+                did == drone.drone_id
+                or did not in self._fixed_ids
+                or other.arrived
+            ):
+                continue
+            lane_from, lane_to = other.position, self._route_head(other)
+            if not self._in_lane(lane_from, lane_to, list(drone.target)):
+                continue
+            if self._in_lane(lane_from, lane_to, position):
+                return True
+        return False
+
     def _propose_move(
         self, drone: Drone, statics: List[List[float]]
     ) -> List[float]:
@@ -1014,7 +1077,7 @@ class PathSolver:
             )
             reason = (
                 f"user-pinned straight paths collide with each other: {pairs}. "
-                "These paths cannot all be flown as drawn — unpin one of the "
+                "These paths cannot all be flown as drawn -- unpin one of the "
                 "drones or change its formation position"
             )
         else:
@@ -1104,7 +1167,7 @@ class PathSolver:
                     return self._failure(
                         step_num,
                         "internal error: collision persists with all drones "
-                        "holding — previous step state was already invalid",
+                        "holding -- previous step state was already invalid",
                     )
                 reverted = resolved
 
@@ -1151,6 +1214,59 @@ class PathSolver:
                             self._routes.pop(did, None)
                             self._futile_detours[did] += 1
                             break
+
+            # Phase 2.8 — lockstep groups: the block moves as one or waits
+            # as one. A member held up this step pulls the rest back to
+            # their previous spots, so a group whose lanes clear at
+            # different moments still departs together instead of trickling
+            # away one drone at a time. Applied last so nothing downstream
+            # (a detour, in particular) can undo it.
+            #
+            # Holding a drone that was about to move can open a *new*
+            # conflict — someone may have been admitted precisely because
+            # that drone was vacating — so every round of holds is
+            # re-checked, and any fresh conflict resolved, until the step
+            # settles. Holds only ever accumulate, which bounds the loop.
+            if self._lockstep_groups:
+                for _ in range(len(self.drones) + 1):
+                    held: List[int] = []
+                    for group in self._lockstep_groups:
+                        movers = [
+                            did
+                            for did in group
+                            if did not in arrived_ids
+                            and proposed[did] != prev_positions[did]
+                        ]
+                        waiting = any(
+                            did not in arrived_ids
+                            and proposed[did] == prev_positions[did]
+                            for did in group
+                        )
+                        if waiting:
+                            held.extend(movers)
+                    if not held:
+                        break
+                    for did in held:
+                        proposed[did] = list(prev_positions[did])
+                        if did not in reverted:
+                            reverted.append(did)
+                    late_collisions = self._find_step_collisions(
+                        prev_positions, proposed
+                    )
+                    if not late_collisions:
+                        continue
+                    resolved = self._resolve_collisions(
+                        prev_positions, proposed, late_collisions, arrived_ids
+                    )
+                    if resolved is None:
+                        return self._failure(
+                            step_num,
+                            "internal error: collision persists with all drones "
+                            "holding — previous step state was already invalid",
+                        )
+                    for did in resolved:
+                        if did not in reverted:
+                            reverted.append(did)
 
             # Phase 3 — apply moves
             for d in self.drones:

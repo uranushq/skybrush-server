@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from itertools import combinations
+
 import pytest
 
+from flockwave.server.ext.path_planner.collision_volume import envelope_overlap_swept
 from flockwave.server.ext.path_planner.converter import (
     DEFAULT_CRUISE_SPEED_M_S,
     DEFAULT_LANDING_SPEED_M_S,
@@ -14,11 +17,19 @@ from flockwave.server.ext.path_planner.extension import (
     STACK_APPROACH_OFFSET,
     STACK_CLIMB_SPEED,
     PlanningError,
+    _corridors_conflict,
+    _detect_rigid_groups,
+    _dispatch_waves,
     _drone_index_from_id,
     _normalize_vec3_array,
     _phase_point_drone_index,
+    _pin_flyable_clusters,
+    _pinned_blocks,
+    _pinned_corridors_deadlock,
     _plan_formation_phases,
     _stack_entry_plan,
+    _staging_spread_targets,
+    _validate_phase_clusters,
 )
 from flockwave.server.ext.path_planner.solver import Drone, SolverResult, StepRecord
 
@@ -74,6 +85,358 @@ def test_normalize_vec3_array_orders_by_show_drone_id() -> None:
         {"droneId": "show-drone-1", "x": 0, "y": 0, "z": 0},
     ]
     assert _normalize_vec3_array("initial", value) == [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]]
+
+
+# ── staging layout ───────────────────────────────────────────────────────
+
+
+def _chebyshev(a, b) -> float:
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1]), abs(a[2] - b[2]))
+
+
+def test_staging_keeps_a_takeoff_layout_that_already_clears_the_spacing() -> None:
+    # A 2 m take-off grid is already spread out, so staging must not move a
+    # single drone -- it used to re-shuffle everyone onto a half-cell-offset
+    # grid, which deadlocked the solver.
+    hover = [(x, y, 20.0) for x in (0, 2, 4, 6, 8) for y in (0, 2, 4, 6, 8, 10)]
+
+    assert _staging_spread_targets(hover, 2.0) == hover
+
+
+def test_staging_spreads_a_tight_layout_about_drone_one() -> None:
+    hover = [(x, y, 20.0) for x in (0, 1, 2) for y in (0, 1, 2)]
+    targets = _staging_spread_targets(hover, 2.0)
+
+    # drone-1 is the anchor and stays exactly where it took off
+    assert targets[0] == hover[0]
+    # every pair clears the requested spacing afterwards
+    for a, b in combinations(targets, 2):
+        assert _chebyshev(a, b) >= 2.0
+    # the take-off shape is preserved: one uniform horizontal scale, no
+    # altitude change
+    assert [t[2] for t in targets] == [p[2] for p in hover]
+    assert targets[1][1] / hover[1][1] == pytest.approx(targets[3][0] / hover[3][0])
+
+
+def test_staging_spread_never_brings_two_drones_closer_together() -> None:
+    # Scaling about a fixed point is monotone, which is what makes the
+    # staging move collision-free without any avoidance planning.
+    hover = [(0.0, 0.0, 20.0), (0.9, 0.4, 20.0), (2.3, 1.1, 20.0), (0.2, 1.8, 20.0)]
+    targets = _staging_spread_targets(hover, 2.0)
+
+    for i, j in combinations(range(len(hover)), 2):
+        previous = _chebyshev(hover[i], hover[j])
+        for step in range(1, 21):
+            t = step / 20.0
+            a = [hover[i][k] + (targets[i][k] - hover[i][k]) * t for k in range(3)]
+            b = [hover[j][k] + (targets[j][k] - hover[j][k]) * t for k in range(3)]
+            distance = _chebyshev(a, b)
+            assert distance >= previous - 1e-9
+            previous = distance
+
+
+def test_staging_ignores_pairs_already_separated_by_altitude() -> None:
+    # Separation is Chebyshev, so a pair split by altitude alone is fine.
+    # Scaling it apart horizontally would blow the whole layout up.
+    hover = [(0.0, 0.0, 20.0), (0.1, 0.0, 22.0), (3.0, 0.0, 20.0)]
+
+    assert _staging_spread_targets(hover, 2.0) == hover
+
+
+def test_staging_spread_survives_a_single_drone() -> None:
+    assert _staging_spread_targets([(1.0, 2.0, 20.0)], 2.0) == [(1.0, 2.0, 20.0)]
+
+
+# ── automatic rigid-group clustering ─────────────────────────────────────
+
+
+def test_rigid_groups_pin_blocks_that_do_not_get_in_each_others_way() -> None:
+    # Two blocks translating well clear of one another: both fly in lockstep.
+    current = [(0.0, 0.0, 10.0), (0.0, 3.0, 10.0), (0.0, 20.0, 10.0), (0.0, 23.0, 10.0)]
+    targets = [(10.0, 0.0, 10.0), (10.0, 3.0, 10.0), (-10.0, 20.0, 10.0), (-10.0, 23.0, 10.0)]
+
+    pinned = _detect_rigid_groups(
+        current, targets, excluded=set(), static_positions=[], separation=1.45
+    )
+
+    assert set(pinned) == {0, 1, 2, 3}
+
+
+def test_rigid_groups_do_not_pin_two_blocks_onto_crossing_corridors() -> None:
+    # Head-on blocks whose lanes are only 1 m apart. Pinning both would take
+    # away everyone's right to detour and deadlock the segment, so only one
+    # block keeps its pins and the other falls back to normal planning.
+    current = [(0.0, 0.0, 10.0), (0.0, 3.0, 10.0), (10.0, 1.0, 10.0), (10.0, 4.0, 10.0)]
+    targets = [(10.0, 0.0, 10.0), (10.0, 3.0, 10.0), (0.0, 1.0, 10.0), (0.0, 4.0, 10.0)]
+
+    pinned = _detect_rigid_groups(
+        current, targets, excluded=set(), static_positions=[], separation=1.45
+    )
+
+    assert set(pinned) == {0, 1}, "the larger/earlier block wins, the clashing one yields"
+
+
+def test_rigid_groups_keep_clear_of_a_user_pinned_route() -> None:
+    # drone-3 is pinned by hand head-on down drone-1's lane, swapping places
+    # with it. Neither can detour and neither order works, so the block must
+    # not be pinned against it.
+    current = [(0.0, 0.0, 10.0), (0.0, 3.0, 10.0), (10.0, 0.0, 10.0)]
+    targets = [(10.0, 0.0, 10.0), (10.0, 3.0, 10.0), (0.0, 0.0, 10.0)]
+    routes = [[current[2], targets[2]]]
+
+    assert _detect_rigid_groups(
+        current, targets, excluded={2}, static_positions=[], separation=1.45
+    ), "sanity: without the route the block is pinned"
+
+    pinned = _detect_rigid_groups(
+        current,
+        targets,
+        excluded={2},
+        static_positions=[],
+        pinned_routes=routes,
+        separation=1.45,
+    )
+
+    assert pinned == {}
+
+
+def test_corridors_conflict_compares_distance_flown_not_normalised_time() -> None:
+    # A flies 20 m; B flies 4 m and then parks 1 m off A's lane. A passes
+    # the parked B half way down its own run. Rescaling both onto t=[0, 1]
+    # would put B at the far end of its path while A is only a fifth of the
+    # way along and miss it entirely.
+    a_start, a_end = (0.0, 0.0, 10.0), (20.0, 0.0, 10.0)
+    b_start, b_end = (10.0, 5.0, 10.0), (10.0, 1.0, 10.0)
+
+    assert _corridors_conflict(a_start, a_end, b_start, b_end, separation=1.45)
+    # the naive same-duration reading of the very same corridors
+    assert not envelope_overlap_swept(
+        list(a_start), list(a_end), list(b_start), list(b_end), separation=1.45
+    )
+
+
+def test_corridors_conflict_clears_genuinely_separate_lanes() -> None:
+    assert not _corridors_conflict(
+        (0.0, 0.0, 10.0), (20.0, 0.0, 10.0),
+        (10.0, 5.0, 10.0), (10.0, 2.0, 10.0),
+        separation=1.45,
+    )
+
+
+# ── explicit per-phase clusters ──────────────────────────────────────────
+
+
+def test_cluster_that_translates_keeps_its_lockstep_pins() -> None:
+    current = [(0.0, 0.0, 10.0), (0.0, 3.0, 10.0), (0.0, 6.0, 10.0)]
+    targets = [(10.0, 0.0, 10.0), (10.0, 3.0, 10.0), (10.0, 6.0, 10.0)]
+    routes: dict = {}
+
+    groups, notes = _pin_flyable_clusters(
+        routes,
+        [{0, 1, 2}],
+        current_positions=current,
+        targets=targets,
+        separation=1.45,
+        label="phase-1",
+    )
+
+    assert notes == []
+    assert routes == {i: [targets[i]] for i in range(3)}
+    assert groups == [{0, 1, 2}], "the block must also be handed over as one unit"
+
+
+def test_cluster_that_contracts_is_planned_normally_instead() -> None:
+    # The real phase-2 block: four drones fanned out over a 10 m line
+    # converging onto a 1.5 m wedge. The target formation is legal, but two
+    # of the straight lines to it block each other whichever goes first, so
+    # the block must not be pinned.
+    current = [(24.0, 8.0, 20.0), (24.0, 10.0, 20.0), (26.0, 0.0, 20.0), (26.0, 2.0, 20.0)]
+    targets = [(18.0, 3.0, 39.5), (18.0, 1.5, 39.5), (18.0, 1.5, 38.0), (18.0, 0.0, 38.0)]
+    routes: dict = {}
+
+    groups, notes = _pin_flyable_clusters(
+        routes,
+        [{0, 1, 2, 3}],
+        current_positions=current,
+        targets=targets,
+        separation=1.45,
+        label="phase-2",
+    )
+
+    assert routes == {}, "a contracting block must keep its right to detour"
+    assert groups == []
+    assert len(notes) == 1
+    assert "drone-1" in notes[0] and "drone-2" in notes[0]
+
+    # sanity: the formation the block is heading for is itself legal
+    for a, b in combinations(targets, 2):
+        assert _chebyshev(a, b) >= 1.45
+
+
+def test_unschedulable_cluster_is_released_instead_of_failing_the_show() -> None:
+    # Geometry alone cannot tell whether a block's lines are schedulable
+    # alongside the rest of the fleet — this one has a valid flight order on
+    # paper that the solver never finds. Rather than failing a show whose
+    # formations are all legal, the clusters are released and the segment is
+    # replanned normally.
+    start = [
+        (24.0, 0.0, 20.0), (24.0, 2.0, 20.0), (24.0, 4.0, 20.0), (24.0, 6.0, 20.0),
+        (24.0, 8.0, 20.0), (24.0, 10.0, 20.0), (26.0, 0.0, 20.0), (26.0, 2.0, 20.0),
+    ]
+    targets = [
+        (12.0, 6.0, 39.5), (12.0, 6.0, 38.0), (12.0, 4.5, 38.0), (12.0, 3.0, 38.0),
+        (18.0, 3.0, 39.5), (18.0, 1.5, 39.5), (18.0, 1.5, 38.0), (18.0, 0.0, 38.0),
+    ]
+    phases = [
+        {
+            "name": "wedge",
+            "points": [{"x": x, "y": y, "z": z} for x, y, z in targets],
+            "clusters": [
+                ["drone-1", "drone-2", "drone-3", "drone-4"],
+                ["drone-5", "drone-6", "drone-7", "drone-8"],
+            ],
+        }
+    ]
+
+    result, summaries = _plan_formation_phases(
+        start_positions=start,
+        phases=phases,
+        step_size=1.0,
+        duration_ms=1000,
+        seed=7,
+        return_to_initial=False,
+        min_z=2.5,
+    )
+
+    assert result.success
+    assert [tuple(result.steps[-1].positions[i]) for i in range(8)] == targets
+    warnings = summaries[0]["warnings"]
+    assert any("released" in w for w in warnings), warnings
+
+
+def test_cluster_keeps_fixed_path_members_in_the_lockstep_group() -> None:
+    # Every member is also pinned by hand. The old code filtered those out
+    # and the group vanished, so the three drones left independently as
+    # soon as each one's own lane cleared.
+    current = [(0.0, 0.0, 10.0), (0.0, 3.0, 10.0), (0.0, 6.0, 10.0)]
+    targets = [(10.0, 0.0, 10.0), (10.0, 3.0, 10.0), (10.0, 6.0, 10.0)]
+    drawn = [(5.0, 6.0, 12.0), (10.0, 6.0, 10.0)]
+    routes = {2: drawn}
+
+    groups, notes = _pin_flyable_clusters(
+        routes,
+        [{0, 1, 2}],
+        current_positions=current,
+        targets=targets,
+        separation=1.45,
+        label="phase-1",
+    )
+
+    assert notes == []
+    assert groups == [{0, 1, 2}]
+    assert routes[2] == drawn, "a hand-drawn path is never overwritten"
+    assert routes[0] == [targets[0]] and routes[1] == [targets[1]]
+
+
+def test_clusters_may_overlap_fixed_paths() -> None:
+    # The pin fixes a drone's geometry, the cluster fixes the block's
+    # timing; a hand-drawn path joins a block by appearing in both.
+    phase = {
+        "clusters": [["drone-1", "drone-3"]],
+        "fixedPaths": [{"droneId": "drone-3", "path": [{"x": 0, "y": 0, "z": 5}]}],
+    }
+
+    assert _validate_phase_clusters(phase, 0, 4) is None
+
+
+def test_pinned_corridors_that_can_be_staggered_are_not_a_deadlock() -> None:
+    # drone-1 descends onto the spot drone-2 is vacating. Flown together
+    # they would pass 0.75 m apart, but sending drone-2 first resolves it --
+    # exactly what the solver does, so this must not be rejected.
+    descend = ((12.0, 6.0, 21.5), (12.0, 6.0, 20.0))
+    slide = ((12.0, 6.0, 20.0), (12.0, 15.0, 20.0))
+
+    assert _corridors_conflict(*descend, *slide, separation=1.45)
+    assert not _pinned_corridors_deadlock(*descend, *slide, separation=1.45)
+
+
+def test_pinned_corridors_swapping_one_lane_are_a_deadlock() -> None:
+    # A head-on swap along a single line: neither order clears the other.
+    assert _pinned_corridors_deadlock(
+        (0.0, 0.0, 10.0), (10.0, 0.0, 10.0),
+        (10.0, 0.0, 10.0), (0.0, 0.0, 10.0),
+        separation=1.45,
+    )
+
+
+# ── dispatch order between pinned blocks ─────────────────────────────────
+
+
+def test_block_bound_for_an_occupied_lane_is_dispatched_second() -> None:
+    # The real phase-7 clash: one block descends the column at (12, 3, ·)
+    # while another flies in from x=18 to fill the very altitudes it is
+    # still passing through. Sent together, whoever arrives first parks and
+    # the pinned descender can never get by, so the descent goes first.
+    current = [
+        (12.0, 3.0, 39.5), (12.0, 3.0, 38.0),          # block A: descends
+        (18.0, 3.0, 36.5), (18.0, 3.0, 38.0),          # block B: flies in
+    ]
+    targets = [
+        (12.0, 3.0, 23.0), (12.0, 3.0, 21.5),
+        (12.0, 3.0, 36.5), (12.0, 3.0, 38.0),
+    ]
+
+    waves = _dispatch_waves(
+        [{0, 1}, {2, 3}],
+        current_positions=current,
+        targets=targets,
+        separation=1.45,
+    )
+
+    assert waves == [[{0, 1}], [{2, 3}]]
+
+
+def test_independent_blocks_share_one_wave() -> None:
+    current = [(0.0, 0.0, 10.0), (0.0, 3.0, 10.0), (0.0, 20.0, 10.0), (0.0, 23.0, 10.0)]
+    targets = [(10.0, 0.0, 10.0), (10.0, 3.0, 10.0), (10.0, 20.0, 10.0), (10.0, 23.0, 10.0)]
+
+    waves = _dispatch_waves(
+        [{0, 1}, {2, 3}],
+        current_positions=current,
+        targets=targets,
+        separation=1.45,
+    )
+
+    assert waves == [[{0, 1}, {2, 3}]]
+
+
+def test_blocks_that_need_each_others_lanes_have_no_order() -> None:
+    # Each block is bound for the lane the other still has to fly: no
+    # running order can satisfy both, so none is imposed.
+    current = [(0.0, 0.0, 10.0), (0.0, 3.0, 10.0), (10.0, 0.0, 10.0), (10.0, 3.0, 10.0)]
+    targets = [(10.0, 0.0, 10.0), (10.0, 3.0, 10.0), (0.0, 0.0, 10.0), (0.0, 3.0, 10.0)]
+
+    assert (
+        _dispatch_waves(
+            [{0, 1}, {2, 3}],
+            current_positions=current,
+            targets=targets,
+            separation=1.45,
+        )
+        == []
+    )
+
+
+def test_only_whole_pinned_blocks_get_a_running_order() -> None:
+    pinned = {0: [(0.0, 0.0, 0.0)], 1: [(0.0, 0.0, 0.0)], 2: [(0.0, 0.0, 0.0)]}
+
+    # a block whose members are all pinned qualifies; a lone pinned drone
+    # does not, and neither does a group with an unpinned member
+    assert _pinned_blocks(pinned, [{0, 1}]) == [{0, 1}]
+    assert _pinned_blocks(pinned, [{2}]) == []
+    assert _pinned_blocks(pinned, [{2, 9}]) == []
+    # overlapping groups are not double-counted
+    assert _pinned_blocks(pinned, [{0, 1}, {1, 2}]) == [{0, 1}]
 
 
 # ── staged vertical stack entry ──────────────────────────────────────────

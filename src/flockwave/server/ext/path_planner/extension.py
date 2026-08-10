@@ -10,9 +10,10 @@ Formation-phase flow (``phases`` present)::
       │  vertical takeoff
       ▼
     staging hover  (z_ground + staging_altitude, default 5 m)
-      │  solver: collision-avoided move
+      │  solver: collision-avoided move (a no-op when already spread out)
       ▼
-    staging grid   (grid_spacing apart, default 2 m — the algorithm's start)
+    staging layout (take-off shape, spread about drone-1 until every pair
+      │             clears grid_spacing, default 2 m — the algorithm's start)
       │  solver: phase 1, phase 2, ... (+ per-phase holds and yaw changes)
       ▼
     return to staging hover  (when return_to_initial, default true)
@@ -34,11 +35,26 @@ remains:
 
 Per-phase **clusters** move as rigid groups: drones listed in a phase's
 ``clusters`` field (``[["drone-1", "drone-2"], ...]``) are pinned to their
-straight lines for that transition and fly in lockstep, preserving the
-group's shape en route. Groups whose members all share the *same
+straight lines for that transition *and* depart as one — the block waits
+until every member can move, so it holds its shape in time as well as in
+geometry. Listing a drone that also has a ``fixedPaths`` entry is allowed
+and is how a hand-drawn path joins a block: the drawn path wins, the
+cluster only synchronises the departure.
+
+A block that *contracts* rather than translates has straight lines that
+converge on nearly one point and cannot be flown that way. Whether a block
+is schedulable alongside the rest of the fleet is the solver's own
+per-step decision, which geometry cannot predict, so a cluster that will
+not solve is released and the segment replanned normally — with a warning
+on the phase summary — instead of failing a show whose formations are all
+legal. Groups whose members all share the *same
 displacement vector* (a formation block translated as a unit between
 phases) are detected and clustered **automatically** when their straight
-corridors are clear; explicit ``clusters`` entries always win.
+corridors clear everything that cannot get out of the way — parked drones,
+user-pinned paths and the corridors of the blocks already clustered.
+Clashing blocks stay unpinned and are planned normally, since two pinned
+corridors that cross would leave the solver no legal move. Explicit
+``clusters`` entries always win.
 
 A phase may pin selected drones to **user-defined fixed paths** via
 ``fixedPaths`` (``[{"droneId": "drone-3", "path": [{x, y, z}, ...]}]``):
@@ -65,11 +81,13 @@ from __future__ import annotations
 import re
 from contextlib import ExitStack
 from copy import deepcopy
+from itertools import combinations, permutations
 from json import dumps
-from time import perf_counter, time as wall_time
 from logging import Logger
 from math import ceil, sqrt
 from pathlib import Path
+from time import perf_counter
+from time import time as wall_time
 from typing import TYPE_CHECKING, Optional, Sequence
 
 from quart import Blueprint, Response, jsonify, request
@@ -78,7 +96,18 @@ from trio import sleep_forever, to_thread
 from flockwave.server.ext.base import Extension
 from flockwave.server.utils import overridden
 
+from .collision_volume import (
+    GUARANTEED_XY_CLEARANCE,
+    HARD_MIN_SEPARATION,
+    PLANNING_MARGIN,
+    clamp_separation,
+    describe_collision_envelope,
+    envelope_overlap,
+    envelope_overlap_swept,
+)
 from .converter import (
+    _THICKNESS_MAX,
+    _THICKNESS_MIN,
     DEFAULT_CRUISE_SPEED_M_S,
     DEFAULT_LANDING_SPEED_M_S,
     DEFAULT_MAX_YAW_RATE_DEG_S,
@@ -87,8 +116,6 @@ from .converter import (
     DEFAULT_TAKEOFF_SPEED_M_S,
     DEFAULT_VELOCITY_SMOOTHING,
     TrajectoryLimitError,
-    _THICKNESS_MAX,
-    _THICKNESS_MIN,
     build_delivery_show_dicts,
     build_show_dicts,
     duration_ms_for_cruise_speed,
@@ -102,16 +129,6 @@ from .output import (
     build_output,
     build_show_specifications,
     skyc_bytes_from_show_dicts,
-)
-from .collision_volume import (
-    GUARANTEED_XY_CLEARANCE,
-    HARD_MIN_SEPARATION,
-    PLANNED_XY_CLEARANCE,
-    PLANNING_MARGIN,
-    clamp_separation,
-    describe_collision_envelope,
-    envelope_overlap,
-    envelope_overlap_swept,
 )
 from .solver import (
     DOWNWASH_ROUTE_CLEARANCE,
@@ -186,9 +203,17 @@ output_base_dir: str = ""
 MIN_TAKEOFF_TIME = 5.0
 
 # Staging defaults: hover this high above each drone's ground position, then
-# form a grid with this spacing before the requested formation phases start.
+# spread the take-off layout out to at least this spacing before the
+# requested formation phases start.
 DEFAULT_STAGING_ALTITUDE = 5.0
 DEFAULT_GRID_SPACING = 2.0
+
+# Staging coordinates are rounded to STAGING_ROUND_DIGITS decimals for a
+# readable API response; rounding can shave up to 1e-4 m off a pair, so the
+# spread aims this far past the requested spacing to stay clear of the
+# separation check afterwards.
+STAGING_ROUND_DIGITS = 4
+STAGING_SPREAD_GUARD = 1e-3
 
 # Vertical-stack entry (downwash mitigation). When a target formation places
 # one drone within STACK_VERTICAL_GAP above another with horizontal offset
@@ -552,8 +577,13 @@ def _validate_phase_clusters(phase: dict, phase_index: int, num_drones: int):
 
     Shape: ``[["drone-1", "drone-2"], ...]`` — each inner list is a rigid
     group flown in lockstep on straight lines during the transition into
-    this phase. A drone may belong to at most one cluster and must not also
-    carry a ``fixedPaths`` entry (the pin already implies the behavior).
+    this phase. A drone may belong to at most one cluster.
+
+    Overlapping with ``fixedPaths`` is allowed and useful: the pin fixes a
+    drone's *geometry*, the cluster fixes the block's *timing*, and only
+    together do they make a group leave as one. A pinned member keeps the
+    path the user drew; the cluster merely holds it back until the rest of
+    the block can go too.
     """
     clusters = phase.get("clusters")
     if clusters is None:
@@ -561,14 +591,6 @@ def _validate_phase_clusters(phase: dict, phase_index: int, num_drones: int):
     prefix = f"'phases[{phase_index}].clusters"
     if not isinstance(clusters, list):
         return jsonify({"error": f"{prefix}' must be an array of arrays"}), 400
-
-    fixed = phase.get("fixedPaths", phase.get("fixed_paths")) or []
-    fixed_ids = set()
-    for entry in fixed:
-        if isinstance(entry, dict):
-            index = _drone_index_from_id(entry.get("droneId", entry.get("id")))
-            if index is not None:
-                fixed_ids.add(index)
 
     seen: set[int] = set()
     for cluster_index, cluster in enumerate(clusters):
@@ -610,19 +632,6 @@ def _validate_phase_clusters(phase: dict, phase_index: int, num_drones: int):
                     ),
                     400,
                 )
-            if index in fixed_ids:
-                return (
-                    jsonify(
-                        {
-                            "error": (
-                                f"{prefix}' lists drone-{index + 1} which "
-                                "also has a fixedPaths entry — use one or "
-                                "the other"
-                            )
-                        }
-                    ),
-                    400,
-                )
             seen.add(index)
     return None
 
@@ -642,22 +651,307 @@ def _phase_cluster_indices(phase: dict, num_drones: int) -> list[set[int]]:
     return result
 
 
+def _corridors_conflict(
+    a_start: Sequence[float],
+    a_end: Sequence[float],
+    b_start: Sequence[float],
+    b_end: Sequence[float],
+    *,
+    separation: float,
+) -> bool:
+    """Do two straight corridors flown side by side ever come too close?
+
+    Both drones leave on the same step and cover ``step_size`` per step, so
+    they are compared by *distance travelled* rather than by normalised
+    time: first the stretch both are still flying, then the tail where the
+    one that arrived sits parked while the other finishes. Feeding the two
+    corridors to a single swept check instead would silently rescale the
+    shorter one to the longer one's duration and compare positions the
+    drones are never at together.
+    """
+    length_a = Drone.distance(a_start, a_end)
+    length_b = Drone.distance(b_start, b_end)
+    shared = min(length_a, length_b)
+
+    def advance(start, end, length: float) -> list[float]:
+        if length <= 1e-9:
+            return [float(v) for v in start]
+        fraction = shared / length
+        return [start[axis] + (end[axis] - start[axis]) * fraction for axis in range(3)]
+
+    a_mid = advance(a_start, a_end, length_a)
+    b_mid = advance(b_start, b_end, length_b)
+    # Leg 1: both moving. Leg 2: one of the two is already parked, so its
+    # segment is degenerate and this reduces to a swept-vs-static check.
+    return envelope_overlap_swept(
+        [float(v) for v in a_start],
+        a_mid,
+        [float(v) for v in b_start],
+        b_mid,
+        margin=PLANNING_MARGIN,
+        separation=separation,
+    ) or envelope_overlap_swept(
+        a_mid,
+        [float(v) for v in a_end],
+        b_mid,
+        [float(v) for v in b_end],
+        margin=PLANNING_MARGIN,
+        separation=separation,
+    )
+
+
+def _pinned_blocks(
+    pinned: dict[int, list[tuple[float, float, float]]],
+    groups: Sequence[set[int]],
+) -> list[set[int]]:
+    """The pinned formation blocks that can be given a running order.
+
+    Only whole blocks — user clusters and automatically detected rigid
+    groups — qualify. Individual pinned drones are deliberately left out:
+    ordering them one by one would serialise the fleet drone by drone and,
+    worse, park half of it mid-flight where its held position may not clear
+    the other half's targets. A block is included only where every member
+    is pinned; a drone free to detour needs no place in the order.
+    """
+    blocks: list[set[int]] = []
+    for group in groups:
+        members = {index for index in group if index in pinned}
+        if len(members) > 1 and not any(members & block for block in blocks):
+            blocks.append(members)
+    return blocks
+
+
+def _dispatch_waves(
+    blocks: Sequence[set[int]],
+    *,
+    current_positions: Sequence[Sequence[float]],
+    targets: Sequence[Sequence[float]],
+    separation: float,
+) -> list[list[set[int]]]:
+    """Order pinned blocks so the ones that must vacate a spot fly first.
+
+    A pinned drone cannot detour, so a block heading for spots that another
+    block is still standing on — or still has to fly through — can only be
+    sent once that block has cleared out. Flying them together deadlocks:
+    whoever arrives first parks and becomes an obstacle the other can never
+    get past.
+
+    Block *A* must precede *B* when some member of *B* is bound for a spot
+    inside a member of *A*'s straight lane. Those edges are sorted
+    topologically into waves; blocks in one wave are mutually independent
+    and fly together. Returns ``[]`` when the ordering is cyclic — the
+    blocks then genuinely cannot all be flown as drawn and the caller is
+    better off letting the solver report which ones clash.
+    """
+    if len(blocks) < 2:
+        return [list(blocks)] if blocks else []
+
+    def lane(index: int):
+        return (
+            tuple(current_positions[index]),
+            tuple(targets[index]),
+        )
+
+    def needs_clearing(after: set[int], before: set[int]) -> bool:
+        """Does any member of ``after`` want a spot in ``before``'s lanes?"""
+        return any(
+            envelope_overlap_swept(
+                list(lane(a)[0]),
+                list(lane(a)[1]),
+                list(targets[b]),
+                list(targets[b]),
+                margin=PLANNING_MARGIN,
+                separation=separation,
+            )
+            for a in before
+            for b in after
+        )
+
+    blocked_by: list[set[int]] = [set() for _ in blocks]
+    for later, earlier in permutations(range(len(blocks)), 2):
+        if needs_clearing(blocks[later], blocks[earlier]):
+            blocked_by[later].add(earlier)
+
+    waves: list[list[set[int]]] = []
+    done: set[int] = set()
+    while len(done) < len(blocks):
+        ready = [
+            index
+            for index in range(len(blocks))
+            if index not in done and blocked_by[index] <= done
+        ]
+        if not ready:
+            return []  # cyclic: no order can satisfy every block
+        waves.append([blocks[index] for index in ready])
+        done.update(ready)
+    return waves
+
+
+def _pinned_corridors_deadlock(
+    a_start: Sequence[float],
+    a_end: Sequence[float],
+    b_start: Sequence[float],
+    b_end: Sequence[float],
+    *,
+    separation: float,
+) -> bool:
+    """Would pinning both of these corridors leave the solver no move at all?
+
+    Pinned drones never detour, but they *can* wait, and the solver staggers
+    two conflicting pinned lanes by sending whichever drone stands in the
+    other's way first. A crossing is therefore only fatal when *no* order
+    works. Three schedules are tried: both flying together, A then B, and B
+    then A — where "A then B" means A flies its whole line while B waits on
+    its start, then B flies while A sits parked on its target.
+
+    Rejecting on the simultaneous check alone would throw away perfectly
+    flyable moves, such as a drone descending onto the spot another drone is
+    just now vacating.
+    """
+
+    def clear(start, end, point) -> bool:
+        return not envelope_overlap_swept(
+            [float(v) for v in start],
+            [float(v) for v in end],
+            [float(v) for v in point],
+            [float(v) for v in point],
+            margin=PLANNING_MARGIN,
+            separation=separation,
+        )
+
+    if not _corridors_conflict(
+        a_start, a_end, b_start, b_end, separation=separation
+    ):
+        return False
+    a_first = clear(a_start, a_end, b_start) and clear(b_start, b_end, a_end)
+    b_first = clear(b_start, b_end, a_start) and clear(a_start, a_end, b_end)
+    return not (a_first or b_first)
+
+
+def _pin_flyable_clusters(
+    routes: dict[int, list[tuple[float, float, float]]],
+    clusters: Sequence[set[int]],
+    *,
+    current_positions: Sequence[Sequence[float]],
+    targets: Sequence[Sequence[float]],
+    separation: float,
+    label: str,
+) -> tuple[list[set[int]], list[str]]:
+    """Pin the members of every ``clusters`` block that can fly straight.
+
+    A cluster asks a block to hold its shape by putting each member on a
+    straight line to its own spot. That only works while those lines stay
+    clear of one another and of the paths the user fixed by hand — which
+    holds for a block that *translates*, and fails for one that contracts:
+    members fanning in from a wide line onto a tight formation have lines
+    that converge on nearly the same point. Pinning such a block strips
+    every member of its right to detour and deadlocks the segment, so it is
+    left unpinned and planned normally instead. It still reaches exactly
+    the same formation, just not in lockstep.
+
+    Mutates ``routes`` and returns the accepted blocks — to be handed to the
+    solver as lockstep groups, so they hold their shape in *time* as well as
+    in geometry — together with one human-readable note per dropped cluster.
+    A block whose members' lanes clear at different moments would otherwise
+    trickle away one drone at a time even though each flies a perfect
+    straight line.
+    """
+    def segments(index: int) -> list[tuple[Sequence[float], Sequence[float]]]:
+        """The corridor a drone will actually fly, as straight legs."""
+        route = routes.get(index) or [tuple(targets[index])]
+        points = [tuple(current_positions[index]), *(tuple(p) for p in route)]
+        return list(zip(points, points[1:]))
+
+    # Corridors already committed, by drone. User fixedPaths are in from the
+    # start; every cluster accepted below joins them.
+    reserved: dict[int, list[tuple[Sequence[float], Sequence[float]]]] = {
+        index: segments(index) for index in routes
+    }
+
+    groups: list[set[int]] = []
+    notes: list[str] = []
+    for cluster in clusters:
+        # The whole cluster is the lockstep unit, including members the user
+        # also gave an explicit fixedPath: those keep their drawn path (only
+        # unpinned members get a straight line) but still depart with the
+        # block. Dropping them here is what used to reduce a three-drone
+        # group to nothing.
+        members = sorted(cluster)
+        if len(members) < 2:
+            continue
+        corridors = {index: segments(index) for index in members}
+
+        def clash_between(
+            left: int, right: int, corridors=corridors, reserved=reserved
+        ) -> bool:
+            for a_start, a_end in corridors[left]:
+                for b_start, b_end in (reserved.get(right) or corridors[right]):
+                    if _pinned_corridors_deadlock(
+                        a_start, a_end, b_start, b_end, separation=separation
+                    ):
+                        return True
+            return False
+
+        clash: tuple[str, str] | None = None
+        for left, right in combinations(members, 2):
+            if clash_between(left, right):
+                clash = (f"drone-{left + 1}", f"drone-{right + 1}")
+                break
+        if clash is None:
+            for index in members:
+                for other in reserved:
+                    if other in cluster or not clash_between(index, other):
+                        continue
+                    clash = (f"drone-{index + 1}", f"drone-{other + 1}")
+                    break
+                if clash is not None:
+                    break
+
+        if clash is not None:
+            note = (
+                f"cluster {[f'drone-{i + 1}' for i in members]} was not flown "
+                f"in lockstep: its straight lines cannot all be flown "
+                f"({clash[0]} and {clash[1]} block each other whichever goes "
+                "first), so the block was planned normally and still reaches "
+                "the same formation"
+            )
+            notes.append(note)
+            if log:
+                log.warning(f"segment '{label}': {note}")
+            continue
+
+        for index in members:
+            routes.setdefault(index, [tuple(targets[index])])
+            reserved[index] = corridors[index]
+        groups.append(set(members))
+    return groups, notes
+
+
 def _detect_rigid_groups(
     current_positions: Sequence[tuple[float, float, float]],
     targets: Sequence[tuple[float, float, float]],
     *,
     excluded: set[int],
     static_positions: Sequence[Sequence[float]],
+    pinned_routes: Sequence[Sequence[Sequence[float]]] = (),
     separation: float = HARD_MIN_SEPARATION,
 ) -> dict[int, list[tuple[float, float, float]]]:
     """Find formation blocks translated as a unit and pin them to lockstep.
 
     Groups drones by identical displacement vector (mm resolution). A group
-    of two or more whose straight corridors all clear the parked drones
-    (including the vertical downwash pads) flies as a rigid cluster: every
-    member is pinned to its straight line, so the block translates in
-    lockstep with its internal geometry frozen — no member ever weaves
-    through the group. Blocked corridors fall back to normal planning.
+    of two or more flies as a rigid cluster — every member pinned to its
+    straight line, so the block translates in lockstep with its internal
+    geometry frozen and no member ever weaves through the group.
+
+    A group only earns its pins when its corridors clear everything that
+    cannot get out of the way: the parked drones (including their vertical
+    downwash pads), the ``pinned_routes`` the user fixed by hand, and the
+    corridors of groups already pinned here. Pinning is what takes away a
+    drone's right to detour, so two pinned corridors that cross leave the
+    solver no move to make and deadlock the whole segment. Groups that
+    clash fall back to normal planning, where the solver is free to route
+    them around whatever they clashed with; bigger blocks are offered the
+    pins first, since they gain the most from flying in lockstep.
     """
     groups: dict[tuple[int, int, int], list[int]] = {}
     for i, (pos, tgt) in enumerate(zip(current_positions, targets)):
@@ -669,29 +963,47 @@ def _detect_rigid_groups(
         key = (round(d[0] * 1000), round(d[1] * 1000), round(d[2] * 1000))
         groups.setdefault(key, []).append(i)
 
+    # Corridors that will not yield. User-pinned paths are in from the
+    # start; every group accepted below joins them.
+    reserved: list[tuple[Sequence[float], Sequence[float]]] = [
+        (route[i], route[i + 1])
+        for route in pinned_routes
+        for i in range(len(route) - 1)
+    ]
+
     pinned: dict[int, list[tuple[float, float, float]]] = {}
-    for members in groups.values():
+    for members in sorted(groups.values(), key=lambda m: (-len(m), m[0])):
         if len(members) < 2:
             continue
-        corridors_clear = all(
-            not any(
-                envelope_overlap_swept(
-                    list(current_positions[i]),
-                    list(targets[i]),
-                    list(obs),
-                    list(obs),
-                    margin=PLANNING_MARGIN,
-                    separation=separation,
-                    b_extends_below=DOWNWASH_ROUTE_CLEARANCE,
-                    b_extends_above=DOWNWASH_ROUTE_CLEARANCE,
-                )
-                for obs in static_positions
+        corridors = [(current_positions[i], targets[i]) for i in members]
+        blocked = any(
+            envelope_overlap_swept(
+                list(start),
+                list(end),
+                list(obs),
+                list(obs),
+                margin=PLANNING_MARGIN,
+                separation=separation,
+                b_extends_below=DOWNWASH_ROUTE_CLEARANCE,
+                b_extends_above=DOWNWASH_ROUTE_CLEARANCE,
             )
-            for i in members
+            for start, end in corridors
+            for obs in static_positions
+        ) or any(
+            _pinned_corridors_deadlock(
+                start, end, other_start, other_end, separation=separation
+            )
+            for start, end in corridors
+            for other_start, other_end in reserved
         )
-        if corridors_clear:
-            for i in members:
-                pinned[i] = [tuple(targets[i])]
+        if blocked:
+            continue
+        # Members share one displacement, so their corridors run parallel
+        # and can never close on each other — only cross-group clashes
+        # matter, hence reserving them after the group is accepted.
+        reserved.extend(corridors)
+        for i in members:
+            pinned[i] = [tuple(targets[i])]
     return pinned
 
 
@@ -947,73 +1259,65 @@ def _altitude_floor_error(groups: list[tuple[str, Sequence]], min_z: float):
     )
 
 
-# ── staging grid ─────────────────────────────────────────────────────────
+# ── staging layout ───────────────────────────────────────────────────────
 
 
-def _staging_grid_slots(
+def _staging_spread_scale(
+    hover_positions: Sequence[Sequence[float]], spacing: float
+) -> float:
+    """Smallest uniform horizontal scale that spreads the fleet to ``spacing``.
+
+    Separation is Chebyshev (see :data:`HARD_MIN_SEPARATION`), so a pair is
+    already clear when *any* axis reaches ``spacing``. Pairs separated by
+    altitude alone are therefore ignored, and the remaining pairs each need
+    ``spacing / max(|dx|, |dy|)``. Returns ``1.0`` when the take-off layout
+    is already spread out — nothing to do.
+
+    A pair sharing one horizontal spot cannot be spread apart at all; it is
+    skipped here and left to the ``staging-hover`` spacing validation, which
+    reports it with a proper message.
+    """
+    scale = 1.0
+    for a, b in combinations(hover_positions, 2):
+        if abs(a[2] - b[2]) >= spacing:
+            continue
+        horizontal = max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+        if horizontal <= 0.0 or horizontal >= spacing:
+            continue
+        scale = max(scale, (spacing + STAGING_SPREAD_GUARD) / horizontal)
+    return scale
+
+
+def _staging_spread_targets(
     hover_positions: Sequence[Sequence[float]], spacing: float
 ) -> list[tuple[float, float, float]]:
-    """Grid slot positions centered on the fleet's hover centroid.
+    """Spread the take-off layout out about drone-1 until it clears ``spacing``.
 
-    ``ceil(sqrt(n))`` columns, row-major, all at the highest hover altitude
-    so drones over uneven ground meet on one flat plane.
+    The fleet keeps the shape it took off in: every drone is pushed
+    horizontally away from drone-1 (the anchor) by one uniform scale factor,
+    the smallest that brings the tightest pair up to ``spacing``. Altitudes
+    are left alone.
+
+    Scaling about a fixed point only ever *increases* pairwise distances,
+    and does so monotonically along each drone's straight line, so the
+    staging move is collision-free by construction — no drone ever has to
+    weave past another. When the take-off layout already clears ``spacing``
+    the scale is 1 and the hover positions are returned unchanged, which
+    makes the staging segment a no-op.
     """
-    n = len(hover_positions)
-    cx = sum(p[0] for p in hover_positions) / n
-    cy = sum(p[1] for p in hover_positions) / n
-    altitude = max(p[2] for p in hover_positions)
+    scale = _staging_spread_scale(hover_positions, spacing)
+    if scale <= 1.0:
+        return [tuple(float(v) for v in point) for point in hover_positions]
 
-    cols = ceil(sqrt(n))
-    rows = ceil(n / cols)
-    slots: list[tuple[float, float, float]] = []
-    for r in range(rows):
-        for c in range(cols):
-            if len(slots) >= n:
-                break
-            slots.append(
-                (
-                    round(cx + (c - (cols - 1) / 2.0) * spacing, 4),
-                    round(cy + (r - (rows - 1) / 2.0) * spacing, 4),
-                    round(altitude, 4),
-                )
-            )
-    return slots
-
-
-def _assign_grid_slots(
-    positions: Sequence[Sequence[float]],
-    slots: Sequence[tuple[float, float, float]],
-) -> list[tuple[float, float, float]]:
-    """Assign each drone the closest free grid slot (greedy global matching).
-
-    Deterministic: candidate pairs are sorted by distance with the drone and
-    slot indices as tie-breakers, which keeps transition paths short and
-    mostly crossing-free.
-    """
-    n = len(positions)
-    candidates = sorted(
+    anchor = hover_positions[0]
+    return [
         (
-            (
-                (positions[i][0] - slots[j][0]) ** 2
-                + (positions[i][1] - slots[j][1]) ** 2
-                + (positions[i][2] - slots[j][2]) ** 2,
-                i,
-                j,
-            )
-            for i in range(n)
-            for j in range(n)
+            round(anchor[0] + (point[0] - anchor[0]) * scale, STAGING_ROUND_DIGITS),
+            round(anchor[1] + (point[1] - anchor[1]) * scale, STAGING_ROUND_DIGITS),
+            round(float(point[2]), STAGING_ROUND_DIGITS),
         )
-    )
-    drone_to_slot: dict[int, int] = {}
-    used_slots: set[int] = set()
-    for _dist, i, j in candidates:
-        if i in drone_to_slot or j in used_slots:
-            continue
-        drone_to_slot[i] = j
-        used_slots.add(j)
-        if len(drone_to_slot) == n:
-            break
-    return [slots[drone_to_slot[i]] for i in range(n)]
+        for point in hover_positions
+    ]
 
 
 # ── formation planning (runs in a worker thread) ─────────────────────────
@@ -1223,17 +1527,25 @@ def _extend_with_solver_run(
     label: str,
     constant_speed: bool = False,
     fixed_routes: Optional[dict[int, list[tuple[float, float, float]]]] = None,
+    lockstep_groups: Optional[list[set[int]]] = None,
     min_separation: float = HARD_MIN_SEPARATION,
     report_progress: bool = True,
+    tentative: bool = False,
 ) -> list[tuple[float, float, float]]:
     """Run one solver segment and append its steps to the combined timeline.
 
     ``constant_speed`` marks the appended steps as smoothing-exempt (used
     for staged stack-entry climbs whose speed must stay exactly constant).
     ``fixed_routes`` pins the listed drones to user-defined waypoint routes
-    for this segment (see :class:`PathSolver`).
+    for this segment and ``lockstep_groups`` makes the listed blocks advance
+    together or wait together (see :class:`PathSolver`).
 
-    Raises :class:`PlanningError` when the segment cannot be solved — the
+    ``tentative`` marks a run the caller is prepared to retry with looser
+    pins: a failure here is an internal step of the fallback ladder, not a
+    problem the operator has to act on, so it is logged at debug level. The
+    ladder's own warning (or the final re-raise) is what surfaces.
+
+    Raises :class:`PlanningError` when the segment cannot be solved -- the
     caller never sees a partial path.
     """
     num_drones = len(current_positions)
@@ -1284,12 +1596,14 @@ def _extend_with_solver_run(
         on_step=on_step,
         min_z=min_z,
         fixed_routes=fixed_routes,
+        lockstep_groups=lockstep_groups,
         min_separation=min_separation,
     )
     started_at = perf_counter()
     result = solver.solve()
     if log:
-        log.info(
+        emit = log.debug if (tentative and not result.success) else log.info
+        emit(
             f"segment '{label}': {'solved' if result.success else 'FAILED'} "
             f"in {perf_counter() - started_at:.1f}s "
             f"({result.total_steps} steps, {num_drones} drones)"
@@ -1351,10 +1665,11 @@ def _plan_formation_phases(
     """Plan synced formation phases with collision avoidance between phases.
 
     ``start_positions`` are the hover positions right after takeoff. When
-    ``staging_targets`` is given, a staging segment moves the fleet into the
-    grid before the first phase, and ``return_to_initial`` brings it back to
-    the hover positions at the end (so landing descends onto the original
-    ground spots).
+    ``staging_targets`` is given, a staging segment spreads the fleet out
+    before the first phase (a no-op when the take-off layout is already
+    spread out), and ``return_to_initial`` brings it back to the hover
+    positions at the end (so landing descends onto the original ground
+    spots).
 
     Raises :class:`PlanningError` on any unsolvable segment.
     """
@@ -1381,8 +1696,18 @@ def _plan_formation_phases(
     ]
     phase_summaries: list[dict] = []
     segment_counter = 0
+    # Set while the phase loop still has a looser fallback notch to drop to,
+    # so a failed attempt logs as debug instead of shouting FAILED at an
+    # operator who will never see the retry succeed a line later.
+    tentative_run = False
 
-    def summarize(name: str, arrival_step: int, hold_ms: int, hold_steps: int) -> None:
+    def summarize(
+        name: str,
+        arrival_step: int,
+        hold_ms: int,
+        hold_steps: int,
+        notes: Sequence[str] = (),
+    ) -> None:
         phase_summaries.append(
             {
                 "name": name,
@@ -1393,11 +1718,18 @@ def _plan_formation_phases(
                 "endStep": combined_steps[-1].step,
                 "endTimeMs": combined_steps[-1].step * duration_ms,
                 "success": True,
+                "warnings": list(notes),
             }
         )
 
     def run_stage(
-        targets, label: str, *, stage_step_size, constant_speed, fixed_routes=None
+        targets,
+        label: str,
+        *,
+        stage_step_size,
+        constant_speed,
+        fixed_routes=None,
+        lockstep_groups=None,
     ) -> None:
         nonlocal current_positions, segment_counter
         if _positions_match(current_positions, targets):
@@ -1414,11 +1746,19 @@ def _plan_formation_phases(
             label=label,
             constant_speed=constant_speed,
             fixed_routes=fixed_routes,
+            lockstep_groups=lockstep_groups,
             min_separation=min_separation,
+            tentative=tentative_run,
         )
         segment_counter += 1
 
-    def run_segment(targets, label: str, fixed_routes=None) -> None:
+    def run_segment(
+        targets,
+        label: str,
+        fixed_routes=None,
+        lockstep_groups=None,
+        auto_cluster: bool = True,
+    ) -> None:
         """One formation move: approach stage plus staged stack-entry climbs.
 
         Stacked lower drones stop :data:`STACK_APPROACH_OFFSET` below their
@@ -1448,12 +1788,26 @@ def _plan_formation_phases(
 
         # Automatic rigid-group clustering: formation blocks that translate
         # as a unit between the phases fly in lockstep on straight lines.
-        auto_pinned = _detect_rigid_groups(
-            [tuple(p) for p in current_positions],
-            [tuple(t) for t in targets],
-            excluded=stationary | set(combined_fixed),
-            static_positions=[current_positions[i] for i in stationary],
-            separation=min_separation,
+        # It is an optimisation, so a caller retrying a failed segment can
+        # switch it off — otherwise it would re-pin the very block that was
+        # just released and reproduce the failure.
+        auto_pinned = (
+            _detect_rigid_groups(
+                [tuple(p) for p in current_positions],
+                [tuple(t) for t in targets],
+                excluded=stationary | set(combined_fixed),
+                static_positions=[current_positions[i] for i in stationary],
+                # A user-pinned drone never detours either, so an
+                # auto-clustered corridor has to keep clear of its whole
+                # route, not just of where it starts.
+                pinned_routes=[
+                    [tuple(current_positions[did]), *(tuple(wp) for wp in route)]
+                    for did, route in combined_fixed.items()
+                ],
+                separation=min_separation,
+            )
+            if auto_cluster
+            else {}
         )
         if auto_pinned:
             combined_fixed.update(auto_pinned)
@@ -1478,13 +1832,71 @@ def _plan_formation_phases(
                 f"planning failed in segment '{label}': {exc}", details=exc.details
             ) from exc
 
-        run_stage(
-            approach_targets,
-            label,
-            stage_step_size=step_size,
-            constant_speed=False,
-            fixed_routes=combined_fixed or None,
+        # Only blocks that are still moving constrain each other; a member
+        # parked on its target holds nobody back.
+        moving_groups = [
+            group - stationary
+            for group in (lockstep_groups or [])
+            if len(group - stationary) > 1
+        ]
+
+        # Blocks that must vacate a spot before another block can take it
+        # are dispatched in that order: each wave flies while the blocks
+        # still to come hold where they are. Without it the two blocks race,
+        # whoever wins parks on the other's lane, and a pinned drone that
+        # can never detour is stuck behind it for good.
+        # Auto-detected rigid groups are blocks too: regroup them by the
+        # displacement they were detected on.
+        auto_groups: dict[tuple[int, int, int], set[int]] = {}
+        for index in auto_pinned:
+            key = tuple(
+                round((targets[index][axis] - current_positions[index][axis]) * 1000)
+                for axis in range(3)
+            )
+            auto_groups.setdefault(key, set()).add(index)
+        blocks = _pinned_blocks(
+            combined_fixed, [*moving_groups, *auto_groups.values()]
         )
+        waves = _dispatch_waves(
+            blocks,
+            current_positions=current_positions,
+            targets=targets,
+            separation=min_separation,
+        )
+        if len(waves) > 1 and log:
+            log.info(
+                f"segment '{label}': dispatching pinned blocks in "
+                f"{len(waves)} waves "
+                + " then ".join(
+                    str([f"drone-{i + 1}" for block in wave for i in sorted(block)])
+                    for wave in waves
+                )
+            )
+
+        held_back = {index for wave in waves[1:] for block in wave for index in block}
+        for wave_index, wave in enumerate(waves or [[]]):
+            released = {index for block in wave for index in block}
+            held_back -= released
+            stage_targets = [
+                tuple(current_positions[index]) if index in held_back else point
+                for index, point in enumerate(approach_targets)
+            ]
+            run_stage(
+                stage_targets,
+                label if len(waves) < 2 else f"{label}/wave-{wave_index + 1}",
+                stage_step_size=step_size,
+                constant_speed=False,
+                fixed_routes={
+                    index: route
+                    for index, route in combined_fixed.items()
+                    if index not in held_back
+                }
+                or None,
+                lockstep_groups=[
+                    group for group in moving_groups if not (group & held_back)
+                ]
+                or None,
+            )
         climb_step = STACK_CLIMB_SPEED * duration_sec
         for wave_index, wave in enumerate(climb_waves):
             wave_targets = list(current_positions)
@@ -1509,13 +1921,90 @@ def _plan_formation_phases(
         target_yaws = _phase_target_yaws(phase, num_drones)
 
         # Pinned routes for this transition: explicit fixedPaths plus every
-        # member of an explicit cluster (pinned to its straight line).
+        # member of an explicit cluster whose straight lines can be flown.
         pinned_routes = _phase_fixed_routes(phase, num_drones)
-        for cluster in _phase_cluster_indices(phase, num_drones):
-            for index in cluster:
-                pinned_routes.setdefault(index, [targets[index]])
+        hand_pinned = set(pinned_routes)
+        cluster_groups, cluster_notes = _pin_flyable_clusters(
+            pinned_routes,
+            _phase_cluster_indices(phase, num_drones),
+            current_positions=current_positions,
+            targets=targets,
+            separation=min_separation,
+            label=name,
+        )
 
-        run_segment(targets, name, fixed_routes=pinned_routes or None)
+        # Whether a block's straight lines are schedulable *alongside the
+        # rest of the fleet* is the solver's own greedy, per-step decision —
+        # geometry alone cannot predict it (a block can have a valid flight
+        # order on paper that the solver never finds). So try the segment
+        # with everything pinned and, if it will not solve, give up the
+        # pins the *server* chose rather than fail a show whose formations
+        # are all perfectly legal, loosening one notch at a time:
+        #
+        #   1. everything — hand-drawn paths, cluster pins, lockstep timing
+        #      and automatic rigid-group clustering
+        #   2. release the user's clusters (kept: hand-drawn paths + auto)
+        #   3. also switch off automatic clustering — otherwise it re-pins
+        #      the very block just released and reproduces the failure
+        #
+        # Only the drone paths the user drew by hand survive to the end, so
+        # a failure at the last notch is genuinely about those and is
+        # reported as such.
+        hand_only = {
+            index: route
+            for index, route in pinned_routes.items()
+            if index in hand_pinned
+        }
+        attempts: list[tuple[dict, list[set[int]] | None, bool, str]] = [
+            (pinned_routes, cluster_groups or None, True, "")
+        ]
+        if cluster_groups:
+            attempts.append((hand_only, None, True, "the cluster(s) were released"))
+        attempts.append(
+            (
+                hand_only,
+                None,
+                False,
+                "the cluster(s) and the automatically detected rigid groups "
+                "were released",
+            )
+        )
+
+        for attempt, (routes, groups, auto, _label) in enumerate(attempts):
+            # A failed attempt appends nothing, but a segment can fail
+            # *after* its approach stage, so rewind before retrying.
+            checkpoint = (list(current_positions), len(combined_steps), segment_counter)
+            tentative_run = attempt < len(attempts) - 1
+            try:
+                run_segment(
+                    targets,
+                    name,
+                    fixed_routes=routes or None,
+                    lockstep_groups=groups,
+                    auto_cluster=auto,
+                )
+                break
+            except PlanningError as exc:
+                if attempt == len(attempts) - 1:
+                    raise
+                # Describe the notch we are about to drop to, not the one
+                # that just failed. The solver's own reason goes to debug:
+                # it names a conflict that the next notch is about to
+                # dissolve, so repeating it as a warning only reads as an
+                # unresolved error.
+                note = (
+                    f"{attempts[attempt + 1][3]}: the solver could not "
+                    f"schedule their straight lines alongside the rest of the "
+                    "fleet, so those drones were planned normally and "
+                    "still reach the same formation"
+                )
+                cluster_notes.append(note)
+                if log:
+                    log.warning(f"segment '{name}': {note}")
+                    log.debug(f"segment '{name}': attempt {attempt + 1} failed: {exc}")
+                current_positions, checkpoint_steps, segment_counter = checkpoint
+                del combined_steps[checkpoint_steps:]
+        tentative_run = False
         arrival_step = combined_steps[-1].step
 
         hold_ms = int(phase.get("holdMs", 0))
@@ -1549,7 +2038,7 @@ def _plan_formation_phases(
                 max_yaw_rate_deg_s=max_yaw_rate_deg_s,
             )
 
-        summarize(name, arrival_step, hold_ms, hold_steps)
+        summarize(name, arrival_step, hold_ms, hold_steps, cluster_notes)
 
     # ── return to the staging hover positions ────────────────────────────
     final_targets = (
@@ -2094,8 +2583,9 @@ async def plan():
     min_separation = clamp_separation(min_separation)
 
     # Staging parameters: hover altitude above each drone's ground position
-    # and the grid spacing. ``initial_altitude`` is accepted as a legacy
-    # alias for the staging altitude.
+    # and the spacing the take-off layout is spread out to.
+    # ``initial_altitude`` is accepted as a legacy alias for the staging
+    # altitude.
     staging_grid: bool = bool(body.get("staging_grid", uses_phases))
     staging_altitude: float = float(
         body.get(
@@ -2162,16 +2652,24 @@ async def plan():
             for point in ground_positions
         ]
         if staging_grid:
-            grid_slots = _staging_grid_slots(hover_positions, grid_spacing)
-            staging_targets = _assign_grid_slots(hover_positions, grid_slots)
+            staging_targets = _staging_spread_targets(hover_positions, grid_spacing)
+            if log:
+                if _positions_match(hover_positions, staging_targets):
+                    log.info(
+                        "staging: take-off layout already clears "
+                        f"{grid_spacing} m -- keeping it as flown"
+                    )
+                else:
+                    log.info(
+                        f"staging: spreading the take-off layout to {grid_spacing} m "
+                        "about drone-1"
+                    )
         else:
-            grid_slots = []
             staging_targets = None
         planning_start = hover_positions
     else:
         ground_positions = None
         hover_positions = []
-        grid_slots = []
         staging_targets = None
         planning_start = initial
 
@@ -2451,6 +2949,8 @@ async def plan():
             "altitude": staging_altitude,
             "grid_spacing": grid_spacing,
             "hover_positions": hover_positions,
+            # Legacy key name: these are the spread-out staging positions,
+            # which equal ``hover_positions`` when no spreading was needed.
             "grid_slots": [list(slot) for slot in (staging_targets or [])],
         }
 
@@ -2653,7 +3153,7 @@ async def _upload_show_dicts(
         if log:
             log.warning(
                 f"Only {len(uav_ids)} UAV(s) available but the show has "
-                f"{num_drones} drones — uploading to available UAVs only"
+                f"{num_drones} drones -- uploading to available UAVs only"
             )
 
     details: dict = {}
@@ -2661,7 +3161,7 @@ async def _upload_show_dicts(
 
     for idx, show_dict in enumerate(show_dicts):
         if idx >= len(uav_ids):
-            details[f"drone-{idx + 1}"] = "skipped — no UAV available"
+            details[f"drone-{idx + 1}"] = "skipped -- no UAV available"
             continue
 
         uav_id = uav_ids[idx]

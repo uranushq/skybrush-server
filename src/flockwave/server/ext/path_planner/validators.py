@@ -236,7 +236,7 @@ class MinFlightAltitudeValidator(PathValidator):
             code="MIN_FLIGHT_ALTITUDE",
             severity=SEVERITY_ERROR,
             message=(
-                f"Path 컴파일 오류: invalid height — "
+                f"Path 컴파일 오류: invalid height -- "
                 f"{len(violations)} waypoint(s) below the minimum show "
                 f"altitude ({min_alt} m, {source_msg}). Increase the z "
                 f"coordinate of the listed waypoints."
