@@ -108,14 +108,19 @@ from .collision_volume import (
 from .converter import (
     _THICKNESS_MAX,
     _THICKNESS_MIN,
+    _ramp_from_smoothing,
+    DEFAULT_ACCEL_SHAPE,
     DEFAULT_CRUISE_SPEED_M_S,
+    DEFAULT_DECEL_SHAPE,
     DEFAULT_LANDING_SPEED_M_S,
     DEFAULT_MAX_YAW_RATE_DEG_S,
     DEFAULT_PROFILE_EXP,
     DEFAULT_PROFILE_LOG,
     DEFAULT_TAKEOFF_SPEED_M_S,
     DEFAULT_VELOCITY_SMOOTHING,
+    RAMP_SHAPES,
     TrajectoryLimitError,
+    VelocityProfile,
     build_delivery_show_dicts,
     build_show_dicts,
     duration_ms_for_cruise_speed,
@@ -162,37 +167,124 @@ log: Optional[Logger] = None
 velocity_smoothing: float = DEFAULT_VELOCITY_SMOOTHING
 
 
-def _parse_profile_knobs(body: dict):
-    """Parse the optional exp/log ramp-curvature knobs of the velocity profile.
+def _parse_profile_knobs(body: dict, smoothing: float = DEFAULT_VELOCITY_SMOOTHING):
+    """Parse the velocity-profile knobs of a request.
 
-    Returns ``(profile_exp, profile_log, error_response)`` where the error
-    response is ``None`` on success.
+    Returns ``(profile_exp, profile_log, profile, error_response)`` where the
+    error response is ``None`` on success.
+
+    The legacy pair still describes the historical symmetric exp-in / log-out
+    shape, and is what the returned ``profile`` falls back to. The per-side
+    fields override it independently::
+
+        profile_accel_shape   exp | log | linear | none   (default exp)
+        profile_accel_curve   _THICKNESS_MIN .. _MAX      (default profile_exp)
+        profile_accel_width   0 .. 1                      (default from smoothing)
+        profile_decel_shape   exp | log | linear | none   (default log)
+        profile_decel_curve   _THICKNESS_MIN .. _MAX      (default profile_log)
+        profile_decel_width   0 .. 1                      (default from smoothing)
+
+    The plateau (constant-speed) region takes whatever the two ramps leave, so
+    the widths may sum to at most 1. Both ramps disabled — widths 0, or shapes
+    set to ``none`` — means a single constant-speed run, exactly what
+    ``velocity_smoothing = 0`` already means.
+
+    Note a ``decel`` ramp evaluates its basis backwards in time, so ``exp`` on
+    the deceleration side is the gentle-at-arrival choice and ``log`` brakes
+    hardest at arrival.
     """
+
+    def bad(message: str):
+        return None, None, None, (jsonify({"error": message}), 400)
+
+    def number(key: str, default: float, low: float, high: float):
+        """Parse one optional numeric field, or return an error tuple."""
+        raw = body.get(key)
+        if raw is None:
+            return default, None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None, bad(f"'{key}' must be a number")
+        if not (low <= value <= high):
+            return None, bad(f"'{key}' must be between {low} and {high}")
+        return value, None
+
     try:
         k_exp = float(body.get("profile_exp", DEFAULT_PROFILE_EXP))
         k_log = float(body.get("profile_log", DEFAULT_PROFILE_LOG))
     except (TypeError, ValueError):
-        return (
-            None,
-            None,
-            (jsonify({"error": "'profile_exp'/'profile_log' must be numbers"}), 400),
-        )
+        return bad("'profile_exp'/'profile_log' must be numbers")
     for name, value in (("profile_exp", k_exp), ("profile_log", k_log)):
         if not (_THICKNESS_MIN <= value <= _THICKNESS_MAX):
-            return (
-                None,
-                None,
-                (
-                    jsonify(
-                        {
-                            "error": f"'{name}' must be between "
-                            f"{_THICKNESS_MIN} and {_THICKNESS_MAX}"
-                        }
-                    ),
-                    400,
-                ),
+            return bad(
+                f"'{name}' must be between {_THICKNESS_MIN} and {_THICKNESS_MAX}"
             )
-    return k_exp, k_log, None
+
+    default_width = _ramp_from_smoothing(smoothing)
+    shapes: dict[str, str] = {}
+    curves: dict[str, float] = {}
+    widths: dict[str, float] = {}
+    for side, default_shape, legacy_curve in (
+        ("accel", DEFAULT_ACCEL_SHAPE, k_exp),
+        ("decel", DEFAULT_DECEL_SHAPE, k_log),
+    ):
+        raw_shape = body.get(f"profile_{side}_shape")
+        if raw_shape is None:
+            shapes[side] = default_shape
+        else:
+            name = str(raw_shape).strip().lower()
+            if name not in RAMP_SHAPES:
+                return bad(
+                    f"'profile_{side}_shape' must be one of {', '.join(RAMP_SHAPES)}"
+                )
+            shapes[side] = name
+
+        curve, err = number(
+            f"profile_{side}_curve", legacy_curve, _THICKNESS_MIN, _THICKNESS_MAX
+        )
+        if err is not None:
+            return err
+        curves[side] = curve
+
+        width, err = number(f"profile_{side}_width", default_width, 0.0, 1.0)
+        if err is not None:
+            return err
+        widths[side] = width
+
+    # A "none" ramp contributes no width, so it can never push the plateau
+    # negative — only explicitly requested widths are checked against the sum.
+    used = [
+        0.0 if shapes[side] == "none" else widths[side] for side in ("accel", "decel")
+    ]
+    if sum(used) > 1.0 + 1e-9:
+        return bad(
+            "'profile_accel_width' + 'profile_decel_width' must be at most 1 "
+            f"(got {used[0]:g} + {used[1]:g}); the plateau takes the rest"
+        )
+
+    profile = VelocityProfile(
+        accel_shape=shapes["accel"],
+        accel_curve=curves["accel"],
+        accel_width=widths["accel"],
+        decel_shape=shapes["decel"],
+        decel_curve=curves["decel"],
+        decel_width=widths["decel"],
+    )
+    return k_exp, k_log, profile, None
+
+
+def _profile_report(profile: VelocityProfile) -> dict:
+    """Serializable echo of the profile actually applied, for API responses."""
+    return {
+        "accel_shape": profile.accel_shape,
+        "accel_curve": profile.accel_curve,
+        "accel_width": profile.accel_width,
+        "plateau_width": profile.plateau_width,
+        "decel_shape": profile.decel_shape,
+        "decel_curve": profile.decel_curve,
+        "decel_width": profile.decel_width,
+    }
 
 # Base directory for generated files; requests may only choose subdirectories
 # of this. Empty string means "parent of the server's working directory".
@@ -2259,7 +2351,9 @@ async def _handle_path_delivery(body: dict):
     smoothing = float(body.get("velocity_smoothing", velocity_smoothing))
     if not (0.0 <= smoothing <= 1.0):
         return jsonify({"error": "'velocity_smoothing' must be between 0 and 1"}), 400
-    profile_exp, profile_log, profile_err = _parse_profile_knobs(body)
+    profile_exp, profile_log, velocity_profile, profile_err = _parse_profile_knobs(
+        body, smoothing
+    )
     if profile_err is not None:
         return profile_err
     # Delivery paths honour the same separation floor as generated plans;
@@ -2356,6 +2450,7 @@ async def _handle_path_delivery(body: dict):
             geofence=body.get("geofence"),
             profile_exp=profile_exp,
             profile_log=profile_log,
+            profile=velocity_profile,
         )
 
     try:
@@ -2379,6 +2474,7 @@ async def _handle_path_delivery(body: dict):
             "applied": applied_smoothing,
             "profile_exp": profile_exp,
             "profile_log": profile_log,
+            "profile": _profile_report(velocity_profile),
         },
     }
     if takeoff_time_adjusted:
@@ -2550,7 +2646,9 @@ async def plan():
         return jsonify({"error": "'max_yaw_rate_deg_s' must be > 0"}), 400
     if not (0.0 <= smoothing <= 1.0):
         return jsonify({"error": "'velocity_smoothing' must be between 0 and 1"}), 400
-    profile_exp, profile_log, profile_err = _parse_profile_knobs(body)
+    profile_exp, profile_log, velocity_profile, profile_err = _parse_profile_knobs(
+        body, smoothing
+    )
     if profile_err is not None:
         return profile_err
 
@@ -2864,6 +2962,7 @@ async def plan():
             geofence=body.get("geofence"),
             profile_exp=profile_exp,
             profile_log=profile_log,
+            profile=velocity_profile,
         )
 
     _progress_update(segment="build+verify", percent=None, step=None)
@@ -2909,6 +3008,7 @@ async def plan():
         "applied": applied_smoothing,
         "profile_exp": profile_exp,
         "profile_log": profile_log,
+        "profile": _profile_report(velocity_profile),
     }
     output["timing"] = {
         "duration_ms": duration_ms,
@@ -2928,7 +3028,7 @@ async def plan():
         # place phase markers without re-deriving the takeoff profile.
         takeoff_duration_sec = vertical_transit_duration_sec(
             staging_altitude, takeoff_speed, applied_smoothing,
-            profile_exp, profile_log,
+            profile_exp, profile_log, profile=velocity_profile,
         )
         show_offset_sec = round(takeoff_time + takeoff_duration_sec, 4)
         for summary in phase_summaries:
