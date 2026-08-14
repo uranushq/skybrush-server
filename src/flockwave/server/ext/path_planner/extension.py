@@ -300,6 +300,11 @@ MIN_TAKEOFF_TIME = 5.0
 DEFAULT_STAGING_ALTITUDE = 5.0
 DEFAULT_GRID_SPACING = 2.0
 
+# Landing default: when 'landing_grid' is requested, spread the final return
+# leg out to at least this spacing (same spread solver as take-off staging)
+# instead of returning to the original take-off hover spots.
+DEFAULT_LANDING_SPACING = 4.0
+
 # Staging coordinates are rounded to STAGING_ROUND_DIGITS decimals for a
 # readable API response; rounding can shave up to 1e-4 m off a pair, so the
 # spread aims this far past the requested spacing to stay clear of the
@@ -1752,6 +1757,7 @@ def _plan_formation_phases(
     initial_yaws: list[float] | None = None,
     max_yaw_rate_deg_s: float = DEFAULT_MAX_YAW_RATE_DEG_S,
     staging_targets: Optional[list[tuple[float, float, float]]] = None,
+    landing_targets: Optional[list[tuple[float, float, float]]] = None,
     min_separation: float = HARD_MIN_SEPARATION,
 ) -> tuple[SolverResult, list[dict]]:
     """Plan synced formation phases with collision avoidance between phases.
@@ -1761,7 +1767,10 @@ def _plan_formation_phases(
     before the first phase (a no-op when the take-off layout is already
     spread out), and ``return_to_initial`` brings it back to the hover
     positions at the end (so landing descends onto the original ground
-    spots).
+    spots). ``landing_targets``, when given, replaces those hover positions
+    for the final return leg only (e.g. a wider spread computed the same way
+    as ``staging_targets``), so landing touches down under wherever that
+    leg ends instead of directly below the original take-off spot.
 
     Raises :class:`PlanningError` on any unsolvable segment.
     """
@@ -2133,13 +2142,21 @@ def _plan_formation_phases(
         summarize(name, arrival_step, hold_ms, hold_steps, cluster_notes)
 
     # ── return to the staging hover positions ────────────────────────────
+    # landing_targets, when given, spreads the final hover leg out (same
+    # solver as the take-off staging spread) instead of returning to the
+    # original, possibly tight, take-off hover spots.
+    return_targets = (
+        [tuple(t) for t in landing_targets]
+        if landing_targets is not None
+        else original_initials
+    )
     final_targets = (
-        original_initials
+        return_targets
         if return_to_initial
         else [tuple(t) for t in _phase_targets(phases[-1], num_drones)]
     )
     if return_to_initial:
-        run_segment(original_initials, "return-to-start")
+        run_segment(return_targets, "return-to-start")
         arrival_step = combined_steps[-1].step
         if not _yaw_lists_match(current_yaws, original_yaws):
             current_yaws = _append_yaw_transition(
@@ -2721,6 +2738,40 @@ async def plan():
             400,
         )
 
+    # Landing parameters: opt-in wider spread for the final return-to-start
+    # leg, independent of the take-off staging spacing above. Off by default
+    # so existing callers keep landing on their original take-off spot.
+    landing_grid: bool = bool(body.get("landing_grid", False))
+    landing_spacing: float = float(
+        body.get("landing_spacing", DEFAULT_LANDING_SPACING)
+    )
+    if landing_grid and not uses_phases:
+        return (
+            jsonify(
+                {
+                    "error": (
+                        "'landing_grid' is only supported together with "
+                        "'phases'; point-to-point requests have no "
+                        "return-to-start leg"
+                    )
+                }
+            ),
+            400,
+        )
+    if landing_grid and landing_spacing < min_separation:
+        return (
+            jsonify(
+                {
+                    "error": (
+                        f"'landing_spacing' of {landing_spacing} m is below "
+                        f"the required minimum separation of "
+                        f"{min_separation:.2f} m"
+                    )
+                }
+            ),
+            400,
+        )
+
     # --- takeoff time & output directory ---
     takeoff_time: float = float(body.get("takeoff_time", 0.0))
     takeoff_time_adjusted = takeoff_time < MIN_TAKEOFF_TIME
@@ -2764,11 +2815,27 @@ async def plan():
                     )
         else:
             staging_targets = None
+        if landing_grid:
+            landing_targets = _staging_spread_targets(hover_positions, landing_spacing)
+            if log:
+                if _positions_match(hover_positions, landing_targets):
+                    log.info(
+                        "landing: take-off layout already clears "
+                        f"{landing_spacing} m -- returning to the original spot"
+                    )
+                else:
+                    log.info(
+                        f"landing: spreading the return leg to {landing_spacing} m "
+                        "about drone-1"
+                    )
+        else:
+            landing_targets = None
         planning_start = hover_positions
     else:
         ground_positions = None
         hover_positions = []
         staging_targets = None
+        landing_targets = None
         planning_start = initial
 
     # --- pre-flight validation -------------------------------------------
@@ -2843,6 +2910,9 @@ async def plan():
         floor_groups.append(("staging-hover", hover_positions))
         if staging_targets is not None:
             spacing_groups.append(("staging-grid", staging_targets))
+        if landing_targets is not None:
+            spacing_groups.append(("landing-grid", landing_targets))
+            floor_groups.append(("landing-grid", landing_targets))
         for phase_index, phase in enumerate(phases):
             targets = _phase_targets(phase, len(initial))
             label = f"phases[{phase_index}]:{phase.get('name') or f'phase-{phase_index + 1}'}"
@@ -2893,6 +2963,7 @@ async def plan():
                 initial_yaws=initial_yaws,
                 max_yaw_rate_deg_s=max_yaw_rate_deg_s,
                 staging_targets=staging_targets,
+                landing_targets=landing_targets,
                 min_separation=min_separation,
             )
         solver = PathSolver(
@@ -3052,6 +3123,11 @@ async def plan():
             # Legacy key name: these are the spread-out staging positions,
             # which equal ``hover_positions`` when no spreading was needed.
             "grid_slots": [list(slot) for slot in (staging_targets or [])],
+        }
+        output["landing"] = {
+            "enabled": landing_targets is not None,
+            "spacing": landing_spacing,
+            "grid_slots": [list(slot) for slot in (landing_targets or [])],
         }
 
     # --- save Skybrush files (post-verification only) -----------------------

@@ -2,9 +2,13 @@
 
 Endpoints (see ``JR_precise_timing/firmware/dr_node/main/http_api.c``)::
 
-    GET  http://<ip>/health       -> board status JSON
     POST http://<ip>/reboot       -> {"ok": true, "action": "reboot"}
     POST http://<ip>/redownload   -> {"ok": true, "action": "redownload"}
+
+Health is no longer part of this on-board HTTP API -- the board pushes its
+status over UDP instead (see ``health_udp.py``), since polling ~30 boards'
+``/health`` synchronously over HTTP was the source of the "no telem"
+bottleneck this replaced.
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ from typing import Any
 
 import httpx
 
-__all__ = ("JRBoardError", "get_health", "post_reboot", "post_redownload")
+__all__ = ("JRBoardError", "post_reboot", "post_redownload")
 
 
 class JRBoardError(RuntimeError):
@@ -39,11 +43,6 @@ async def _request(method: str, ip: str, path: str, *, timeout: float) -> Any:
     except ValueError:
         # Some firmware actions reply with a bare string; surface it as-is.
         return {"raw": response.text}
-
-
-async def get_health(ip: str, *, timeout: float = 5.0) -> Any:
-    """Fetch a JR board's ``/health`` status JSON."""
-    return await _request("GET", ip, "/health", timeout=timeout)
 
 
 async def post_reboot(ip: str, *, timeout: float = 5.0) -> Any:

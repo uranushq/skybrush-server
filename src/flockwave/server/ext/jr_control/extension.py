@@ -3,9 +3,14 @@
 Endpoints (mounted under ``/api/v1/jr`` by default)
 ---------------------------------------------------
 POST ``/arm``                broadcast a JRPT ARM (or other) sync packet over UDP
-GET  ``/health/<ip>``        proxy a board's ``GET /health``
+GET  ``/health/<ip>``        latest status pushed by the board over health UDP
 POST ``/reboot/<ip>``        proxy a board's ``POST /reboot``
 POST ``/redownload/<ip>``    proxy a board's ``POST /redownload``
+
+Health is received passively: boards push their status over UDP (port
+``health_port``, default 16550) instead of being polled over HTTP, so
+``/health/<ip>`` just returns whatever was last received -- see
+``health_udp.py``.
 
 ``POST /arm`` request body (JSON, all optional)::
 
@@ -30,13 +35,14 @@ from logging import Logger
 from typing import TYPE_CHECKING, Optional
 
 from quart import Blueprint, jsonify, request
-from trio import sleep_forever, to_thread
+from trio import to_thread
 
 from flockwave.server.ext.base import Extension
 from flockwave.server.utils import overridden
 
 from .arm import broadcast_arm
-from .health import JRBoardError, get_health, post_reboot, post_redownload
+from .health import JRBoardError, post_reboot, post_redownload
+from .health_udp import get_cached_health, run_listener as run_health_udp_listener
 
 if TYPE_CHECKING:
     from flockwave.server.app import SkybrushServer
@@ -89,7 +95,7 @@ async def arm_endpoint():
 @blueprint.route("/health/<ip>", methods=["GET"])
 async def health_endpoint(ip: str):
     try:
-        return jsonify(await get_health(ip))
+        return jsonify(get_cached_health(ip))
     except JRBoardError as exc:
         return jsonify({"error": str(exc)}), 502
 
@@ -115,13 +121,16 @@ class JRControlExtension(Extension):
 
     async def run(self, app, configuration, logger):  # type: ignore[override]
         route = configuration.get("route", "/api/v1/jr")
+        health_host = configuration.get("health_host", "")
+        health_port = int(configuration.get("health_port", 16550))
         http_server = app.import_api("http_server")
 
         with ExitStack() as stack:
             stack.enter_context(overridden(globals(), app=app, log=logger))
             stack.enter_context(http_server.mounted(blueprint, path=route))
             logger.info(f"JR-control API mounted at {route}")
-            await sleep_forever()
+            # Blocks forever, receiving boards' health-UDP pushes.
+            await run_health_udp_listener(health_host, health_port, log=logger)
 
 
 construct = JRControlExtension
@@ -138,6 +147,26 @@ schema = {
                 "the HTTP namespace of the server"
             ),
             "default": "/api/v1/jr",
+        },
+        "health_host": {
+            "type": "string",
+            "title": "Health UDP listen host",
+            "description": (
+                "IP address to listen on for JR boards' health UDP pushes. "
+                "Use an empty string to listen on all interfaces."
+            ),
+            "default": "",
+        },
+        "health_port": {
+            "type": "integer",
+            "title": "Health UDP listen port",
+            "description": (
+                "UDP port that JR boards push their health status to (must "
+                "match CFG_HEALTH_UDP_PORT in the board firmware's config.h)."
+            ),
+            "minimum": 1,
+            "maximum": 65535,
+            "default": 16550,
         },
     }
 }
