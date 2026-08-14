@@ -4,13 +4,15 @@ Endpoints (mounted under ``/api/v1/jr`` by default)
 ---------------------------------------------------
 POST ``/arm``                broadcast a JRPT ARM (or other) sync packet over UDP
 GET  ``/health/<ip>``        latest status pushed by the board over health UDP
-POST ``/reboot/<ip>``        proxy a board's ``POST /reboot``
-POST ``/redownload/<ip>``    proxy a board's ``POST /redownload``
+POST ``/reboot/<ip>``        send a UDP reboot command, wait for the board's ack
+POST ``/redownload/<ip>``    send a UDP redownload command, wait for the board's ack
 
-Health is received passively: boards push their status over UDP (port
-``health_port``, default 16550) instead of being polled over HTTP, so
-``/health/<ip>`` just returns whatever was last received -- see
-``health_udp.py``.
+The board has no HTTP server at all -- everything in this extension talks to
+it over UDP on ``health_port`` (default 16550, must match the firmware's
+``CFG_HEALTH_UDP_PORT``): boards push their status passively (see
+``health_udp.py``, consumed by ``/health/<ip>``), and ``/reboot``,
+``/redownload`` actively send a small JSON command to that same port and
+wait for the board's ack (see ``commands.py``).
 
 ``POST /arm`` request body (JSON, all optional)::
 
@@ -41,7 +43,7 @@ from flockwave.server.ext.base import Extension
 from flockwave.server.utils import overridden
 
 from .arm import broadcast_arm
-from .health import JRBoardError, post_reboot, post_redownload
+from .commands import JRBoardError, post_reboot, post_redownload
 from .health_udp import get_cached_health, run_listener as run_health_udp_listener
 
 if TYPE_CHECKING:
@@ -51,6 +53,9 @@ blueprint = Blueprint("jr_control", __name__)
 
 app: Optional["SkybrushServer"] = None
 log: Optional[Logger] = None
+#: UDP port boards listen on for reboot/redownload commands -- set from the
+#: extension's own `health_port` configuration when it starts.
+health_port: int = 16550
 
 
 @blueprint.route("/arm", methods=["POST"])
@@ -103,7 +108,7 @@ async def health_endpoint(ip: str):
 @blueprint.route("/reboot/<ip>", methods=["POST"])
 async def reboot_endpoint(ip: str):
     try:
-        return jsonify(await post_reboot(ip))
+        return jsonify(await post_reboot(ip, port=health_port))
     except JRBoardError as exc:
         return jsonify({"error": str(exc)}), 502
 
@@ -111,7 +116,7 @@ async def reboot_endpoint(ip: str):
 @blueprint.route("/redownload/<ip>", methods=["POST"])
 async def redownload_endpoint(ip: str):
     try:
-        return jsonify(await post_redownload(ip))
+        return jsonify(await post_redownload(ip, port=health_port))
     except JRBoardError as exc:
         return jsonify({"error": str(exc)}), 502
 
@@ -126,7 +131,9 @@ class JRControlExtension(Extension):
         http_server = app.import_api("http_server")
 
         with ExitStack() as stack:
-            stack.enter_context(overridden(globals(), app=app, log=logger))
+            stack.enter_context(
+                overridden(globals(), app=app, log=logger, health_port=health_port)
+            )
             stack.enter_context(http_server.mounted(blueprint, path=route))
             logger.info(f"JR-control API mounted at {route}")
             # Blocks forever, receiving boards' health-UDP pushes.

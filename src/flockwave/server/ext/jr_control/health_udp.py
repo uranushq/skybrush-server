@@ -19,7 +19,7 @@ from typing import Any, Optional
 from flockwave.networking import create_socket
 from trio.socket import SOCK_DGRAM
 
-from .health import JRBoardError
+from .commands import JRBoardError
 
 __all__ = ("get_cached_health", "run_listener")
 

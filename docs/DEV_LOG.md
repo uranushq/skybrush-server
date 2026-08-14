@@ -1,5 +1,24 @@
 <!-- ENTRIES -->
 
+## 2026-08-14 18:01:26 +0900 — `f1eca657` 0814
+
+_branch: dev · author: directorBae <bjw020615@gmail.com>_
+
+**요약**: JR 보드 상태 조회를 HTTP 폴링에서 UDP 푸시 수신 방식으로 전환하고, 경로 계획기에 착륙 시 넓은 간격으로 펼쳐 내리는 옵션을 추가했다.
+
+**주요 변경점**:
+- `jr_control`에 `health_udp.py` 신설: 보드가 UDP(기본 16550 포트)로 밀어주는 상태를 캐시하고, `/health/<ip>`는 최근 수신값을 반환(15초 초과 시 stale 처리).
+- 확장에서 기존 동기 HTTP `get_health` 폴링 제거, `run()`이 `sleep_forever` 대신 UDP 리스너를 상시 실행. `health_host`/`health_port` 설정 스키마 추가.
+- `health.py`에서 `/health` 프록시 삭제(reboot·redownload만 유지).
+- `path_planner`에 `landing_targets` 도입 및 `DEFAULT_LANDING_SPACING=4.0`: 착륙 복귀 구간을 원래 이륙 지점 대신 이륙 스테이징과 동일한 솔버로 넓게 펼쳐 착지.
+
+**의미/영향**: 약 30대 보드를 HTTP로 동기 폴링하던 구조가 "no telem" 병목·연결 끊김의 원인이었는데, 이를 보드 주도 UDP 푸시로 바꿔 텔레메트리 지연과 부하를 줄였다. 착륙 간격 옵션은 좁은 이륙 배치에서도 안전한 착지 분산을 가능하게 해 실제 군집 운용 안정성을 높인다.
+
+**주의/리스크**: UDP는 비신뢰 전송이라 패킷 유실 시 stale 판정으로 "unreachable"이 될 수 있고, 서버 리스너 포트가 보드 펌웨어의 `CFG_HEALTH_UDP_PORT`와 일치해야 한다. 또한 캐시가 프로세스 메모리에 저장돼 재시작 시 보드가 다시 보고할 때까지 상태가 비며, 브로드캐스트/멀티 보드 환경에서 인증 없는 UDP 수신의 신뢰성 검증이 필요하다.
+
+---
+
+
 ## 2026-07-03 17:08:21 +0900 — `3e63e3ad` claude commit 분석 완료
 
 _branch: dev · author: directorBae <bjw020615@gmail.com>_
