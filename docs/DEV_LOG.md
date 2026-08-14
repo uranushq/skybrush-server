@@ -1,5 +1,24 @@
 <!-- ENTRIES -->
 
+## 2026-08-14 18:08:37 +0900 — `30936ebe` ..
+
+_branch: dev · author: directorBae <bjw020615@gmail.com>_
+
+**요약**: JR 보드의 reboot/redownload 제어를 온보드 HTTP API에서 UDP 명령·ack 방식으로 전환해, 보드가 HTTP 서버를 완전히 없앤 구조를 마무리했다.
+
+**주요 변경점**:
+- `commands.py` 신설: `reboot`/`redownload`를 헬스 UDP 포트(기본 16550)로 JSON 데이터그램 전송 후 보드 ack를 대기(`to_thread`로 블로킹 소켓을 이벤트 루프 밖에서 실행, 기본 timeout 3초).
+- 기존 HTTP 프록시 `health.py` 삭제, `health_udp.py`의 `JRBoardError` import를 `commands`로 이관.
+- `extension.py`에서 reboot/redownload 엔드포인트가 UDP 명령을 쓰도록 변경하고, 모듈 전역 `health_port`(설정에서 주입)를 명령 전송에 재사용(`overridden`으로 전달). 문서화 주석도 "보드에 HTTP 서버 없음"으로 갱신.
+- `DEV_LOG.md`에 직전 커밋(`f1eca657`) 분석 항목 추가.
+
+**의미/영향**: 앞선 커밋에서 헬스 조회를 UDP 푸시로 바꾼 데 이어, 이번엔 제어 명령까지 UDP로 통일해 보드의 HTTP 스택 의존을 완전히 제거했다. 이로써 상태 수신·제어가 단일 포트/프로토콜로 일원화되어 "no telem" 병목을 유발하던 HTTP 폴링 구조가 정리되고, 펌웨어 측 부담과 코드 경로가 단순해졌다.
+
+**주의/리스크**: UDP는 비신뢰 전송이라 명령/ack 유실 시 timeout으로 "unreachable"처럼 실패할 수 있고, 서버의 `health_port`가 펌웨어 `CFG_HEALTH_UDP_PORT`와 정확히 일치해야 한다. 또한 보드가 쇼 PLAYING 중이면 명령을 무시해 timeout이 정상 동작과 실패가 구분되지 않으며, 인증 없는 UDP 명령이므로 동일 네트워크 내 오·악용 여지에 대한 검증이 필요하다.
+
+---
+
+
 ## 2026-08-14 18:01:26 +0900 — `f1eca657` 0814
 
 _branch: dev · author: directorBae <bjw020615@gmail.com>_
