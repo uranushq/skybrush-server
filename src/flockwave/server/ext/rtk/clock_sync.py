@@ -2,7 +2,7 @@
 clock of the computer running the server.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from struct import Struct
 from typing import ClassVar
 
@@ -11,6 +11,17 @@ from flockwave.gps.ubx.enums import UBXClass, UBXNAVSubclass
 from flockwave.gps.ubx.packet import UBXPacket
 
 from .types import GPSPacket
+
+__all__ = ("GPSClockSynchronizationValidator",)
+
+# Clocks are considered in sync when |GPS − server| is below this threshold.
+# UBX-NAV-TIMEUTC seconds are integer; including ``nano`` still leaves room for
+# transport delay and mild PC clock drift, so 2 s is used instead of 1 s.
+SYNC_THRESHOLD_SECONDS = 2.0
+
+# Hysteresis: once out of sync, require a tighter error before declaring sync
+# again so 1 Hz TIMEUTC packets do not toggle the warning every second.
+RESYNC_THRESHOLD_SECONDS = 1.5
 
 
 class GPSClockSynchronizationValidator:
@@ -23,7 +34,8 @@ class GPSClockSynchronizationValidator:
     clock.
     """
 
-    _ubx_nav_timeutc_struct: ClassVar[Struct] = Struct("<12xHBBBBB")
+    # iTOW(U4) + tAcc(U4) skipped, then nano(I4), year(U2), month..sec (5×U1)
+    _ubx_nav_timeutc_struct: ClassVar[Struct] = Struct("<8xiH5B")
 
     sync_state_changed: Signal = Signal(
         doc=(
@@ -80,12 +92,17 @@ class GPSClockSynchronizationValidator:
 
         try:
             struct = self._ubx_nav_timeutc_struct
-            year, month, day, hour, minute, second = struct.unpack(
+            nano, year, month, day, hour, minute, second = struct.unpack(
                 payload[: struct.size]
             )
-            dt = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
-            delta = dt - datetime.now(timezone.utc)
+            dt = datetime(
+                year, month, day, hour, minute, second, tzinfo=timezone.utc
+            ) + timedelta(microseconds=nano // 1000)
+            delta_seconds = abs((dt - datetime.now(timezone.utc)).total_seconds())
         except Exception:
             return
 
-        self.are_clocks_in_sync = delta.total_seconds() < 1
+        if self._are_clocks_in_sync:
+            self.are_clocks_in_sync = delta_seconds < SYNC_THRESHOLD_SECONDS
+        else:
+            self.are_clocks_in_sync = delta_seconds < RESYNC_THRESHOLD_SECONDS
