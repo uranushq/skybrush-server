@@ -1,5 +1,24 @@
 <!-- ENTRIES -->
 
+## 2026-08-16 18:42:49 +0900 — `238e25be` led udp
+
+_branch: dev · author: directorBae <bjw020615@gmail.com>_
+
+**요약**: JR 보드 제어에 UDP `led` 명령을 추가해, HTTP 제거 후 UDP 전환 흐름에 LED 점등/소등(배선 점검용) 기능과 `POST /led/<ip>` 엔드포인트를 신설했다.
+
+**주요 변경점**:
+- `commands.py`에 `format_led_body`·`post_led`·`send_raw_command`를 추가하고, `_send_and_wait`를 `cmd` 문자열 대신 `body: bytes` + `label` 방식으로 리팩터링(JSON 래퍼 없이 평문 전송 가능).
+- 펌웨어가 본문을 substring 매칭(`redownload`→`reboot`→`led` 순)하고 `sscanf`로 색상 4채널을 파싱한다는 점에 맞춰, LED 본문은 JSON이 아닌 평문(`led R G B W` 또는 `led off`)으로 생성하고 각 채널을 0~255로 clamp.
+- `extension.py`에 `POST /led/<ip>` 라우트 추가: JSON 바디(`red/green/blue/white/off`)를 정수 검증 후 `post_led` 호출, 실패 시 400/502 반환.
+- `DEV_LOG.md`에 직전 문서 커밋(`8beb20f1`) 분석 항목 추가.
+
+**의미/영향**: `30936ebe`에서 시작된 "HTTP 서버 제거 → UDP 명령/ack 통일" 아키텍처가 reboot·redownload에 이어 LED까지 확장되며 제어 계열이 UDP로 완성 단계에 접어들었다. 특히 인자를 본문에서 파싱하는 명령을 위해 평문 전송 경로(`send_raw_command`)를 분리한 것은, 기존 JSON 기반 명령과 펌웨어 파싱 규칙 사이의 충돌을 구조적으로 해결한 실질적 진전이다.
+
+**주의/리스크**: 펌웨어가 본문을 순서 있는 substring 매칭으로 처리하므로 `led` 본문에 "reboot"·"redownload" 같은 상위 키워드가 섞이면 오작동할 수 있어(코드 주석에도 명시), 향후 본문 포맷 변경 시 이 규칙을 반드시 지켜야 한다. 또한 LED는 소등/다음 쇼 재생 전까지 계속 켜져 있고 `PLAYING` 중에는 무시되어 타임아웃되는 동작 특성에 유의해야 한다.
+
+---
+
+
 ## 2026-08-14 18:19:23 +0900 — `8beb20f1` .
 
 _branch: dev · author: directorBae <bjw020615@gmail.com>_
