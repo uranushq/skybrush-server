@@ -6,6 +6,7 @@ POST ``/arm``                broadcast a JRPT ARM (or other) sync packet over UD
 GET  ``/health/<ip>``        latest status pushed by the board over health UDP
 POST ``/reboot/<ip>``        send a UDP reboot command, wait for the board's ack
 POST ``/redownload/<ip>``    send a UDP redownload command, wait for the board's ack
+POST ``/led/<ip>``           light the board's LEDs solid (wiring check) / turn off
 
 The board has no HTTP server at all -- everything in this extension talks to
 it over UDP on ``health_port`` (default 16550, must match the firmware's
@@ -43,7 +44,7 @@ from flockwave.server.ext.base import Extension
 from flockwave.server.utils import overridden
 
 from .arm import broadcast_arm
-from .commands import JRBoardError, post_reboot, post_redownload
+from .commands import JRBoardError, post_led, post_reboot, post_redownload
 from .health_udp import get_cached_health, run_listener as run_health_udp_listener
 
 if TYPE_CHECKING:
@@ -117,6 +118,36 @@ async def reboot_endpoint(ip: str):
 async def redownload_endpoint(ip: str):
     try:
         return jsonify(await post_redownload(ip, port=health_port))
+    except JRBoardError as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+@blueprint.route("/led/<ip>", methods=["POST"])
+async def led_endpoint(ip: str):
+    """Light one board's LEDs solid, or turn them off.
+
+    Body (JSON, all optional)::
+
+        {"red": 255, "green": 0, "blue": 0, "white": 0}
+        {"off": true}
+
+    Channels are clamped to 0..255. The reply echoes what the board reports it
+    actually applied, e.g. ``{"ok": true, "action": "led 255,0,0,0"}``.
+    """
+    body = await request.get_json(silent=True) or {}
+    try:
+        kwargs = dict(
+            off=bool(body.get("off", False)),
+            red=int(body.get("red", 255)),
+            green=int(body.get("green", 255)),
+            blue=int(body.get("blue", 255)),
+            white=int(body.get("white", 0)),
+        )
+    except (TypeError, ValueError):
+        return jsonify({"error": "'red'/'green'/'blue'/'white' must be integers"}), 400
+
+    try:
+        return jsonify(await post_led(ip, port=health_port, **kwargs))
     except JRBoardError as exc:
         return jsonify({"error": str(exc)}), 502
 
