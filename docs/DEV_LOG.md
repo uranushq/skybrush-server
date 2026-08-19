@@ -1,5 +1,23 @@
 <!-- ENTRIES -->
 
+## 2026-08-19 22:33:14 +0900 — `01687026` file number
+
+_branch: dev · author: directorBae <bjw020615@gmail.com>_
+
+**요약**: LED 바이너리 업로드 파일명의 타일 번호를 1-based에서 0-based로 바꿔 JR 펌웨어의 `client_id`와 정렬시킨 버그 수정 커밋이다.
+
+**주요 변경점**:
+- `led_generator/extension.py`의 업로드 파일명 생성에서 `drone_index + 1` → `drone_index`로 변경(`{show_id}_tile_{nn}.bin`의 `nn`을 0-based로).
+- 주석을 확장해 근거를 명시: JR 펌웨어가 `client_id = (정적 IP 마지막 옥텟) - 1`로 계산하고 `GET /download/<client_id>`를 요청하므로, 보드 `192.168.11.1`은 `/download/0`을 받아야 함.
+- `docs/DEV_LOG.md`에 직전 커밋 `3eabd063`("ss")에 대한 분석 항목 18줄 추가(문서 갱신).
+
+**의미/영향**: 기존 1-based 번호는 모든 드론을 한 슬롯씩 밀어(off-by-one) 잘못된 드론이 LED 패턴을 받게 만드는 실질적 오프셋 버그였고, 이번 커밋으로 서버가 내보내는 타일 번호와 펌웨어의 다운로드 인덱스가 정확히 일치하게 되었다. LED UDP/다운로드 파이프라인이 실제 하드웨어(정적 IP 기반 보드)와 올바르게 연동되도록 만드는 마무리 성격의 수정이다.
+
+**주의/리스크**: 파일명 규약(0-based)이 펌웨어의 IP-마지막옥텟-1 규칙에 강하게 결합되어 있어, 향후 IP 할당 방식이나 `client_id` 산출식이 바뀌면 다시 어긋날 수 있으니 이 계약을 양쪽에서 함께 관리할 필요가 있다. 또한 이 명명 규칙을 참조하는 다운로드 서버·펌웨어 측이 모두 0-based로 통일됐는지 확인이 필요하다.
+
+---
+
+
 ## 2026-08-19 21:49:43 +0900 — `3eabd063` ss
 
 _branch: dev · author: directorBae <bjw020615@gmail.com>_
