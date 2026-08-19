@@ -148,27 +148,6 @@ ASTAR_DOWNWARD_PENALTY = 0.5
 # asymmetric z window in the swept envelope test.
 DOWNWASH_ROUTE_CLEARANCE = 2.5
 
-# Graded downwash exposure. The clearance above was all-or-nothing, which
-# makes a dense planar formation impossible to fly into: the wall's own
-# vertical neighbours sit inside each other's band, so every transit through
-# it reads as blocked. Instead:
-#
-#   |dz| <  DOWNWASH_HARD_FLOOR        forbidden outright, at any duration
-#   |dz| <  DOWNWASH_ROUTE_CLEARANCE   allowed while the accumulated time in
-#                                      the band stays under the budget
-#   otherwise                          unrestricted (unchanged)
-#
-# The clock only runs against drones that are PARKED — the only obstacles a
-# route is planned around. Two drones holding formation while translating
-# together never close on each other, and the safety of that geometry is the
-# formation's own vertical separation, not a transit rule.
-#
-# HARD_MIN_SEPARATION is the floor the whole planner is built on ("a request
-# may RAISE the separation but nothing may ever lower it below this"), so it
-# is what the graded band bottoms out at rather than a fresh number.
-DOWNWASH_HARD_FLOOR = HARD_MIN_SEPARATION
-DOWNWASH_EXPOSURE_MS = 2000
-
 # Edges passing within PROXIMITY_EXTRA of a parked drone's (margin-inflated)
 # envelope cost this fraction extra — wide/over routes beat tight squeezes.
 ASTAR_PROXIMITY_SURCHARGE = 0.3
@@ -246,7 +225,6 @@ class PathSolver:
         fixed_routes: Optional[Dict[int, List[Vec3]]] = None,
         lockstep_groups: Optional[List[Set[int]]] = None,
         min_separation: float = HARD_MIN_SEPARATION,
-        step_duration_ms: int = 0,
     ) -> None:
         assert len(initials) == len(targets), "initial and target counts must match"
         self.step_size = step_size
@@ -255,15 +233,6 @@ class PathSolver:
         self.margin = float(margin)
         # Per-axis minimum separation; can never go below the hard floor.
         self.separation = clamp_separation(min_separation)
-        # How many consecutive steps a route may spend in the graded downwash
-        # band. Zero (the default, and whenever a step lasts longer than the
-        # whole budget) reproduces the old all-or-nothing rule exactly.
-        self.step_duration_ms = int(step_duration_ms or 0)
-        self.downwash_budget_steps = (
-            DOWNWASH_EXPOSURE_MS // self.step_duration_ms
-            if self.step_duration_ms > 0
-            else 0
-        )
         # ``seed`` is accepted for API compatibility; the solver is fully
         # deterministic and uses no randomness.
         del seed
@@ -568,7 +537,6 @@ class PathSolver:
         *,
         margin: Optional[float] = None,
         downwash: bool = False,
-        downwash_pad: Optional[float] = None,
     ) -> bool:
         """Whether the straight edge a→b hits any parked drone's envelope.
 
@@ -581,10 +549,7 @@ class PathSolver:
         this column.
         """
         checked_margin = self.margin if margin is None else margin
-        if downwash_pad is not None:
-            pad = downwash_pad
-        else:
-            pad = DOWNWASH_ROUTE_CLEARANCE if downwash else 0.0
+        pad = DOWNWASH_ROUTE_CLEARANCE if downwash else 0.0
         for obs in statics:
             if envelope_overlap_swept(
                 a,
@@ -634,21 +599,13 @@ class PathSolver:
                 obs, list(goal), margin=self.margin, separation=self.separation
             ):
                 return None
-            # A start inside the *graded* band is routable — the budget below
-            # lets it step out. Only the hard floor is hopeless: every
-            # outgoing edge would start blocked and no budget can buy it.
-            start_pad = (
-                DOWNWASH_HARD_FLOOR
-                if self.downwash_budget_steps > 0
-                else DOWNWASH_ROUTE_CLEARANCE
-            )
             if envelope_overlap(
                 list(start),
                 obs,
                 margin=self.margin,
                 separation=self.separation,
-                b_extends_below=start_pad,
-                b_extends_above=start_pad,
+                b_extends_below=DOWNWASH_ROUTE_CLEARANCE,
+                b_extends_above=DOWNWASH_ROUTE_CLEARANCE,
             ):
                 return None
 
@@ -681,7 +638,7 @@ class PathSolver:
             and lo[2] - z_reach <= obs[2] <= hi[2] + z_reach + DOWNWASH_ROUTE_CLEARANCE
         ]
 
-        def node_pos(node: Tuple[int, ...]) -> Tuple[float, float, float]:
+        def node_pos(node: Tuple[int, int, int]) -> Tuple[float, float, float]:
             return (
                 start[0] + node[0] * step,
                 start[1] + node[1] * step,
@@ -693,13 +650,9 @@ class PathSolver:
             # discount) so the estimate never overshoots the true cost.
             return ASTAR_ASCENT_DISCOUNT * Drone.distance(pos, goal)
 
-        # Node identity carries how many consecutive steps the route has
-        # already spent in the graded downwash band, so a path can never
-        # accumulate more than the budget allows.
-        budget = self.downwash_budget_steps
-        origin = (0, 0, 0, 0)
-        g_cost: Dict[Tuple[int, int, int, int], float] = {origin: 0.0}
-        parent: Dict[Tuple[int, int, int, int], Tuple[int, int, int, int]] = {}
+        origin = (0, 0, 0)
+        g_cost: Dict[Tuple[int, int, int], float] = {origin: 0.0}
+        parent: Dict[Tuple[int, int, int], Tuple[int, int, int]] = {}
         counter = 0
         open_heap = [(heuristic(start), 0, origin)]
         expansions = 0
@@ -727,8 +680,8 @@ class PathSolver:
 
             expansions += 1
             for ox, oy, oz in _DETOUR_OFFSETS:
-                cell = (node[0] + ox, node[1] + oy, node[2] + oz)
-                npos = node_pos(cell)
+                neighbour = (node[0] + ox, node[1] + oy, node[2] + oz)
+                npos = node_pos(neighbour)
                 if not (
                     lo[0] <= npos[0] <= hi[0]
                     and lo[1] <= npos[1] <= hi[1]
@@ -742,34 +695,10 @@ class PathSolver:
                 elif oz < 0:
                     cost += ASTAR_DOWNWARD_PENALTY * length
                 candidate_g = g_cost[node] + cost
-                # Zero exposure is the best any route can arrive with, so a
-                # cell already reached clean and cheaper dominates whatever
-                # this edge would produce. Prune before touching geometry.
-                clean = g_cost.get((cell[0], cell[1], cell[2], 0))
-                if clean is not None and clean <= candidate_g + 1e-12:
-                    continue
-                # Wide pad first: out in open air it passes on the first test,
-                # which is the overwhelmingly common case and keeps this loop
-                # at one swept check per neighbour, as it was before grading.
-                if self._edge_blocked(
-                    pos, npos, statics, downwash_pad=DOWNWASH_ROUTE_CLEARANCE
-                ):
-                    if budget <= 0:
-                        continue
-                    # In the band: allowed only above the hard floor, and only
-                    # while the accumulated time stays within the budget.
-                    if self._edge_blocked(
-                        pos, npos, statics, downwash_pad=DOWNWASH_HARD_FLOOR
-                    ):
-                        continue
-                    exposure = node[3] + 1
-                    if exposure > budget:
-                        continue
-                else:
-                    exposure = 0
-                neighbour = (cell[0], cell[1], cell[2], exposure)
                 known = g_cost.get(neighbour)
                 if known is not None and known <= candidate_g + 1e-12:
+                    continue
+                if self._edge_blocked(pos, npos, statics, downwash=True):
                     continue
                 if self._edge_blocked(
                     pos, npos, statics, margin=proximity_margin, downwash=True
