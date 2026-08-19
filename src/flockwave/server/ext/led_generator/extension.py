@@ -104,9 +104,15 @@ async def compile_endpoint():
             "bytes": len(per_drone.data),
         }
         if do_upload:
-            # The download server requires the pattern ``xxxxxx_tile_nn.bin``:
-            # a 6-char show id, then the 2-digit (1-based) tile/drone number.
-            filename = f"{show_id}_tile_{per_drone.drone_index + 1:02d}.bin"
+            # Filename pattern ``xxxxxx_tile_nn.bin``: a 6-char show id, then
+            # the 2-digit tile/drone number.
+            #
+            # nn is 0-BASED so that it lines up with the JR firmware's
+            # client_id.  The firmware derives client_id = (last octet of its
+            # static IP) - 1 and fetches GET /download/<client_id>, so board
+            # 192.168.11.1 asks for /download/0.  Emitting a 1-based tile
+            # number here shifted every drone by one slot.
+            filename = f"{show_id}_tile_{per_drone.drone_index:02d}.bin"
             try:
                 result = await upload_bin(filename, per_drone.data, url=upload_url)
                 entry["filename"] = result.get("filename")
