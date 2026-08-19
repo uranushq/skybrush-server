@@ -2205,29 +2205,29 @@ def _plan_formation_phases(
             for index, route in pinned_routes.items()
             if index in hand_pinned
         }
-        # Entry strategy gate. A formation whose own points are packed
-        # tighter than ENTRY_CORRIDOR_FACTOR x the separation has no corridor
-        # between any two of its drones, so it cannot be flown into in one
-        # go: the last arrivals are walled out by the first. Stage those
-        # instead, structural strategy first, falling back to the single-shot
-        # entry that has always been used.
+        # Entry strategy ladder. The single-shot entry is ALWAYS tried first:
+        # it is what every show has flown so far, and staging costs a visible
+        # standoff-and-return excursion that a formation the solver can
+        # already reach must not be made to fly.
+        #
+        # Staged entry is a fallback, and only worth offering when the
+        # formation is genuinely too tight to fly into in one go — packed
+        # closer than ENTRY_CORRIDOR_FACTOR x the separation, so no two of its
+        # drones leave a corridor and the last arrivals are walled out by the
+        # first. It sits right after the first attempt because it addresses
+        # that failure directly, whereas the cluster-release notches below
+        # loosen unrelated constraints.
         corridor = ENTRY_CORRIDOR_FACTOR * min_separation
         formation_gap = _min_pairwise_gap(targets)
-        if formation_gap >= corridor:
-            entry_modes = ["direct"]
-        else:
-            entry_modes = ["plane", "direct"]
-            if log:
-                log.info(
-                    f"segment '{name}': formation gap {formation_gap:.2f} m is "
-                    f"below the {corridor:.2f} m needed to fly between two "
-                    "parked drones -- staging the entry"
-                )
+        staged_fallback = formation_gap < corridor
 
         attempts: list[tuple[str, dict, list[set[int]] | None, bool, str]] = [
-            (mode, pinned_routes, cluster_groups or None, True, "")
-            for mode in entry_modes
+            ("direct", pinned_routes, cluster_groups or None, True, "")
         ]
+        if staged_fallback:
+            attempts.append(
+                ("plane", pinned_routes, cluster_groups or None, True, "")
+            )
         if cluster_groups:
             attempts.append(
                 ("direct", hand_only, None, True, "the cluster(s) were released")
