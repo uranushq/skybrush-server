@@ -1,5 +1,23 @@
 <!-- ENTRIES -->
 
+## 2026-08-16 18:45:37 +0900 — `12a0d0a8` devlog
+
+_branch: dev · author: directorBae <bjw020615@gmail.com>_
+
+**요약**: 직전 커밋(`238e25be` "led udp")의 분석 항목을 `docs/DEV_LOG.md`에 추가한 개발 로그 갱신 커밋이다.
+
+**주요 변경점**:
+- `docs/DEV_LOG.md` 상단(`<!-- ENTRIES -->` 아래)에 `238e25be` 항목 19줄 추가.
+- 추가된 내용은 UDP `led` 명령 도입(평문 전송 경로 `send_raw_command`, `POST /led/<ip>` 엔드포인트, 색상 4채널 clamp) 및 HTTP 제거→UDP 전환 아키텍처의 진행을 서술.
+- 코드/기능 변경 없이 문서만 수정.
+
+**의미/영향**: 실제 소스에는 영향이 없고, "HTTP 제거→UDP 통일" 흐름의 LED 확장 작업(`238e25be`)을 사후 기록해 개발 히스토리 추적성을 유지하는 커밋이다. 최신순으로 항목이 쌓이는 DEV_LOG 관행이 유지되고 있어, 커밋 단위 문서화 프로세스가 정착 단계임을 보여준다.
+
+**주의/리스크**: 특이사항 없음
+
+---
+
+
 ## 2026-08-16 18:42:49 +0900 — `238e25be` led udp
 
 _branch: dev · author: directorBae <bjw020615@gmail.com>_
