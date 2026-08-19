@@ -1425,6 +1425,103 @@ def _segment_seed(seed: Optional[int], index: int) -> Optional[int]:
     return None if seed is None else seed + index
 
 
+# ── dense formation entry (second-tier fallback) ─────────────────────────
+# Passing BETWEEN two parked drones needs them ENTRY_CORRIDOR_FACTOR x the
+# separation apart. A tight formation is never that loose, so once part of it
+# is parked the rest can be walled out and whoever arrives last deadlocks —
+# an arrival ORDER problem, which no amount of local detour logic fixes.
+#
+# None of this runs until the previous algorithm has failed outright: staging
+# costs a visible standoff-and-return excursion that a formation the solver
+# can already reach must never be made to fly.
+ENTRY_CORRIDOR_FACTOR = 2.0
+
+# A formation counts as flat when its spread along one axis is this small (m).
+PLANE_FLATNESS_TOLERANCE = 0.5
+
+# How far off its own plane the fleet assembles, in multiples of separation.
+PLANE_STANDOFF_FACTOR = 2.0
+
+
+def _min_pairwise_gap(points: Sequence[Sequence[float]]) -> float:
+    """Smallest Chebyshev distance between any two of *points*."""
+    best = float("inf")
+    for a, b in combinations(points, 2):
+        gap = max(abs(a[0] - b[0]), abs(a[1] - b[1]), abs(a[2] - b[2]))
+        if gap < best:
+            best = gap
+    return best
+
+
+def _plane_normal_axis(
+    targets: Sequence[Sequence[float]],
+    *,
+    tolerance: float = PLANE_FLATNESS_TOLERANCE,
+) -> Optional[int]:
+    """Index of the axis the formation is flat along, else None.
+
+    A vertical plane (an image wall) is flat along x or y; a floor pattern —
+    the take-off and landing grids — is flat along z. Both are entered the
+    same way: assemble on a copy offset along the normal, then close the gap
+    as one block. For the floor case that is exactly the natural landing
+    approach: gather above your own spot and come straight down.
+
+    ``_stack_entry_plan`` is unaffected — it only fires on drones stacked
+    directly above one another, which a flat pattern has none of.
+    """
+    if len(targets) < 3:
+        return None
+    spread = [
+        max(t[axis] for t in targets) - min(t[axis] for t in targets)
+        for axis in range(3)
+    ]
+    for axis in (0, 1, 2):
+        others = [spread[other] for other in range(3) if other != axis]
+        if spread[axis] <= tolerance and all(o > tolerance for o in others):
+            return axis
+    return None
+
+
+def _plane_entry_targets(
+    targets: Sequence[Sequence[float]],
+    current_positions: Sequence[Sequence[float]],
+    *,
+    min_separation: float,
+    exempt: Optional[set[int]] = None,
+) -> Optional[tuple[list[tuple[float, float, float]], int]]:
+    """A copy of the formation standing off its plane, on the fleet's side.
+
+    Returns ``(approach_targets, normal_axis)``, or ``None`` when the target
+    formation is not flat.
+
+    The point is the leg that follows: going from these points to *targets*
+    is ONE shared displacement for every drone, so every pairwise distance is
+    invariant along it. If the formation respects the separation then so does
+    the whole entry leg, and no drone ever has to pass between two parked
+    ones — the manoeuvre a tight formation makes impossible.
+    """
+    axis = _plane_normal_axis(targets)
+    if axis is None:
+        return None
+    plane = sum(t[axis] for t in targets) / len(targets)
+    fleet = sum(p[axis] for p in current_positions) / len(current_positions)
+    standoff = PLANE_STANDOFF_FACTOR * min_separation
+    # Stand off towards wherever the fleet already is; when it is sitting on
+    # the plane (a wall-to-wall transition) either side is open, so pick one
+    # deterministically.
+    side = 1.0 if fleet > plane else -1.0
+    exempt = exempt or set()
+    approach: list[tuple[float, float, float]] = []
+    for index, target in enumerate(targets):
+        if index in exempt:
+            approach.append(tuple(float(v) for v in target))
+            continue
+        point = [float(v) for v in target]
+        point[axis] = point[axis] + side * standoff
+        approach.append(tuple(point))
+    return approach, axis
+
+
 def _stack_entry_plan(
     targets: Sequence[tuple[float, float, float]],
     *,
@@ -1628,6 +1725,7 @@ def _extend_with_solver_run(
     min_separation: float = HARD_MIN_SEPARATION,
     report_progress: bool = True,
     tentative: bool = False,
+    step_duration_ms: int = 0,
 ) -> list[tuple[float, float, float]]:
     """Run one solver segment and append its steps to the combined timeline.
 
@@ -1695,6 +1793,7 @@ def _extend_with_solver_run(
         fixed_routes=fixed_routes,
         lockstep_groups=lockstep_groups,
         min_separation=min_separation,
+        step_duration_ms=step_duration_ms,
     )
     started_at = perf_counter()
     result = solver.solve()
@@ -1831,6 +1930,7 @@ def _plan_formation_phases(
         constant_speed,
         fixed_routes=None,
         lockstep_groups=None,
+        downwash_grading: bool = False,
     ) -> None:
         nonlocal current_positions, segment_counter
         if _positions_match(current_positions, targets):
@@ -1848,6 +1948,9 @@ def _plan_formation_phases(
             constant_speed=constant_speed,
             fixed_routes=fixed_routes,
             lockstep_groups=lockstep_groups,
+            # A zero budget is bit-for-bit the old all-or-nothing rule, so
+            # the first tier routes exactly as it always has.
+            step_duration_ms=duration_ms if downwash_grading else 0,
             min_separation=min_separation,
             tentative=tentative_run,
         )
@@ -1859,6 +1962,8 @@ def _plan_formation_phases(
         fixed_routes=None,
         lockstep_groups=None,
         auto_cluster: bool = True,
+        entry_mode: str = "direct",
+        downwash_grading: bool = False,
     ) -> None:
         """One formation move: approach stage plus staged stack-entry climbs.
 
@@ -1881,6 +1986,28 @@ def _plan_formation_phases(
             for i in range(len(targets))
             if Drone.distance(current_positions[i], targets[i]) < 1e-9
         }
+        # Plane entry: fly the whole existing pipeline at a copy of the
+        # formation standing off its own plane, then close the gap with one
+        # shared displacement. Drones already parked on target stay put.
+        entry_leg = None
+        if entry_mode == "plane":
+            plane_plan = _plane_entry_targets(
+                targets,
+                current_positions,
+                min_separation=min_separation,
+                exempt=stationary,
+            )
+            if plane_plan is not None:
+                approach_copy, normal_axis = plane_plan
+                entry_leg = [tuple(t) for t in targets]
+                targets = approach_copy
+                if log:
+                    log.info(
+                        f"segment '{label}': assembling "
+                        f"{PLANE_STANDOFF_FACTOR * min_separation:.1f} m off the "
+                        f"{'XYZ'[normal_axis]} plane, then entering as one block"
+                    )
+
         combined_fixed = {
             did: route
             for did, route in (fixed_routes or {}).items()
@@ -1997,6 +2124,7 @@ def _plan_formation_phases(
                     group for group in moving_groups if not (group & held_back)
                 ]
                 or None,
+                downwash_grading=downwash_grading,
             )
         climb_step = STACK_CLIMB_SPEED * duration_sec
         for wave_index, wave in enumerate(climb_waves):
@@ -2008,6 +2136,19 @@ def _plan_formation_phases(
                 f"{label}/stack-climb-{wave_index + 1}",
                 stage_step_size=climb_step,
                 constant_speed=True,
+                downwash_grading=downwash_grading,
+            )
+
+        # The entry leg: every drone covers the same displacement, so all
+        # pairwise distances are preserved and the leg is collision-free as
+        # long as the formation itself is — which validation already checked.
+        if entry_leg is not None:
+            run_stage(
+                entry_leg,
+                f"{label}/plane-entry",
+                stage_step_size=step_size,
+                constant_speed=False,
+                downwash_grading=downwash_grading,
             )
 
     # ── staging: move from the hover line-up into the grid ──────────────
@@ -2056,13 +2197,22 @@ def _plan_formation_phases(
             for index, route in pinned_routes.items()
             if index in hand_pinned
         }
-        attempts: list[tuple[dict, list[set[int]] | None, bool, str]] = [
-            (pinned_routes, cluster_groups or None, True, "")
+        # TIER 1 — the algorithm exactly as it was, including its own
+        # cluster-release notches: single-shot entry, all-or-nothing downwash.
+        # A show that flies today keeps flying identically, at the same cost.
+        # Anything new inserted ahead of these notches would be a failed
+        # attempt paid for on every segment that relies on them.
+        attempts: list[tuple[str, bool, dict, list[set[int]] | None, bool, str]] = [
+            ("direct", False, pinned_routes, cluster_groups or None, True, "")
         ]
         if cluster_groups:
-            attempts.append((hand_only, None, True, "the cluster(s) were released"))
+            attempts.append(
+                ("direct", False, hand_only, None, True, "the cluster(s) were released")
+            )
         attempts.append(
             (
+                "direct",
+                False,
                 hand_only,
                 None,
                 False,
@@ -2071,7 +2221,23 @@ def _plan_formation_phases(
             )
         )
 
-        for attempt, (routes, groups, auto, _label) in enumerate(attempts):
+        # TIER 2 — only once all of the above has failed. Graded downwash lets
+        # a drone cross the band above the hard floor for a bounded time,
+        # which frees one walled in by the arrivals ahead of it; staged entry
+        # then assembles off the formation's own plane and enters as a block.
+        # Staging is only offered when the formation is genuinely too tight to
+        # fly into in one go — no two of its drones leave a corridor.
+        attempts.append(
+            ("direct", True, hand_only, None, False, "graded downwash was allowed")
+        )
+        if _min_pairwise_gap(targets) < ENTRY_CORRIDOR_FACTOR * min_separation:
+            attempts.append(
+                ("plane", True, hand_only, None, False, "the entry was staged")
+            )
+
+        for attempt, (mode, grading, routes, groups, auto, _label) in enumerate(
+            attempts
+        ):
             # A failed attempt appends nothing, but a segment can fail
             # *after* its approach stage, so rewind before retrying.
             checkpoint = (list(current_positions), len(combined_steps), segment_counter)
@@ -2083,6 +2249,8 @@ def _plan_formation_phases(
                     fixed_routes=routes or None,
                     lockstep_groups=groups,
                     auto_cluster=auto,
+                    entry_mode=mode,
+                    downwash_grading=grading,
                 )
                 break
             except PlanningError as exc:
@@ -2093,11 +2261,11 @@ def _plan_formation_phases(
                 # it names a conflict that the next notch is about to
                 # dissolve, so repeating it as a warning only reads as an
                 # unresolved error.
+                next_label = attempts[attempt + 1][5]
                 note = (
-                    f"{attempts[attempt + 1][3]}: the solver could not "
-                    f"schedule their straight lines alongside the rest of the "
-                    "fleet, so those drones were planned normally and "
-                    "still reach the same formation"
+                    f"{next_label}: the solver could not schedule this "
+                    "segment the previous way, so it was retried with that "
+                    "fallback and still reaches the same formation"
                 )
                 cluster_notes.append(note)
                 if log:
