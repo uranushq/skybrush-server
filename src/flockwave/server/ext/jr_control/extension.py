@@ -19,8 +19,6 @@ wait for the board's ack (see ``commands.py``).
 
     {
       "startIn": 5.0,        // seconds from now -> start_time_us
-      "fpsNum": 30, "fpsDen": 1,
-      "frameCount": 300,
       "seq": 1,
       "repeat": 5,
       "interval": 0.05,      // < 0.1 enforced
@@ -28,6 +26,14 @@ wait for the board's ack (see ``commands.py``).
       "port": 8765,
       "cmd": "ARM"           // ARM | ABORT | PING | LOAD_FILE
     }
+
+The show's length and frame rate are deliberately *not* accepted here. The
+firmware plays exactly the ``frame_count`` the ARM packet carries and never
+checks it against the file it downloaded, so a controller-side guess silently
+overrides the real show. The boards report the true numbers in their health
+pushes and ``derive_show_params`` reads them back, which leaves ``startIn``
+as the only playback knob a caller owns. An ARM is refused with 409 while no
+board has a show loaded to read them from.
 """
 
 from __future__ import annotations
@@ -45,7 +51,12 @@ from flockwave.server.utils import overridden
 
 from .arm import broadcast_arm
 from .commands import JRBoardError, post_led, post_reboot, post_redownload
-from .health_udp import get_cached_health, run_listener as run_health_udp_listener
+from .health_udp import (
+    ShowParams,
+    derive_show_params,
+    get_cached_health,
+    run_listener as run_health_udp_listener,
+)
 
 if TYPE_CHECKING:
     from flockwave.server.app import SkybrushServer
@@ -63,12 +74,10 @@ health_port: int = 16550
 async def arm_endpoint():
     """Broadcast an ARM (or other) JRPT sync packet over UDP."""
     body = await request.get_json(silent=True) or {}
+    cmd = str(body.get("cmd", "ARM"))
 
     kwargs = dict(
         start_in=float(body.get("startIn", 5.0)),
-        fps_num=int(body.get("fpsNum", 30)),
-        fps_den=int(body.get("fpsDen", 1)),
-        frame_count=int(body.get("frameCount", 300)),
         show_id=int(body.get("showId", 1)),
         file_id=int(body.get("fileId", 99)),
         seq=int(body.get("seq", 1)),
@@ -78,8 +87,24 @@ async def arm_endpoint():
         # whole subnet receives the ARM; pass an explicit address to override.
         target=body.get("target") or None,
         port=int(body.get("port", 8765)),
-        cmd=str(body.get("cmd", "ARM")),
+        cmd=cmd,
     )
+
+    # Length and frame rate come from the boards, never from the request -- see
+    # this module's docstring. Only ARM carries them: the firmware drops every
+    # other command before it reads those fields (``on_sync_pkt`` returns early
+    # unless cmd == ARM), so a PING still works with no show loaded anywhere.
+    show: Optional[ShowParams] = None
+    if cmd == "ARM":
+        try:
+            show = derive_show_params()
+        except JRBoardError as exc:
+            return jsonify({"error": str(exc)}), 409
+        kwargs.update(
+            frame_count=show.frame_count,
+            fps_num=show.fps_num,
+            fps_den=show.fps_den,
+        )
 
     try:
         # Blocking socket sends + sleeps -> run off the event loop.
@@ -89,11 +114,22 @@ async def arm_endpoint():
     except OSError as exc:
         return jsonify({"error": f"broadcast failed: {exc}"}), 502
 
+    detail = ""
+    if show is not None:
+        summary["frameCountPerBoard"] = show.per_board
+        detail = f" frames={show.frame_count} fps={show.fps_num}/{show.fps_den}"
+        if show.disagreement:
+            # Not fatal -- the longest show wins and shorter boards just hold
+            # their last frame -- but it means the fleet was not uploaded from
+            # one show, which is worth seeing.
+            summary["frameCountMismatch"] = True
+            detail += f" (boards disagree: {show.per_board})"
+
     if log:
         log.info(
             f"JR ARM broadcast: cmd={summary['cmd']} "
             f"targets={summary['targets']} sent={summary['sent']} "
-            f"startTimeUs={summary['startTimeUs']}"
+            f"startTimeUs={summary['startTimeUs']}{detail}"
         )
     return jsonify({"success": True, **summary})
 
