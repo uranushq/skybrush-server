@@ -136,6 +136,7 @@ from .output import (
     skyc_bytes_from_show_dicts,
 )
 from .solver import (
+    DOWNWASH_EXPOSURE_MS,
     DOWNWASH_ROUTE_CLEARANCE,
     PathSolver,
     SolverResult,
@@ -1726,6 +1727,7 @@ def _extend_with_solver_run(
     min_separation: float = HARD_MIN_SEPARATION,
     report_progress: bool = True,
     tentative: bool = False,
+    step_duration_ms: int = 0,
 ) -> list[tuple[float, float, float]]:
     """Run one solver segment and append its steps to the combined timeline.
 
@@ -1793,6 +1795,7 @@ def _extend_with_solver_run(
         fixed_routes=fixed_routes,
         lockstep_groups=lockstep_groups,
         min_separation=min_separation,
+        step_duration_ms=step_duration_ms,
     )
     started_at = perf_counter()
     result = solver.solve()
@@ -1810,6 +1813,19 @@ def _extend_with_solver_run(
             "stuck_drones": [f"drone-{i + 1}" for i in result.stuck_drones],
             "steps_completed": result.total_steps,
         }
+        # A solver step lasts step_size / cruise_speed seconds. When that is
+        # longer than the whole downwash budget the graded band buys nothing
+        # -- transits that a faster show would fly are simply forbidden. The
+        # operator can only fix that by changing the speed, so say so instead
+        # of leaving them to read a deadlock.
+        if step_duration_ms > DOWNWASH_EXPOSURE_MS:
+            details["code"] = "CRUISE_SPEED_TOO_SLOW_FOR_DOWNWASH"
+            details["step_duration_ms"] = step_duration_ms
+            details["downwash_exposure_ms"] = DOWNWASH_EXPOSURE_MS
+            details["required_cruise_speed"] = round(
+                step_size / (DOWNWASH_EXPOSURE_MS / 1000.0), 4
+            )
+            details["step_size"] = step_size
         if result.fixed_conflicts:
             details["code"] = "FIXED_PATH_CONFLICT"
             details["fixed_conflicts"] = [
@@ -1946,6 +1962,7 @@ def _plan_formation_phases(
             constant_speed=constant_speed,
             fixed_routes=fixed_routes,
             lockstep_groups=lockstep_groups,
+            step_duration_ms=duration_ms,
             min_separation=min_separation,
             tentative=tentative_run,
         )
@@ -3139,6 +3156,7 @@ async def plan():
             seed=seed,
             min_z=min_z,
             min_separation=min_separation,
+            step_duration_ms=duration_ms,
         )
         result = solver.solve()
         if not result.success:
