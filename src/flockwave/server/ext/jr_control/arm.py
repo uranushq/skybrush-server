@@ -19,6 +19,16 @@
 
 The JR firmware snaps ``start_time_us`` to the nearest GPS-PPS second, so a
 controller clock error of up to +/-500 ms is absorbed.
+
+That snap is also why :func:`broadcast_arm` accepts an *absolute*
+``start_at_us`` and not just a relative ``start_in``. A board labels its PPS
+edges with the ``abs_time_us`` we send and rounds that label to the nearest
+whole second; because a PPS edge really is a GPS-UTC second boundary, the
+rounding removes our clock error entirely and the board ends up running on
+true UTC. An absolute start instant therefore survives intact, while a relative
+delay is re-anchored to *this* machine's clock here in the handler and carries
+that error into the packet -- enough to slide the LEDs off the GPS-synced
+aircraft by up to the half second the snap tolerates.
 """
 
 from __future__ import annotations
@@ -164,6 +174,7 @@ def resolve_broadcast_targets(
 def broadcast_arm(
     *,
     start_in: float = 5.0,
+    start_at_us: int | None = None,
     fps_num: int = 30,
     fps_den: int = 1,
     frame_count: int = 300,
@@ -182,6 +193,11 @@ def broadcast_arm(
     broadcast out of *every* local interface so all boards on the subnet receive
     it simultaneously; pass an explicit address to unicast or send a directed
     subnet broadcast (e.g. ``192.168.255.255``).
+
+    ``start_at_us`` pins playback to an absolute instant (microseconds since
+    the Unix epoch) and takes precedence over ``start_in``; pass it when the caller
+    already knows the exact second playback must begin, such as a drone show's
+    scheduled start time. Leave it ``None`` to keep the relative behaviour.
 
     The packet is retransmitted ``repeat`` times ``interval`` seconds apart to
     survive UDP loss. ``interval`` must stay below 0.1 s so all retransmits land
@@ -202,7 +218,25 @@ def broadcast_arm(
 
     cmd_id = CMD[cmd]
     abs_t = now_us()
-    start_t = abs_t + int(start_in * 1_000_000) if cmd_id == CMD["ARM"] else 0
+    if cmd_id != CMD["ARM"]:
+        start_t = 0
+    elif start_at_us is None:
+        start_t = abs_t + int(start_in * 1_000_000)
+    else:
+        start_t = int(start_at_us)
+        # A start instant this far off is a clock or unit bug (seconds passed
+        # as microseconds, a stale scheduled time), not a legitimate cue. The
+        # firmware would not complain: it either catches up mid-show or drops
+        # the ARM silently, so the boards would just stay dark. Fail loudly
+        # here instead, while the operator can still see why.
+        offset_s = (start_t - abs_t) / 1_000_000
+        if not -60.0 <= offset_s <= 86_400.0:
+            raise ValueError(
+                f"startAtUnixSec is {offset_s:.1f}s away from this server's "
+                "clock, which is outside the sane -60s..+24h window; check the "
+                "controller and server clocks"
+            )
+        start_in = offset_s
 
     destinations = resolve_broadcast_targets(target)
 
@@ -259,6 +293,15 @@ def broadcast_arm(
         "absTimeUs": abs_t,
         "startTimeUs": start_t,
         "startIn": start_in if cmd_id == CMD["ARM"] else 0,
+        # Lets a caller that asked for an absolute cue confirm it was honoured
+        # rather than silently resolved against this server's clock -- the two
+        # repos deploy separately, so an older server would otherwise accept the
+        # request and quietly fall back to the relative path.
+        "startTimeSource": (
+            "absolute"
+            if cmd_id == CMD["ARM"] and start_at_us is not None
+            else "relative"
+        ),
         "fps": f"{fps_num}/{fps_den}",
         "frameCount": frame_count,
         "showId": show_id,

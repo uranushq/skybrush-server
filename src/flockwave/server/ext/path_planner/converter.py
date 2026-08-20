@@ -1283,6 +1283,7 @@ def build_delivery_show_dicts(
 async def save_skyb_files(
     show_dicts: List[dict],
     output_dir: str | Path,
+    formation_plan: dict | None = None,
 ) -> Dict[str, str]:
     """Save ready-made per-drone show dicts as ``.skyb`` files + ``show.json``.
 
@@ -1332,6 +1333,12 @@ async def save_skyb_files(
             for idx, show_dict in enumerate(show_dicts)
         },
     }
+    if formation_plan is not None:
+        # Purely additive: "version", "num_drones" and "drones" are untouched,
+        # so anything reading this file today keeps working. The key is
+        # namespaced rather than called "formation" on purpose -- see
+        # FORMATION_PLAN_KEY in the extension for why that name is unsafe.
+        combined["formationPlan"] = formation_plan
 
     show_json_path = output_dir / "show.json"
     show_json_path.write_text(json.dumps(combined, indent=2), encoding="utf-8")

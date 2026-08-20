@@ -425,6 +425,27 @@ def _normalize_vec3_array(name: str, value: list) -> list[list[float]]:
     return [point for point in normalized if point is not None]
 
 
+def _validate_phase_ids(phases) -> Optional[str]:
+    """Reject duplicate phase ids.
+
+    The id is what a caller joins the returned annotation back onto its own
+    phases with. Two phases sharing one would attach the wrong formation's
+    timing and shape to a phase and give no sign of it, so it is refused here
+    rather than discovered on a timeline that looks plausible.
+    """
+    seen: set[str] = set()
+    for index, phase in enumerate(phases):
+        raw = phase.get("id") if isinstance(phase, dict) else None
+        if raw is None or not str(raw).strip():
+            continue
+        phase_id = str(raw)
+        if phase_id in seen:
+            return f"'phases[{index}].id' ({phase_id!r}) is used by another phase"
+        seen.add(phase_id)
+
+    return None
+
+
 def _validate_phases(phases, *, num_drones: int):
     if not isinstance(phases, list) or len(phases) == 0:
         return jsonify({"error": "'phases' must be a non-empty array"}), 400
@@ -1224,6 +1245,206 @@ def _phase_targets(phase: dict, num_drones: int) -> list[tuple[float, float, flo
     return [target for target in targets if target is not None]
 
 
+#: Key under which the phase annotation travels in every artifact. Namespaced
+#: on purpose: Skybrush Live already reads a top-level ``formation`` block and
+#: *replaces* its authored phases with it, so writing that key into a generated
+#: show would silently wipe an operator's work on any already-shipped client.
+FORMATION_PLAN_KEY = "formationPlan"
+
+#: Filename of the separate ``.skyc`` archive member carrying the annotation.
+FORMATION_PLAN_FILENAME = "formation_plan.json"
+
+
+def _trajectory_time_index(show_dicts: Sequence[dict]) -> list[dict[int, int]]:
+    """Per drone, a map from a keyframe's time (µs, integer) to its index.
+
+    Built once so a phase can be linked to the *actual* position in the emitted
+    trajectory rather than to a solver step. The two are not the same list:
+    ``_collapse_stationary`` merges runs of identical positions and velocity
+    smoothing inserts sub-knots, so step N is not point N and never was. Time
+    is the one thing that survives both, which is why the join is on time and
+    the answer is reported as a real index into the file the boards fly.
+    """
+    tables: list[dict[int, int]] = []
+    for show_dict in show_dicts:
+        table: dict[int, int] = {}
+        points = (show_dict.get("trajectory") or {}).get("points") or []
+        for index, point in enumerate(points):
+            try:
+                microseconds = int(round(float(point[0]) * 1_000_000))
+            except (TypeError, ValueError, IndexError):
+                continue
+            table.setdefault(microseconds, index)
+        tables.append(table)
+
+    return tables
+
+
+def _points_at(
+    tables: Sequence[dict[int, int]], seconds: float
+) -> dict[str, int]:
+    """Which trajectory keyframe each drone is on at *seconds*.
+
+    Only exact hits are reported. A near miss would be a guess, and a consumer
+    that trusted it would cut an LED board at the wrong keyframe with nothing
+    to show for it -- an absent entry says "not on a keyframe here", which is
+    the truth.
+    """
+    microseconds = int(round(seconds * 1_000_000))
+    found: dict[str, int] = {}
+    for drone_index, table in enumerate(tables):
+        index = table.get(microseconds)
+        if index is not None:
+            found[f"drone-{drone_index + 1}"] = index
+
+    return found
+
+
+def _build_formation_plan(
+    *,
+    phases: Sequence[dict],
+    phase_summaries: Sequence[dict],
+    num_drones: int,
+    duration_ms: int,
+    takeoff_time: float,
+    takeoff_duration_sec: float,
+    show_offset_sec: float,
+    total_steps: int,
+    show_dicts: Sequence[dict] | None = None,
+    profile_report: dict | None = None,
+) -> dict:
+    """Record which solver step -- and which absolute second -- each requested
+    formation phase ended up at.
+
+    The planner is the only party that knows this. A consumer handed just the
+    finished trajectories has to guess, by hunting for stretches where every
+    drone happens to be stationary, and that guess cannot tell an intended
+    formation from a drone pausing at a waypoint.
+
+    Times are absolute show seconds on the same clock the trajectories use:
+    ``show_offset_sec + step * duration_ms / 1000``, where the offset covers
+    the ground wait plus the takeoff climb. Steps are reported too, but only
+    for provenance -- ``_collapse_stationary`` in the converter merges runs of
+    identical positions, so a step index does not survive as a keyframe index.
+    Anchor on time, never on position in a list.
+
+    Each phase carries three instants, because they genuinely differ:
+
+    * ``startSec``   -- the formation is formed (the solver's arrival step).
+    * ``holdEndSec`` -- the requested hold ends. **This is the window a
+      consumer should paint**, e.g. an LED board for this formation.
+    * ``endSec``     -- the segment ends, which also covers the neutral-yaw
+      reset appended when the next leg moves. Always >= ``holdEndSec``.
+
+    Planner-inserted legs (staging grid, return to start) are kept in a
+    separate ``transits`` list rather than mixed in with the caller's phases,
+    so ``phases[i]`` always refers to the caller's ``phases[i]``.
+    """
+
+    time_tables = _trajectory_time_index(show_dicts or [])
+
+    def _abs_sec(time_ms: float) -> float:
+        return round(show_offset_sec + time_ms / 1000.0, 4)
+
+    def _points_for(phase_index: int) -> dict[str, dict[str, float]]:
+        """The phase's targets, keyed by drone id, so a consumer can rebuild
+        the formation's shape without replaying the solve."""
+        try:
+            targets = _phase_targets(phases[phase_index], num_drones)
+            yaws = _phase_target_yaws(phases[phase_index], num_drones)
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            # Swallowing this produced a phase with no coordinates at all, and
+            # the only downstream sign was an editor that quietly refused to
+            # group. Record it on the phase so a consumer can say why.
+            if log:
+                log.warning(
+                    f"formation plan: phase {phase_index} has no usable "
+                    f"targets ({exc}); its points are omitted"
+                )
+            return {}
+        return {
+            f"drone-{index + 1}": {
+                "x": round(float(target[0]), 4),
+                "y": round(float(target[1]), 4),
+                "z": round(float(target[2]), 4),
+                "yaw": round(float(yaws[index]), 4),
+            }
+            for index, target in enumerate(targets)
+        }
+
+    plan_phases: list[dict] = []
+    transits: list[dict] = []
+    for summary in phase_summaries:
+        entry = {
+            "order": summary["order"],
+            "name": summary["name"],
+            "kind": summary["kind"],
+            "arrivalStep": summary["arrivalStep"],
+            "holdEndStep": summary["holdEndStep"],
+            "endStep": summary["endStep"],
+            "startSec": _abs_sec(summary["arrivalTimeMs"]),
+            "holdEndSec": _abs_sec(summary["holdEndTimeMs"]),
+            "endSec": _abs_sec(summary["endTimeMs"]),
+            "holdMs": summary["holdMs"],
+            "warnings": list(summary.get("warnings") or ()),
+        }
+        if summary["kind"] == "transit" or summary["phaseIndex"] is None:
+            transits.append(entry)
+            continue
+
+        phase_index = int(summary["phaseIndex"])
+        entry["index"] = phase_index
+        # The link a caller actually needs: where this phase sits in the
+        # trajectory that ships, per drone. `arrivalStep` above is the solver's
+        # own counter and does not index this list.
+        if time_tables:
+            entry["pointIndex"] = {
+                "start": _points_at(time_tables, entry["startSec"]),
+                "holdEnd": _points_at(time_tables, entry["holdEndSec"]),
+                "end": _points_at(time_tables, entry["endSec"]),
+            }
+        # Echo the caller's own id when it sent one, so a consumer can join by
+        # identity instead of by position. Names are not usable as ids: they
+        # are free text and nothing rejects duplicates.
+        raw_id = phases[phase_index].get("id") if phase_index < len(phases) else None
+        if raw_id is not None and str(raw_id).strip():
+            entry["id"] = str(raw_id)
+        entry["points"] = _points_for(phase_index)
+        plan_phases.append(entry)
+
+    plan = {
+        "version": 1,
+        "generator": "skybrush-server/path_planner",
+        "mode": "formation_phases",
+        # Seconds are on the show clock (t=0 is show start, i.e. before the
+        # ground wait) -- the same base the emitted trajectory points use.
+        "timeBase": "showStartSec",
+        # One window for the whole fleet: every drone climbs the same staging
+        # altitude, so the offset is not per-drone.
+        "scope": "fleet",
+        "numDrones": num_drones,
+        "timing": {
+            "durationMs": duration_ms,
+            "takeoffTimeSec": takeoff_time,
+            "takeoffDurationSec": takeoff_duration_sec,
+            "showTimeOffsetSec": show_offset_sec,
+            "totalSteps": total_steps,
+        },
+        # How to read `pointIndex`: trajectory.points[i] of the named drone,
+        # in the show document this plan travels with. Absent for a drone that
+        # has no keyframe exactly at that instant.
+        "pointIndexBase": "trajectory.points",
+        "phases": plan_phases,
+        "transits": transits,
+    }
+    if profile_report is not None:
+        # Report-only: the velocity profile drives the takeoff duration, so
+        # without it the offset above cannot be re-derived from the block.
+        plan["timing"]["velocityProfile"] = profile_report
+
+    return plan
+
+
 def _positions_match(
     positions: Sequence[Sequence[float]],
     targets: Sequence[Sequence[float]],
@@ -1882,7 +2103,6 @@ def _plan_formation_phases(
     original_initials = list(current_positions)
     current_yaws = list(initial_yaws or [0.0] * num_drones)
     original_yaws = list(current_yaws)
-    neutral_yaws = [0.0] * num_drones
 
     combined_steps: list[StepRecord] = [
         StepRecord(
@@ -1907,14 +2127,36 @@ def _plan_formation_phases(
         hold_ms: int,
         hold_steps: int,
         notes: Sequence[str] = (),
+        *,
+        kind: str = "formation",
+        phase_index: int | None = None,
     ) -> None:
+        # ``endStep`` closes the whole segment, which also covers the
+        # neutral-yaw reset appended after the hold whenever the next leg
+        # moves. A formation's *visible* window ends when the hold does, so
+        # record both: anything lining LED content up with the formation wants
+        # the hold, not the rotation that follows it.
+        hold_end_step = arrival_step + hold_steps
         phase_summaries.append(
             {
+                # Assigned here rather than derived later: a phase whose
+                # targets already match appends no steps, so several entries
+                # can share one step index and sorting by step or time would
+                # put them in an order the solver never used.
+                "order": len(phase_summaries),
+                # "formation" for a phase the caller asked for, "transit" for
+                # a leg the planner inserted itself (staging grid, return to
+                # start). Keeping them apart stops consumers from index-
+                # aligning this list against the request's phases array.
+                "kind": kind,
+                "phaseIndex": phase_index,
                 "name": name,
                 "arrivalStep": arrival_step,
                 "arrivalTimeMs": arrival_step * duration_ms,
                 "holdMs": hold_ms,
                 "holdSteps": hold_steps,
+                "holdEndStep": hold_end_step,
+                "holdEndTimeMs": hold_end_step * duration_ms,
                 "endStep": combined_steps[-1].step,
                 "endTimeMs": combined_steps[-1].step * duration_ms,
                 "success": True,
@@ -2154,7 +2396,7 @@ def _plan_formation_phases(
     # ── staging: move from the hover line-up into the grid ──────────────
     if staging_targets is not None:
         run_segment(staging_targets, "staging-grid")
-        summarize("staging-grid", combined_steps[-1].step, 0, 0)
+        summarize("staging-grid", combined_steps[-1].step, 0, 0, kind="transit")
 
     # ── requested formation phases ───────────────────────────────────────
     for phase_index, phase in enumerate(phases):
@@ -2288,26 +2530,29 @@ def _plan_formation_phases(
             min_steps=hold_steps,
         )
 
-        # Reset yaw to neutral before the next translation (if any actually
-        # moves the fleet), so all cruising happens at a known heading.
-        if phase_index < len(phases) - 1:
-            next_targets = _phase_targets(phases[phase_index + 1], num_drones)
-            moves_next = not _positions_match(current_positions, next_targets)
-        else:
-            moves_next = return_to_initial and not _positions_match(
-                current_positions, original_initials
-            )
-        if moves_next and not _yaw_lists_match(current_yaws, neutral_yaws):
-            current_yaws = _append_yaw_transition(
-                combined_steps,
-                current_positions,
-                current_yaws,
-                neutral_yaws,
-                duration_sec=duration_sec,
-                max_yaw_rate_deg_s=max_yaw_rate_deg_s,
-            )
+        # A phase's heading is held all the way to the next one. Nothing is
+        # appended here on purpose.
+        #
+        # Cruising used to be forced back to 0 degrees first, so that every
+        # translation happened at a known heading. In the air that read as the
+        # fleet spinning on the spot at the end of every formation: turn to the
+        # authored yaw, hold, turn all the way back, translate, turn out to the
+        # next yaw. Asking for 180 degrees produced two 180 degree rotations
+        # per phase and never actually flew at 180.
+        #
+        # Dropping the reset is safe for separation because collision checking
+        # uses a yaw-invariant envelope by construction (see
+        # ``collision_volume``), so a drone's heading never changes how close
+        # it may come to another.
 
-        summarize(name, arrival_step, hold_ms, hold_steps, cluster_notes)
+        summarize(
+            name,
+            arrival_step,
+            hold_ms,
+            hold_steps,
+            cluster_notes,
+            phase_index=phase_index,
+        )
 
     # ── return to the staging hover positions ────────────────────────────
     # landing_targets, when given, spreads the final hover leg out (same
@@ -2335,7 +2580,7 @@ def _plan_formation_phases(
                 duration_sec=duration_sec,
                 max_yaw_rate_deg_s=max_yaw_rate_deg_s,
             )
-        summarize("return-to-start", arrival_step, 0, 0)
+        summarize("return-to-start", arrival_step, 0, 0, kind="transit")
 
     drones = [
         Drone(
@@ -2771,7 +3016,9 @@ async def plan():
         return jsonify({"error": str(exc)}), 400
 
     if uses_phases:
-        phases_error = _validate_phases(phases, num_drones=len(initial))
+        phases_error = _validate_phases(phases, num_drones=len(initial)) or (
+            _validate_phase_ids(phases)
+        )
         if phases_error is not None:
             return phases_error
         target = [list(point) for point in _phase_targets(phases[-1], len(initial))]
@@ -3259,6 +3506,9 @@ async def plan():
     }
     if takeoff_time_adjusted:
         output["adjustments"] = {"takeoff_time": takeoff_time}
+    # Only formation-phase runs have phases to annotate; point-to-point and
+    # delivery requests leave every artifact exactly as it was.
+    formation_plan: dict | None = None
     if uses_phases:
         # Absolute show-timeline seconds: solver step s happens at
         # takeoff_time (ground wait) + takeoff climb duration + s×step time.
@@ -3271,12 +3521,31 @@ async def plan():
         )
         show_offset_sec = round(takeoff_time + takeoff_duration_sec, 4)
         for summary in phase_summaries:
+            # 4 decimals, matching the formation plan below -- reporting one
+            # instant at two precisions in a single response invites consumers
+            # to compare them and find a difference that is not there.
             summary["arrivalTimeAbsSec"] = round(
-                show_offset_sec + summary["arrivalTimeMs"] / 1000.0, 3
+                show_offset_sec + summary["arrivalTimeMs"] / 1000.0, 4
+            )
+            summary["holdEndTimeAbsSec"] = round(
+                show_offset_sec + summary["holdEndTimeMs"] / 1000.0, 4
             )
             summary["endTimeAbsSec"] = round(
-                show_offset_sec + summary["endTimeMs"] / 1000.0, 3
+                show_offset_sec + summary["endTimeMs"] / 1000.0, 4
             )
+        formation_plan = _build_formation_plan(
+            phases=phases,
+            phase_summaries=phase_summaries,
+            num_drones=len(ground_positions),
+            duration_ms=duration_ms,
+            takeoff_time=takeoff_time,
+            takeoff_duration_sec=takeoff_duration_sec,
+            show_offset_sec=show_offset_sec,
+            total_steps=result.total_steps,
+            show_dicts=show_dicts,
+            profile_report=_profile_report(velocity_profile),
+        )
+        output[FORMATION_PLAN_KEY] = formation_plan
         output["timing"]["takeoff_time_sec"] = takeoff_time
         output["timing"]["takeoff_duration_sec"] = takeoff_duration_sec
         output["timing"]["show_time_offset_sec"] = show_offset_sec
@@ -3300,7 +3569,9 @@ async def plan():
 
     # --- save Skybrush files (post-verification only) -----------------------
     try:
-        saved = await save_skyb_files(show_dicts, output_dir=output_dir)
+        saved = await save_skyb_files(
+            show_dicts, output_dir=output_dir, formation_plan=formation_plan
+        )
         output["skybrush_files"] = saved
         if log:
             log.info(
@@ -3330,7 +3601,9 @@ async def plan():
         if should_download:
             if output_type == "skyc":
                 response = Response(
-                    skyc_bytes_from_show_dicts(show_dicts),
+                    skyc_bytes_from_show_dicts(
+                        show_dicts, formation_plan=formation_plan
+                    ),
                     mimetype="application/zip",
                 )
                 filename = "path-planner.skyc"

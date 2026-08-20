@@ -17,6 +17,9 @@ Request body (JSON) — the ``LedShow`` model authored in Skybrush Live
          "drones": [ [[r,g,b], ... (k*k)], ... (droneCount) ],
          "rows": 3, "cols": 7}        // formation; optional, ignored for .bin
       ],
+      "tileIds": [0, 1, 32],          // optional; download slot per drone
+      "includeData": false,           // optional; base64 the .bin back to the
+                                      // caller so it can be saved locally
       "upload": true,                 // optional, default true
       "upload_url": "http://..."      // optional, overrides the default server
     }
@@ -31,8 +34,9 @@ Response body (JSON)::
       "tileHeight": 4,
       "droneCount": 21,
       "tiles": [
-        {"droneIndex": 0, "bytes": 736, "filename": "file12.bin",
-         "url": "/download/12", "message": "File uploaded successfully"},
+        {"droneIndex": 0, "tileId": 0, "bytes": 736,
+         "filename": "abc123_tile_00.bin", "url": "/download/0",
+         "message": "File uploaded successfully"},
         ...
       ]
     }
@@ -42,6 +46,8 @@ from __future__ import annotations
 
 import re
 import uuid
+
+from base64 import b64encode
 
 from contextlib import ExitStack
 from logging import Logger
@@ -67,6 +73,54 @@ log: Optional[Logger] = None
 default_upload_url: str = DEFAULT_UPLOAD_URL
 
 
+def _resolve_tile_ids(body: dict, count: int) -> list[int]:
+    """Map each 0-based drone index to the download slot its file must occupy.
+
+    A JR board fetches ``GET /download/<client_id>`` and derives ``client_id``
+    from its own address as *last octet - 1*; it never sees a filename. The
+    slot, not the name, is therefore what decides which board plays which
+    drone's LEDs, and the identity mapping is drone *n* (1-based) -> slot
+    ``n - 1``. An explicit ``tileIds`` lets an operator route one drone's
+    content to a different board -- after swapping in a spare airframe, say.
+
+    Duplicate slots are refused: two drones sharing one would overwrite each
+    other on the download server, and whichever lost would fly dark with no
+    error anywhere.
+    """
+    raw = body.get("tileIds")
+    if raw is None:
+        return list(range(count))
+
+    if not isinstance(raw, (list, tuple)) or len(raw) != count:
+        raise CompileError(
+            f"'tileIds' must be a list of {count} integers, one per drone"
+        )
+
+    ids: list[int] = []
+    for index, value in enumerate(raw):
+        # bool is an int subclass; treating True as slot 1 would be nonsense.
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise CompileError(
+                f"'tileIds[{index}]' must be a non-negative integer"
+            )
+        ids.append(value)
+
+    seen: set[int] = set()
+    clashes: set[int] = set()
+    for slot in ids:
+        if slot in seen:
+            clashes.add(slot)
+        seen.add(slot)
+
+    if clashes:
+        raise CompileError(
+            "'tileIds' sends more than one drone to the same download slot: "
+            f"{sorted(clashes)}"
+        )
+
+    return ids
+
+
 def _make_show_id(body: dict) -> str:
     """Return a 6-character alphanumeric prefix for the ``xxxxxx_tile_nn.bin``
     filenames the download server expects.
@@ -90,29 +144,41 @@ async def compile_endpoint():
 
     try:
         compiled = compile_show(body)
+        tile_ids = _resolve_tile_ids(body, len(compiled.bins))
     except CompileError as exc:
         return jsonify({"error": str(exc)}), 400
 
     do_upload = bool(body.get("upload", True))
+    # Returning the bytes is opt-in: they are the bulk of the response and most
+    # callers only want them on the download server. Without this there was no
+    # way at all to keep a copy -- the compiled files were POSTed away and the
+    # originals dropped on the floor.
+    include_data = bool(body.get("includeData", body.get("include_data", False)))
     upload_url = str(body.get("upload_url", default_upload_url))
     show_id = _make_show_id(body)
 
     tiles: list[dict] = []
     for per_drone in compiled.bins:
+        tile_id = tile_ids[per_drone.drone_index]
         entry: dict = {
             "droneIndex": per_drone.drone_index,
+            "tileId": tile_id,
             "bytes": len(per_drone.data),
         }
+        if include_data:
+            entry["data"] = b64encode(per_drone.data).decode("ascii")
+
         if do_upload:
             # Filename pattern ``xxxxxx_tile_nn.bin``: a 6-char show id, then
-            # the 2-digit tile/drone number.
+            # the 2-digit download slot.
             #
             # nn is 0-BASED so that it lines up with the JR firmware's
             # client_id.  The firmware derives client_id = (last octet of its
             # static IP) - 1 and fetches GET /download/<client_id>, so board
-            # 192.168.11.1 asks for /download/0.  Emitting a 1-based tile
-            # number here shifted every drone by one slot.
-            filename = f"{show_id}_tile_{per_drone.drone_index:02d}.bin"
+            # 192.168.11.1 asks for /download/0.  Emitting a 1-based number
+            # here shifted every drone by one slot.  See _resolve_tile_ids for
+            # how a slot may deliberately differ from the drone's own index.
+            filename = f"{show_id}_tile_{tile_id:02d}.bin"
             try:
                 result = await upload_bin(filename, per_drone.data, url=upload_url)
                 entry["filename"] = result.get("filename")

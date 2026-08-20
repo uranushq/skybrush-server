@@ -19,6 +19,7 @@ wait for the board's ack (see ``commands.py``).
 
     {
       "startIn": 5.0,        // seconds from now -> start_time_us
+      "startAtUnixSec": 0.0, // absolute UTC start instant; wins over startIn
       "seq": 1,
       "repeat": 5,
       "interval": 0.05,      // < 0.1 enforced
@@ -34,6 +35,13 @@ overrides the real show. The boards report the true numbers in their health
 pushes and ``derive_show_params`` reads them back, which leaves ``startIn``
 as the only playback knob a caller owns. An ARM is refused with 409 while no
 board has a show loaded to read them from.
+
+``startAtUnixSec`` exists because the boards run on true GPS UTC once their
+show clock locks (see :mod:`.arm`), so an absolute cue lands on exactly the
+second the caller asked for. ``startIn`` is resolved against *this* server's
+clock at the moment the request is handled, which folds both the request
+latency and the server's own clock error into the result -- fine for a manual
+"arm in five seconds" test, wrong for lining LEDs up with a flying show.
 """
 
 from __future__ import annotations
@@ -76,8 +84,10 @@ async def arm_endpoint():
     body = await request.get_json(silent=True) or {}
     cmd = str(body.get("cmd", "ARM"))
 
+    start_at = body.get("startAtUnixSec")
     kwargs = dict(
         start_in=float(body.get("startIn", 5.0)),
+        start_at_us=None if start_at is None else int(float(start_at) * 1_000_000),
         show_id=int(body.get("showId", 1)),
         file_id=int(body.get("fileId", 99)),
         seq=int(body.get("seq", 1)),

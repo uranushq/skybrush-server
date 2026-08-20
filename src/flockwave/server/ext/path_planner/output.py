@@ -127,13 +127,23 @@ def _max_geofence_altitude(show_dicts: list[dict[str, Any]]) -> float:
     return math.ceil(max_alt)
 
 
-def skyc_bytes_from_show_dicts(show_dicts: list[dict[str, Any]]) -> bytes:
+def skyc_bytes_from_show_dicts(
+    show_dicts: list[dict[str, Any]],
+    formation_plan: dict[str, Any] | None = None,
+) -> bytes:
     """Pack a list of per-drone show dicts into a ``.skyc`` ZIP for Viewer.
 
     The validation block reuses the same limits the planner enforces
     (velocity caps from ``converter``, minimum distance from the collision
     envelope), so the Viewer never flags a show the planner considers safe
     and vice versa.
+
+    ``formation_plan``, when given, rides along as its own archive member.
+    Nothing about the show itself changes: ``show.json`` and ``cues.json`` are
+    written from the same dicts, byte for byte, as they would be without it,
+    and a reader that does not know the extra member simply never opens it.
+    That isolation is the point -- the annotation is provenance for whoever
+    generated the show, and must not be able to affect how it flies or renders.
     """
     cues = {"version": 1, "items": [{"time": 0.0, "name": "start"}]}
 
@@ -171,5 +181,10 @@ def skyc_bytes_from_show_dicts(show_dicts: list[dict[str, Any]]) -> bytes:
     with ZipFile(archive, mode="w", compression=ZIP_DEFLATED) as zf:
         zf.writestr("show.json", dumps(show, ensure_ascii=False, indent=2))
         zf.writestr("cues.json", dumps(cues, ensure_ascii=False, indent=2))
+        if formation_plan is not None:
+            zf.writestr(
+                "formation_plan.json",
+                dumps(formation_plan, ensure_ascii=False, indent=2),
+            )
 
     return archive.getvalue()
