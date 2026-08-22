@@ -298,6 +298,12 @@ MIN_TAKEOFF_TIME = 5.0
 # spread the take-off layout out to at least this spacing before the
 # requested formation phases start.
 DEFAULT_STAGING_ALTITUDE = 5.0
+
+# Hold at the take-off hover point before the show starts moving. The climb
+# to `staging_altitude` is a pure vertical leg; settling there for a moment
+# lets the fleet stabilise (and the operator confirm it) before the first
+# formation pulls everyone sideways.
+TAKEOFF_HOVER_HOLD_MS = 5000
 DEFAULT_GRID_SPACING = 2.0
 
 # Landing default: when 'landing_grid' is requested, spread the final return
@@ -2114,6 +2120,22 @@ def _plan_formation_phases(
             yaws={idx: current_yaws[idx] for idx in range(num_drones)},
         )
     ]
+    # Settle at the hover point the vertical take-off leg ends on, before the
+    # first move. Yaw is unchanged, so this is a pure hold.
+    takeoff_hold_steps = (
+        ceil(TAKEOFF_HOVER_HOLD_MS / duration_ms) if duration_ms > 0 else 0
+    )
+    if takeoff_hold_steps > 0:
+        current_yaws = _append_yaw_transition(
+            combined_steps,
+            current_positions,
+            current_yaws,
+            current_yaws,
+            duration_sec=duration_sec,
+            max_yaw_rate_deg_s=max_yaw_rate_deg_s,
+            min_steps=takeoff_hold_steps,
+        )
+
     phase_summaries: list[dict] = []
     segment_counter = 0
     # Set while the phase loop still has a looser fallback notch to drop to,
