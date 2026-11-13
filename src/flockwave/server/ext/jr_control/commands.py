@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import socket
 from functools import partial
-from typing import Any
+from typing import Any, Sequence
 
 from trio import to_thread
 
@@ -158,4 +158,56 @@ async def post_led(
     turned off or the next show's player overwrites it.
     """
     body = format_led_body(red, green, blue, white, off=off)
+    return await send_raw_command(ip, body, port=port, timeout=timeout)
+
+
+def format_pixel_body(index: int, rgb: Sequence[int], white: int = 0) -> str:
+    """Build the plain-text ``pixel`` body: one LED, the rest left alone.
+
+    ``index`` is in reading order on the board's grid -- 0 is top-left, and it
+    increases left-to-right then top-to-bottom, so a 3x3 panel ends at 8. The
+    firmware keeps a shadow framebuffer, so LEDs this command does not name
+    keep whatever they were showing.
+    """
+    r, g, b = (_clamp_u8(int(c)) for c in tuple(rgb)[:3])
+    return f"pixel {int(index)} {r} {g} {b} {_clamp_u8(white)}"
+
+
+def format_pixels_body(pixels: Sequence[Sequence[int]]) -> str:
+    """Build the plain-text ``pixels`` body: the whole grid in one write.
+
+    ``pixels`` is a list of ``[r, g, b]`` triples in the same reading order as
+    :func:`format_pixel_body`. The firmware blanks any LED the list does not
+    reach, so a short list clears the tail rather than leaving it stale.
+    """
+    parts = []
+    for rgb in pixels:
+        r, g, b = (_clamp_u8(int(c)) for c in tuple(rgb)[:3])
+        parts.append(f"{r},{g},{b}")
+    return "pixels " + " ".join(parts)
+
+
+async def post_pixel(
+    ip: str,
+    *,
+    port: int,
+    index: int,
+    rgb: Sequence[int],
+    white: int = 0,
+    timeout: float = 3.0,
+) -> Any:
+    """Set a single LED by its reading-order index, leaving the others as-is."""
+    body = format_pixel_body(index, rgb, white)
+    return await send_raw_command(ip, body, port=port, timeout=timeout)
+
+
+async def post_pixels(
+    ip: str,
+    *,
+    port: int,
+    pixels: Sequence[Sequence[int]],
+    timeout: float = 3.0,
+) -> Any:
+    """Set the whole grid at once (a single I2C write on the board)."""
+    body = format_pixels_body(pixels)
     return await send_raw_command(ip, body, port=port, timeout=timeout)

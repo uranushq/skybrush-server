@@ -7,6 +7,7 @@ GET  ``/health/<ip>``        latest status pushed by the board over health UDP
 POST ``/reboot/<ip>``        send a UDP reboot command, wait for the board's ack
 POST ``/redownload/<ip>``    send a UDP redownload command, wait for the board's ack
 POST ``/led/<ip>``           light the board's LEDs solid (wiring check) / turn off
+POST ``/pixels/<ip>``        address LEDs individually (reading order, 0 = top-left)
 
 The board has no HTTP server at all -- everything in this extension talks to
 it over UDP on ``health_port`` (default 16550, must match the firmware's
@@ -58,7 +59,14 @@ from flockwave.server.ext.base import Extension
 from flockwave.server.utils import overridden
 
 from .arm import broadcast_arm
-from .commands import JRBoardError, post_led, post_reboot, post_redownload
+from .commands import (
+    JRBoardError,
+    post_led,
+    post_pixel,
+    post_pixels,
+    post_reboot,
+    post_redownload,
+)
 from .health_udp import (
     ShowParams,
     derive_show_params,
@@ -194,6 +202,68 @@ async def led_endpoint(ip: str):
 
     try:
         return jsonify(await post_led(ip, port=health_port, **kwargs))
+    except JRBoardError as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+@blueprint.route("/pixels/<ip>", methods=["POST"])
+async def pixels_endpoint(ip: str):
+    """Address the board's LEDs individually.
+
+    LEDs are numbered in reading order on the grid: 0 is top-left, numbering
+    runs left-to-right then top-to-bottom, so a 3x3 panel ends at 8.
+
+    Two body shapes, both JSON::
+
+        {"pixels": [[255,0,0], [0,0,0], ... ]}   # whole grid, one write
+        {"index": 4, "rgb": [0,255,0]}           # one LED, rest untouched
+
+    The whole-grid form blanks any LED the list does not reach. The single-LED
+    form leaves every other LED showing whatever it already had, because the
+    firmware keeps a shadow framebuffer.
+    """
+    body = await request.get_json(silent=True) or {}
+
+    pixels = body.get("pixels")
+    if pixels is not None:
+        if not isinstance(pixels, list) or not all(
+            isinstance(p, (list, tuple)) and len(p) >= 3 for p in pixels
+        ):
+            return jsonify({"error": "'pixels' must be a list of [r, g, b]"}), 400
+        try:
+            return jsonify(
+                await post_pixels(ip, port=health_port, pixels=pixels)
+            )
+        except (TypeError, ValueError):
+            return jsonify({"error": "'pixels' entries must be integers"}), 400
+        except JRBoardError as exc:
+            return jsonify({"error": str(exc)}), 502
+
+    if "index" not in body:
+        return jsonify({"error": "body needs either 'pixels' or 'index'"}), 400
+
+    rgb = body.get("rgb")
+    if rgb is None:
+        rgb = [body.get("red", 0), body.get("green", 0), body.get("blue", 0)]
+    if not isinstance(rgb, (list, tuple)) or len(rgb) < 3:
+        return jsonify({"error": "'rgb' must be [r, g, b]"}), 400
+
+    try:
+        index = int(body["index"])
+        white = int(body.get("white", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'index'/'white' must be integers"}), 400
+    if index < 0:
+        return jsonify({"error": "'index' must be >= 0"}), 400
+
+    try:
+        return jsonify(
+            await post_pixel(
+                ip, port=health_port, index=index, rgb=rgb, white=white
+            )
+        )
+    except (TypeError, ValueError):
+        return jsonify({"error": "'rgb' entries must be integers"}), 400
     except JRBoardError as exc:
         return jsonify({"error": str(exc)}), 502
 
