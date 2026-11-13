@@ -69,11 +69,25 @@ PLANNING_MARGIN = 0.0
 # Two drones must be at least this far apart (meters) along AT LEAST one
 # axis — i.e. the Chebyshev distance between any two drone centers must be
 # >= the separation, which also lower-bounds the Euclidean distance by the
-# same value. This is a HARD operational floor: a request may RAISE the
-# separation via `min_separation` but nothing may ever lower it below this
-# constant. Enforced at request validation (initial/staging/phase points),
+# same value. Enforced at request validation (initial/staging/phase points),
 # throughout the solver and by the final verification gate.
+#
+# This is the separation used when a request does not specify
+# `min_separation`. It is NOT the lowest value a request may ask for — see
+# MIN_SEPARATION_FLOOR.
 HARD_MIN_SEPARATION = 1.45
+
+# Lowest separation a request is allowed to ask for (meters).
+#
+# Lowered from HARD_MIN_SEPARATION (1.45) to 1.0 by operator decision, so
+# tighter formations can be planned. This single constant is the only place
+# the floor is enforced — raise it back to HARD_MIN_SEPARATION to restore the
+# previous "nothing may go below 1.45" policy everywhere at once.
+#
+# Note the separation is Chebyshev, so it is NOT rotation-invariant: a grid
+# spaced exactly at the floor loses up to a factor of sqrt(2) when rotated
+# off-axis. Leave headroom for rotated formations.
+MIN_SEPARATION_FLOOR = 1.0
 
 # Boundary tolerance (meters) for the separation checks. 1.45 is not
 # exactly representable in binary floating point, so spacings that are
@@ -84,14 +98,18 @@ SEPARATION_EPS = 1e-6
 
 
 def clamp_separation(value) -> float:
-    """Coerce a requested separation to a float no smaller than the floor."""
+    """Coerce a requested separation to a float no smaller than the floor.
+
+    Unusable input (missing / non-numeric / NaN) falls back to the *default*
+    rather than the floor — "no opinion" must not mean "least clearance".
+    """
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return HARD_MIN_SEPARATION
     if parsed != parsed:  # NaN
         return HARD_MIN_SEPARATION
-    return max(HARD_MIN_SEPARATION, parsed)
+    return max(MIN_SEPARATION_FLOOR, parsed)
 
 
 # Backwards-compatible alias: the formation spacing floor now equals the
@@ -217,8 +235,8 @@ def envelope_overlap(
     """Separation check for two drones at *a* and *b*.
 
     The drones conflict unless they are at least ``separation`` meters
-    apart along at least one axis (``separation`` is clamped to the hard
-    floor :data:`HARD_MIN_SEPARATION`; boundary-exact spacings pass).
+    apart along at least one axis (``separation`` is clamped to
+    :data:`MIN_SEPARATION_FLOOR`; boundary-exact spacings pass).
     ``margin`` inflates the window on every side; ``b_extends_below`` /
     ``b_extends_above`` additionally extend *b*'s conflict zone that many
     meters downward / upward — used by route planning to treat a parked
@@ -226,7 +244,7 @@ def envelope_overlap(
     as blocked.
     """
     window = (
-        max(separation, HARD_MIN_SEPARATION) + 2.0 * margin - SEPARATION_EPS
+        max(separation, MIN_SEPARATION_FLOOR) + 2.0 * margin - SEPARATION_EPS
     )
     if abs(a[0] - b[0]) >= window:
         return False
@@ -268,7 +286,7 @@ def envelope_overlap_swept(
     :func:`envelope_overlap`), making the z window asymmetric.
     """
     window = (
-        max(separation, HARD_MIN_SEPARATION) + 2.0 * margin - SEPARATION_EPS
+        max(separation, MIN_SEPARATION_FLOOR) + 2.0 * margin - SEPARATION_EPS
     )
     lo = 0.0
     hi = 1.0

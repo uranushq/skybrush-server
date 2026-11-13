@@ -99,6 +99,7 @@ from flockwave.server.utils import overridden
 from .collision_volume import (
     GUARANTEED_XY_CLEARANCE,
     HARD_MIN_SEPARATION,
+    MIN_SEPARATION_FLOOR,
     PLANNING_MARGIN,
     clamp_separation,
     describe_collision_envelope,
@@ -1523,7 +1524,7 @@ def _spacing_error_response(
                     "collision_envelope": describe_collision_envelope(),
                     "required_separation": separation,
                     "required_xy_clearance": separation,
-                    "hard_min_separation": HARD_MIN_SEPARATION,
+                    "hard_min_separation": MIN_SEPARATION_FLOOR,
                     "violations": violations,
                 },
             }
@@ -3107,8 +3108,9 @@ async def plan():
         return profile_err
 
     # Minimum inter-drone separation (per-axis / Chebyshev). Adjustable per
-    # request but NEVER below the hard floor — requests trying to lower it
-    # are rejected loudly instead of being clamped silently.
+    # request down to MIN_SEPARATION_FLOOR; requests below that are rejected
+    # loudly instead of being clamped silently. Omitting the field keeps the
+    # more conservative HARD_MIN_SEPARATION default.
     raw_separation = body.get("min_separation", body.get("min_spacing"))
     if raw_separation is None:
         min_separation = HARD_MIN_SEPARATION
@@ -3117,17 +3119,17 @@ async def plan():
             min_separation = float(raw_separation)
         except (TypeError, ValueError):
             return jsonify({"error": "'min_separation' must be a number"}), 400
-        if min_separation < HARD_MIN_SEPARATION:
+        if min_separation < MIN_SEPARATION_FLOOR:
             return (
                 jsonify(
                     {
                         "error": (
                             f"'min_separation' of {min_separation} m is below "
-                            f"the hard operational floor of "
-                            f"{HARD_MIN_SEPARATION} m and cannot be lowered"
+                            f"the operational floor of "
+                            f"{MIN_SEPARATION_FLOOR} m and cannot be lowered"
                         ),
                         "code": "SEPARATION_BELOW_HARD_FLOOR",
-                        "hard_min_separation": HARD_MIN_SEPARATION,
+                        "hard_min_separation": MIN_SEPARATION_FLOOR,
                     }
                 ),
                 400,
@@ -3508,7 +3510,8 @@ async def plan():
     output["verification"] = {"checked": True, "violations": 0}
     output["spacing"] = {
         "min_separation": min_separation,
-        "hard_min_separation": HARD_MIN_SEPARATION,
+        "hard_min_separation": MIN_SEPARATION_FLOOR,
+        "default_separation": HARD_MIN_SEPARATION,
         "semantics": "per-axis (Chebyshev)",
     }
     output["smoothing"] = {

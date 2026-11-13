@@ -163,9 +163,12 @@ DOWNWASH_ROUTE_CLEARANCE = 2.5
 # close on each other, and the safety of that geometry is the formation's own
 # vertical separation, not a transit rule.
 #
-# HARD_MIN_SEPARATION is the floor the whole planner is built on ("a request
-# may RAISE the separation but nothing may ever lower it below this"), so the
-# graded band bottoms out there rather than at a fresh invented number.
+# Deliberately pinned to HARD_MIN_SEPARATION (the planner's *default* lateral
+# separation), NOT to MIN_SEPARATION_FLOOR. Downwash is a rotor-wash question
+# about a drone sitting below another one, physically independent of how close
+# the operator chooses to pack a formation laterally; lowering the lateral
+# floor must not quietly shrink the wake band too. Change this only with a
+# wash measurement to back it up.
 DOWNWASH_HARD_FLOOR = HARD_MIN_SEPARATION
 DOWNWASH_EXPOSURE_MS = 2000
 
